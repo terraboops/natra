@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: natra-installer
+  namespace: kube-system
+  labels:
+    app: natra
+    component: cni-installer
+spec:
+  selector:
+    matchLabels:
+      app: natra
+      component: cni-installer
+  template:
+    metadata:
+      labels:
+        app: natra
+        component: cni-installer
+    spec:
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: install-cni
+        image: ghcr.io/terraboops/natra:latest
+        imagePullPolicy: IfNotPresent
+        command:
+          - /bin/sh
+          - -c
+          - |
+            set -e
+            echo "Installing natra CNI plugin..."
+            cp /usr/local/bin/natra /host/opt/cni/bin/natra
+            echo "natra CNI plugin installed successfully"
+            echo "Sleeping to keep container alive..."
+            sleep infinity
+        volumeMounts:
+        - name: cni-bin-dir
+          mountPath: /host/opt/cni/bin
+        securityContext:
+          privileged: true
+      volumes:
+      - name: cni-bin-dir
+        hostPath:
+          path: /opt/cni/bin
+          type: DirectoryOrCreate

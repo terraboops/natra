@@ -1,0 +1,39 @@
+# Binaries
+bin/
+*.o
+*.a
+
+# eBPF
+bpf/*.o
+bpf/headers/vmlinux.h
+
+# Go
+vendor/
+*.test
+*.out
+coverage.txt
+*.prof
+
+# Kubebuilder
+testbin/
+cover.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+tmp/
+*.tmp
+
+# Build artifacts
+dist/
+*.tar.gz
+*.zip
