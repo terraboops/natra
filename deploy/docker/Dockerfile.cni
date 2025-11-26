@@ -1,0 +1,21 @@
+# Build CNI plugin binary
+FROM golang:1.22 AS builder
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/ cmd/
+COPY pkg/ pkg/
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o bin/natra ./cmd/natra
+
+# Runtime
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+COPY --from=builder /workspace/bin/natra /usr/local/bin/natra
+
+ENTRYPOINT ["/usr/local/bin/natra"]
