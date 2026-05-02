@@ -9,11 +9,13 @@ package cni_test
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 
+	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
@@ -66,6 +68,79 @@ func newTestNetns() (netns.NsHandle, func(), error) {
 // CNI_NETNS, given a netns handle.
 func netnsPath(h netns.NsHandle) string {
 	return fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), int(h))
+}
+
+// newTestNetnsWithVeth creates a fresh netns and pulls a veth pair end
+// into it under the requested name, so a CNI plugin entering the netns
+// finds an interface to attach BPF to. Cleanup deletes the host end
+// (which auto-deletes the peer in the netns).
+//
+// Both ends are created with unique tags in the host netns (avoids
+// colliding with the container's existing eth0), then the peer is
+// moved into the pod netns and renamed to ifName via a netlink handle
+// scoped to that netns. No thread-level netns switching needed.
+func newTestNetnsWithVeth(ifName string) (netns.NsHandle, func(), error) {
+	ns, baseCleanup, err := newTestNetns()
+	if err != nil {
+		return 0, nil, err
+	}
+	tag := fmt.Sprintf("%d-%d", os.Getpid(), int(ns))
+	hostEnd := "h" + tag
+	tmpPeer := "p" + tag
+	if len(hostEnd) > 15 {
+		hostEnd = hostEnd[:15]
+	}
+	if len(tmpPeer) > 15 {
+		tmpPeer = tmpPeer[:15]
+	}
+
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: hostEnd},
+		PeerName:  tmpPeer,
+	}
+	if err := netlink.LinkAdd(veth); err != nil {
+		baseCleanup()
+		return 0, nil, fmt.Errorf("netlink add veth %s/%s: %w", hostEnd, tmpPeer, err)
+	}
+	cleanup := func() {
+		_ = netlink.LinkDel(veth)
+		baseCleanup()
+	}
+
+	peer, err := netlink.LinkByName(tmpPeer)
+	if err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("find peer %s in host netns: %w", tmpPeer, err)
+	}
+	if err := netlink.LinkSetNsFd(peer, int(ns)); err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("move %s into netns: %w", tmpPeer, err)
+	}
+
+	// Operate on the pod netns via a scoped netlink handle — no thread
+	// migration. Rename the moved-in peer to the requested name (e.g.
+	// "eth0") and bring it up so the BPF program can attach.
+	nlh, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("netlink handle for pod netns: %w", err)
+	}
+	defer nlh.Close()
+	movedPeer, err := nlh.LinkByName(tmpPeer)
+	if err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("find peer %s in pod netns: %w", tmpPeer, err)
+	}
+	if err := nlh.LinkSetName(movedPeer, ifName); err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("rename %s to %s in pod netns: %w", tmpPeer, ifName, err)
+	}
+	if err := nlh.LinkSetUp(movedPeer); err != nil {
+		cleanup()
+		return 0, nil, fmt.Errorf("set %s up in pod netns: %w", ifName, err)
+	}
+	_ = net.IPv4zero // pin the `net` import for future helpers
+	return ns, cleanup, nil
 }
 
 // runPlugin executes the natra binary with the canonical CNI env vars and

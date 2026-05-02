@@ -73,12 +73,32 @@ check: fmt vet lint ## Run all code quality checks
 ##@ Build
 
 .PHONY: build
-build: fmt vet build-cni ## Build CNI plugin binary (Linux ELF, host arch).
+build: fmt vet build-cni ## Build CNI plugin binary with BPF embedded (Linux ELF).
 
+# build-cni first compiles bpf/natra.bpf.o and copies it into pkg/bpf/
+# (where go:embed in loader.go reads it), then go-builds the natra
+# binary with the BPF object embedded as a []byte.
+#
+# On Linux this is a straight invocation. On macOS it runs inside the
+# Docker wrapper because BPF compile + Linux Go build aren't host-native.
 .PHONY: build-cni
-build-cni: ## Build natra binary for Linux (cross-compiles from macOS).
-	@mkdir -p bin
-	GOOS=linux CGO_ENABLED=0 go build -o $(CNI_BINARY) ./cmd/natra
+build-cni: ## Build natra binary with BPF embedded.
+ifeq ($(UNAME_S),Linux)
+	@$(MAKE) -s build-cni-inner
+else
+	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && make -s build-cni-inner"
+endif
+
+# Inner build target — assumes Linux + clang already available. Don't
+# call this directly on Mac; use `make build-cni` which wraps it in
+# Docker.
+.PHONY: build-cni-inner
+build-cni-inner:
+	@$(MAKE) -s build-bpf
+	@mkdir -p bin pkg/bpf
+	@cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
+	@GOOS=linux CGO_ENABLED=0 go build -buildvcs=false -o $(CNI_BINARY) ./cmd/natra
+	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2))"
 
 .PHONY: build-bpf
 build-bpf: $(BPF_OBJS) ## Compile BPF C sources to bytecode (.o).
@@ -136,7 +156,7 @@ test-cni: ## Layer 2 — CNI protocol tests (Linux native or Mac via Docker).
 ifeq ($(UNAME_S),Linux)
 	sudo go test -tags=$(TAGS_INTEGRATION) ./test/cni/...
 else
-	@bash scripts/run-in-docker.sh "go test -tags=$(TAGS_INTEGRATION) ./test/cni/..."
+	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq iproute2 >/dev/null && go test -tags=$(TAGS_INTEGRATION) ./test/cni/..."
 endif
 
 .PHONY: test-bpf

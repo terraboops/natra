@@ -64,7 +64,7 @@ var _ = Describe("natra CNI binary", func() {
 	})
 
 	Context("ADD with simple bandwidth annotation", func() {
-		It("succeeds and logs the annotation (Phase 0 fail-open)", func() {
+		It("attempts BPF attach and fail-opens when interface absent", func() {
 			ns, cleanup, err := newTestNetns()
 			Expect(err).NotTo(HaveOccurred())
 			defer cleanup()
@@ -83,8 +83,42 @@ var _ = Describe("natra CNI binary", func() {
 			stdout, stderr, runErr := runPlugin(natra, "ADD", "test-annotation", netnsPath(ns), "eth0", stdin)
 			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
 
-			// Phase 0: annotation is logged to stderr but execution succeeds.
-			Expect(string(stderr)).To(ContainSubstring("bandwidth annotation found: 10M"))
+			// natra entered the empty test netns, didn't find eth0, logged
+			// the BPF-attach failure, and fell through to passthrough. The
+			// fail-open path is the design contract — pod startup must not
+			// block on rate-limit setup.
+			Expect(string(stderr)).To(ContainSubstring("BPF attach failed"))
+			Expect(string(stderr)).To(ContainSubstring("passing through unrate-limited"))
+
+			var result map[string]any
+			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
+			Expect(result["cniVersion"]).To(Equal("1.0.0"))
+		})
+
+		It("attaches the BPF program when the target interface exists in the pod netns", func() {
+			By("creating a veth pair end inside the pod netns")
+			ns, cleanup, err := newTestNetnsWithVeth("eth0")
+			Expect(err).NotTo(HaveOccurred())
+			defer cleanup()
+
+			stdin := []byte(`{
+				"cniVersion": "1.0.0",
+				"name": "natra-test",
+				"type": "natra",
+				"runtimeConfig": {
+					"podAnnotations": {
+						"kubernetes.io/ingress-bandwidth": "10M"
+					}
+				}
+			}`)
+
+			stdout, stderr, runErr := runPlugin(natra, "ADD", "test-attach-success", netnsPath(ns), "eth0", stdin)
+			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
+
+			// Success path: stderr reports the attach with parsed rate
+			// (10M = 10_000_000 bytes/sec) and a non-zero ifindex.
+			Expect(string(stderr)).To(ContainSubstring("attached to eth0"))
+			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
 
 			var result map[string]any
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
