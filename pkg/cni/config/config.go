@@ -31,14 +31,23 @@ type Config struct {
 	TokenBucketBurst int64
 }
 
-// DefaultConfig returns a Config with sensible defaults
+// DefaultConfig returns a Config with sensible defaults.
+//
+// HeavyHitterThreshold is intentionally low. The CMS counts "packets"
+// from the BPF program's perspective, but on Linux paths with GRO/LRO
+// active a single skb the BPF sees can carry 30+ TCP segments — so a
+// 1000-packet threshold lets ~27 MB through unrate-limited per flow
+// before any throttling kicks in. 10 strikes the balance between
+// "let mice flow free" (DNS lookups, brief HTTP requests are <10
+// packets) and "rate-limit sustained flows quickly" (iperf-style
+// elephant flows cross 10 packets in <100 ms).
 func DefaultConfig() *Config {
 	return &Config{
 		Rate:                 0, // No rate limit
 		Burst:                0,
 		CMSWidth:             1024,
 		CMSDepth:             4,
-		HeavyHitterThreshold: 1000,
+		HeavyHitterThreshold: 10,
 		TokenBucketRate:      100,
 		TokenBucketBurst:     200,
 	}

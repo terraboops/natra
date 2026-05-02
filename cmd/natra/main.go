@@ -77,6 +77,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "dump-stats" {
+		if err := dumpStats(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	skel.PluginMainFuncs(
 		skel.CNIFuncs{
@@ -318,10 +325,18 @@ func attachBPF(args *skel.CmdArgs, cfg *config.Config) error {
 		_ = prog.Close()
 		return fmt.Errorf("attach BPF to %s ingress: %w", args.IfName, err)
 	}
+	// Pin the maps too so `natra dump <containerID>` can read live
+	// stats/CMS counters from another process. Best-effort: if pinning
+	// fails (e.g. EPERM in some environments) we still keep the
+	// program attached.
+	if err := prog.PinMaps(pinDir, args.ContainerID); err != nil {
+		fmt.Fprintf(os.Stderr, "natra: map pin failed (%v) — continuing without debug pins\n", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "natra: attached to %s (ifindex=%d) rate=%d bps burst=%d bytes pin=%s\n",
 		args.IfName, iface.Index, cfg.Rate, cfg.Burst, pinPath)
-	logf("attached: ifname=%s ifindex=%d rate=%d burst=%d pin=%s", args.IfName, iface.Index, cfg.Rate, cfg.Burst, pinPath)
+	logf("attached: ifname=%s ifindex=%d rate=%d burst=%d hh=%d pin=%s",
+		args.IfName, iface.Index, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold, pinPath)
 	return nil
 }
 

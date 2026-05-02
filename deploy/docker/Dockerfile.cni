@@ -1,5 +1,33 @@
-# Build CNI plugin binary
-FROM golang:1.25 AS builder
+# syntax=docker/dockerfile:1
+#
+# Multi-stage build:
+#   1. bpf-builder — compiles bpf/*.bpf.c to *.bpf.o using clang+llvm
+#                    against libbpf headers from Debian.
+#   2. go-builder  — cross-compiles natra to a static linux ELF. Pulls
+#                    the .bpf.o from stage 1 so go:embed in
+#                    pkg/bpf/loader.go finds it.
+#   3. runtime     — minimal alpine with libcap (for setcap in the
+#                    install DaemonSet) and the natra binary.
+
+# ----- Stage 1: BPF -----
+FROM debian:bookworm AS bpf-builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        clang llvm make libbpf-dev linux-libc-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY bpf/ bpf/
+COPY Makefile Makefile
+
+# Reuse the same Makefile rule the host uses, so BPF compile flags
+# don't drift between local dev and image build. The rule respects
+# BPF_CLANG / arch detection via uname.
+RUN make build-bpf
+
+# ----- Stage 2: Go -----
+FROM golang:1.25 AS go-builder
 
 WORKDIR /workspace
 
@@ -9,9 +37,16 @@ RUN go mod download
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o bin/natra ./cmd/natra
+# Bring the freshly-built BPF object into pkg/bpf/ where loader.go's
+# go:embed expects it. Architecturally important: the .bpf.o is
+# compiled inside this image (stage 1) for reproducibility — using a
+# .bpf.o built on the developer's host machine would let go:embed
+# silently embed the wrong build.
+COPY --from=bpf-builder /workspace/bpf/natra.bpf.o pkg/bpf/natra.bpf.o
 
-# Runtime
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/natra ./cmd/natra
+
+# ----- Stage 3: runtime -----
 FROM alpine:latest
 
 # libcap-utils provides `setcap`, used by the install DaemonSet to
@@ -19,6 +54,6 @@ FROM alpine:latest
 # CNI plugin can pin BPF links regardless of the caller's caps.
 RUN apk --no-cache add ca-certificates libcap
 
-COPY --from=builder /workspace/bin/natra /usr/local/bin/natra
+COPY --from=go-builder /workspace/bin/natra /usr/local/bin/natra
 
 ENTRYPOINT ["/usr/local/bin/natra"]

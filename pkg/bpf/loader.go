@@ -67,6 +67,7 @@ type Program struct {
 	configMap *ebpf.Map
 	bucketMap *ebpf.Map
 	statsMap  *ebpf.Map
+	cmsMap    *ebpf.Map // CMS counters; nil when running with the placeholder program
 	tcxLink   link.Link // unused for clsact path; reserved for future tcx-link path
 }
 
@@ -107,6 +108,9 @@ func Load() (*Program, error) {
 		}
 		*dst = m
 	}
+	if cms, ok := coll.Maps["natra_cms_map"]; ok {
+		p.cmsMap = cms
+	}
 
 	prog, ok := coll.Programs["natra_ratelimit"]
 	if !ok {
@@ -131,6 +135,32 @@ func (p *Program) Configure(cfg Config) error {
 	tb := TokenBucket{Tokens: cfg.BurstBytes}
 	if err := p.bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("bucket map update: %w", err)
+	}
+	return nil
+}
+
+// PinMaps pins the program's maps under `dir`/<containerID>-<map> so a
+// debug subcommand can read stats and CMS counters out-of-band. The
+// program itself doesn't need pinned maps to function (clsact filter
+// holds the references), but pinning is the easiest way to expose
+// runtime state to a separate `natra dump` invocation.
+func (p *Program) PinMaps(dir, containerID string) error {
+	if dir == "" || containerID == "" {
+		return nil
+	}
+	for name, m := range map[string]*ebpf.Map{
+		"config": p.configMap,
+		"bucket": p.bucketMap,
+		"stats":  p.statsMap,
+		"cms":    p.cmsMap,
+	} {
+		if m == nil {
+			continue
+		}
+		path := dir + "/" + containerID + "-" + name + ".map"
+		if err := m.Pin(path); err != nil {
+			return fmt.Errorf("pin %s: %w", path, err)
+		}
 	}
 	return nil
 }

@@ -168,6 +168,126 @@ func TestNatraTokenBucketUnderRate(t *testing.T) {
 	}
 }
 
+// synthEthIPpktFromFlow returns a 64-byte ETH+IPv4 packet whose 5-tuple
+// hashes to a different CMS bucket than synthEthIPpkt's. Used to drive
+// many distinct flows from a single test goroutine.
+func synthEthIPpktFromFlow(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte {
+	pkt := synthEthIPpkt()
+	binary.BigEndian.PutUint32(pkt[26:30], srcIP)
+	binary.BigEndian.PutUint32(pkt[30:34], dstIP)
+	// Packet is 64 bytes: ETH(14) + IP(20) = 34, with 30 trailing bytes.
+	// TCP header would start at offset 34 if proto==6; we set proto=6 and
+	// the L4 ports occupy 34..38.
+	binary.BigEndian.PutUint16(pkt[34:36], srcPort)
+	binary.BigEndian.PutUint16(pkt[36:38], dstPort)
+	return pkt
+}
+
+func TestNatraCMSMiceFlowsBypassTokenBucket(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
+
+	// Threshold = 100 means the first 100 packets of any single flow
+	// pass for free; only the 101st onward go through the token bucket.
+	cfg := natraConfig{
+		RateBps:     1, // crippled rate — if any mouse traffic hits the
+		BurstBytes:  1, // bucket, it would be throttled. None should.
+		HHThreshold: 100,
+	}
+	zero := uint32(0)
+	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	tb := tokenBucket{}
+	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	const flows = 50
+	const perFlow = 5 // far below the 100-packet threshold
+	for i := 0; i < flows; i++ {
+		pkt := synthEthIPpktFromFlow(0x0A000001+uint32(i), 0x0A000002, 12345, 5201)
+		for j := 0; j < perFlow; j++ {
+			ret, _, err := prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("BPF_PROG_RUN flow=%d j=%d: %v", i, j, err)
+			}
+			if ret != 0 {
+				t.Fatalf("flow=%d j=%d throttled (ret=%d) — mouse flows must pass", i, j, ret)
+			}
+		}
+	}
+	if got := readPerCPUStat(t, statsMap, statHHHits); got != 0 {
+		t.Errorf("STAT_HH_HITS = %d, want 0 — mice should never reach the bucket", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statThrottled); got != 0 {
+		t.Errorf("STAT_THROTTLED = %d, want 0", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statPassed); got != flows*perFlow {
+		t.Errorf("STAT_PASSED = %d, want %d", got, flows*perFlow)
+	}
+}
+
+func TestNatraCMSElephantHitsBucket(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
+
+	cfg := natraConfig{
+		RateBps:     1,
+		BurstBytes:  64,  // exactly one packet's worth
+		HHThreshold: 10, // 11th packet onward is "heavy"
+	}
+	zero := uint32(0)
+	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	tb := tokenBucket{Tokens: 64}
+	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	pkt := synthEthIPpktFromFlow(0x0A000001, 0x0A000002, 12345, 5201)
+	// First 10 packets: count goes 1..10, none > threshold(10) → mice.
+	for i := 0; i < 10; i++ {
+		ret, _, err := prog.Test(pkt)
+		if err != nil {
+			t.Fatalf("packet %d: %v", i, err)
+		}
+		if ret != 0 {
+			t.Fatalf("packet %d throttled at count<=threshold (ret=%d)", i, ret)
+		}
+	}
+	if got := readPerCPUStat(t, statsMap, statHHHits); got != 0 {
+		t.Errorf("after first 10 packets STAT_HH_HITS=%d, want 0", got)
+	}
+
+	// 11th packet (count=11 > 10): heavy. Burst=64 admits this packet,
+	// so it's logged as a heavy-hitter PASS.
+	ret, _, err := prog.Test(pkt)
+	if err != nil {
+		t.Fatalf("packet 11: %v", err)
+	}
+	if ret != 0 {
+		t.Errorf("11th packet ret=%d, want 0 (TC_ACT_OK; bucket has 64 tokens)", ret)
+	}
+
+	// 12th packet (count=12, still heavy): bucket empty (one packet
+	// drained it), rate is 1 byte/sec so micro-second elapsed adds
+	// nothing. Should throttle.
+	ret, _, err = prog.Test(pkt)
+	if err != nil {
+		t.Fatalf("packet 12: %v", err)
+	}
+	if ret != 2 {
+		t.Errorf("12th packet ret=%d, want 2 (TC_ACT_SHOT; bucket empty)", ret)
+	}
+
+	if got := readPerCPUStat(t, statsMap, statHHHits); got != 2 {
+		t.Errorf("STAT_HH_HITS=%d, want 2 (packets 11 and 12)", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statThrottled); got != 1 {
+		t.Errorf("STAT_THROTTLED=%d, want 1", got)
+	}
+}
+
 func TestNatraTokenBucketThrottlesOnceBurstSpent(t *testing.T) {
 	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
 
