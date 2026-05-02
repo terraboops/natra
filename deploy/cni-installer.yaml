@@ -71,8 +71,28 @@ spec:
                 sleep 1
               done
               /usr/local/bin/natra install-cni-chain /host/etc/cni/net.d/
+              # Marker file the readiness probe watches for. Until this
+              # exists, kubelet keeps the DS pod NotReady and any test
+              # that does `kubectl rollout status` blocks. Without this
+              # gate, e2e tests racily schedule iperf pods before the
+              # install script finishes patching the conflist, and
+              # those pods get the un-natra-chained CNI.
+              mkdir -p /host/var/run/natra
+              touch /host/var/run/natra/installed
               echo "natra: chain install complete; idling"
               sleep infinity
+          # Readiness probe gates Ready on install completion. Without
+          # this, `kubectl rollout status` returns as soon as the
+          # container starts running, which is BEFORE the install
+          # script finishes patching the CNI conflist — then any pod
+          # the test creates immediately afterwards gets the un-chained
+          # CNI and natra never runs on its traffic.
+          readinessProbe:
+            exec:
+              command: ["test", "-f", "/host/var/run/natra/installed"]
+            initialDelaySeconds: 1
+            periodSeconds: 1
+            timeoutSeconds: 1
           volumeMounts:
             - name: cni-bin-dir
               mountPath: /host/opt/cni/bin
@@ -86,6 +106,9 @@ spec:
             - name: host-sys
               mountPath: /host/sys
               mountPropagation: Bidirectional
+            # Marker file location the readiness probe checks.
+            - name: host-var-run
+              mountPath: /host/var/run
           securityContext:
             privileged: true
       volumes:
@@ -101,3 +124,7 @@ spec:
           hostPath:
             path: /sys
             type: Directory
+        - name: host-var-run
+          hostPath:
+            path: /var/run
+            type: DirectoryOrCreate

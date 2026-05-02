@@ -25,6 +25,10 @@ endif
 
 CNI_BINARY := bin/natra
 BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o
+# Intentionally-invalid programs used by the L3 chaos suite. They MUST
+# build (clang accepts them) but FAIL to load (verifier rejects). Listed
+# here so `make build-bpf` produces them alongside the real ones.
+BPF_TESTDATA_OBJS := bpf/testdata/invalid_oob_packet_access.bpf.o
 
 # All Linux-test build tags. Each test file uses one of these.
 TAGS_INTEGRATION := integration
@@ -101,12 +105,13 @@ build-cni-inner:
 	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2))"
 
 .PHONY: build-bpf
-build-bpf: $(BPF_OBJS) ## Compile BPF C sources to bytecode (.o).
+build-bpf: $(BPF_OBJS) $(BPF_TESTDATA_OBJS) ## Compile BPF C sources (incl. chaos testdata) to bytecode (.o).
 
-# Pattern rule: bpf/%.bpf.o ← bpf/%.bpf.c. Includes libbpf + linux-libc
-# headers because natra.bpf.c uses real network headers and bpf_helpers.h.
-# placeholder.bpf.c is self-contained; the same flags work for both.
-bpf/%.bpf.o: bpf/%.bpf.c
+# Pattern rule for both bpf/*.bpf.o and bpf/testdata/*.bpf.o. Single
+# rule keeps build flags consistent — chaos-testdata programs MUST use
+# the same toolchain as the real ones for the verifier-rejection
+# assertions to be meaningful.
+define BPF_COMPILE_RECIPE
 	@if [ ! -x "$(BPF_CLANG)" ] && ! command -v "$(BPF_CLANG)" >/dev/null 2>&1; then \
 		echo ""; \
 		echo "BPF compile needs LLVM clang ($(BPF_CLANG))."; \
@@ -127,10 +132,17 @@ bpf/%.bpf.o: bpf/%.bpf.c
 		-I/usr/include/$$GNU_TRIPLE \
 		-c $< -o $@; \
 	echo "Built $@"
+endef
+
+bpf/testdata/%.bpf.o: bpf/testdata/%.bpf.c
+	$(BPF_COMPILE_RECIPE)
+
+bpf/%.bpf.o: bpf/%.bpf.c
+	$(BPF_COMPILE_RECIPE)
 
 .PHONY: clean
 clean: ## Clean build artifacts.
-	rm -f $(CNI_BINARY) $(BPF_OBJS) cover.out
+	rm -f $(CNI_BINARY) $(BPF_OBJS) $(BPF_TESTDATA_OBJS) cover.out
 
 ##@ Testing
 
