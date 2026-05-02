@@ -14,7 +14,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o bin/natra ./cmd/natra
 # Runtime
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+# libcap-utils provides `setcap`, used by the install DaemonSet to
+# grant the natra binary CAP_BPF + CAP_NET_ADMIN + CAP_PERFMON so the
+# CNI plugin can pin BPF links regardless of the caller's caps.
+RUN apk --no-cache add ca-certificates libcap
 
 COPY --from=builder /workspace/bin/natra /usr/local/bin/natra
 

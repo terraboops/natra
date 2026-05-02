@@ -20,6 +20,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 //go:embed natra.bpf.o
@@ -55,13 +57,17 @@ const (
 // per attached veth — the maps are not shared across pods because each
 // pod has its own rate limit, so concurrent CNI ADDs each instantiate
 // their own Program/Collection.
+//
+// Attachment goes via clsact qdisc + tc filter (see AttachIngress for
+// the rationale). The kernel's qdisc tree owns the attachment after
+// FilterReplace returns, so we don't track a userspace link handle.
 type Program struct {
 	coll      *ebpf.Collection
 	prog      *ebpf.Program
 	configMap *ebpf.Map
 	bucketMap *ebpf.Map
 	statsMap  *ebpf.Map
-	link      link.Link // tcx attachment; nil before Attach()
+	tcxLink   link.Link // unused for clsact path; reserved for future tcx-link path
 }
 
 // Load instantiates the embedded BPF object. The kernel verifies it on
@@ -134,19 +140,65 @@ func (p *Program) Configure(cfg Config) error {
 // eth0 ingress — i.e., packets arriving INTO the pod, which is the
 // direction `kubernetes.io/ingress-bandwidth` describes.
 //
-// Tries tcx first (kernel ≥ 6.6, qdisc-less); clsact fallback for
-// older kernels is TODO (P1.5+).
-func (p *Program) AttachIngress(ifIndex int) error {
-	tcx, err := link.AttachTCX(link.TCXOptions{
-		Interface: ifIndex,
-		Program:   p.prog,
-		Attach:    ebpf.AttachTCXIngress,
-	})
-	if err == nil {
-		p.link = tcx
-		return nil
+// Uses the legacy `clsact` + tc-filter path rather than tcx links,
+// because tcx links require BPF_OBJ_PIN to persist past the CNI
+// plugin process exit, and that syscall returned EPERM in our test
+// environment (likely an LSM/apparmor restriction on tcx-link pins
+// even with CAP_BPF). clsact attachment lives in the kernel's qdisc
+// tree — once `tc filter add` succeeds, the BPF program is referenced
+// by the filter and stays attached until the veth is deleted, with
+// no userspace fd / link / pin required. Tradeoff: clsact is older
+// (kernel 5.x+) but works on every kernel natra targets, including
+// 6.x where tcx is also available. Revisit when we have a confirmed
+// configuration where tcx-link pinning works.
+func (p *Program) AttachIngress(ifIndex int, _ string) error {
+	link, err := netlink.LinkByIndex(ifIndex)
+	if err != nil {
+		return fmt.Errorf("netlink LinkByIndex(%d): %w", ifIndex, err)
 	}
-	return fmt.Errorf("AttachTCX(ingress) failed and clsact fallback not yet implemented: %w (TODO: P1.5+ adds clsact)", err)
+
+	// 1. Make sure clsact qdisc exists on the link. Idempotent — if
+	// another tc filter (e.g. kindnet's, or a previous natra ADD on
+	// the same veth before recreate) already added clsact, we get
+	// EEXIST and ignore.
+	clsact := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+	if err := netlink.QdiscAdd(clsact); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("add clsact qdisc to ifindex %d: %w", ifIndex, err)
+	}
+
+	// 2. Attach the BPF program via a tc filter on the ingress hook.
+	// `Parent: HANDLE_MIN_INGRESS` selects the clsact ingress branch.
+	// `Priority: 1, Protocol: ETH_P_ALL` is the conventional default.
+	// `DirectAction: true` lets the BPF program return TC_ACT_* verdicts
+	// directly without a follow-on policer.
+	filter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    netlink.MakeHandle(0, 1),
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           p.prog.FD(),
+		Name:         "natra_ratelimit",
+		DirectAction: true,
+	}
+	if err := netlink.FilterReplace(filter); err != nil {
+		return fmt.Errorf("replace tc bpf filter on ifindex %d: %w", ifIndex, err)
+	}
+
+	// p.link stays nil — clsact attachment is anchored in the kernel's
+	// qdisc tree, no userspace handle to track. Cleanup happens when
+	// the underlying veth is deleted (which the next chained CNI plugin
+	// does at pod teardown), so cmdDel is a no-op too.
+	return nil
 }
 
 // Stats returns the accumulated counter values across all CPUs.
@@ -186,15 +238,17 @@ func (p *Program) readStat(idx uint32, sum *uint64) error {
 	return nil
 }
 
-// Close detaches the program (if attached) and frees the collection.
-// Safe to call multiple times.
+// Close releases the userspace BPF references. The kernel keeps the
+// program loaded and attached as long as the clsact filter holds a
+// reference, so closing here is safe — packets continue flowing
+// through the rate limiter after this call.
 func (p *Program) Close() error {
 	var firstErr error
-	if p.link != nil {
-		if err := p.link.Close(); err != nil {
+	if p.tcxLink != nil {
+		if err := p.tcxLink.Close(); err != nil {
 			firstErr = err
 		}
-		p.link = nil
+		p.tcxLink = nil
 	}
 	if p.coll != nil {
 		p.coll.Close()

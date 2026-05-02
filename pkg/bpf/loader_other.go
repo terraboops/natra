@@ -41,6 +41,6 @@ var errNotLinux = errors.New("pkg/bpf: BPF requires Linux; the natra binary is L
 
 func Load() (*Program, error)            { return nil, errNotLinux }
 func (*Program) Configure(Config) error  { return errNotLinux }
-func (*Program) AttachIngress(int) error { return errNotLinux }
+func (*Program) AttachIngress(int, string) error { return errNotLinux }
 func (*Program) Stats() (Stats, error)   { return Stats{}, errNotLinux }
 func (*Program) Close() error            { return nil }

@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -91,37 +92,50 @@ var _ = BeforeSuite(func() {
 	mustExec("kubectl", "apply", "-f", repoFile("manifests", "iperf-client.yaml"))
 
 	By("waiting for iperf pods Ready")
-	mustExec("kubectl", "wait", "--for=condition=Ready",
+	if err := exec.Command("kubectl", "wait", "--for=condition=Ready",
 		"pod/iperf-server", "pod/iperf-client",
-		"-n", namespace, "--timeout=120s")
+		"-n", namespace, "--timeout=120s").Run(); err != nil {
+		// Diagnostic dump to make BeforeSuite failures actionable —
+		// pod state, kubelet logs around CNI invocation, the conflist
+		// natra installed.
+		dump := func(name string, args ...string) {
+			GinkgoWriter.Printf("===== %s =====\n", name)
+			out, _ := exec.Command(args[0], args[1:]...).CombinedOutput()
+			GinkgoWriter.Printf("%s\n", out)
+		}
+		dump("kubectl describe pod/iperf-server", "kubectl", "describe", "pod/iperf-server", "-n", namespace)
+		dump("kubectl describe pod/iperf-client", "kubectl", "describe", "pod/iperf-client", "-n", namespace)
+		dump("daemonset logs", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "--tail=50")
+		dump("conflist on worker node", "docker", "exec", clusterName+"-worker", "sh", "-c", "ls /etc/cni/net.d && cat /etc/cni/net.d/*.conflist 2>/dev/null")
+		Fail("iperf pods failed to reach Ready (see diagnostics above)")
+	}
 })
 
 var _ = AfterSuite(func() {
+	if os.Getenv("NATRA_E2E_KEEP") == "1" {
+		GinkgoWriter.Printf("NATRA_E2E_KEEP=1 — leaving cluster %q up for inspection\n", clusterName)
+		return
+	}
 	By("deleting kind cluster")
 	_ = exec.Command("kind", "delete", "cluster", "--name", clusterName).Run()
 })
 
 var _ = Describe("natra e2e", func() {
-	It("kindnet provides connectivity and natra DaemonSet installs the binary", func() {
+	It("connectivity smoke: iperf pods can reach each other", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-
 		bps := runIperf(ctx)
-		GinkgoWriter.Printf("measured throughput: %.2f Mbps (target after Phase 1: ≤ %.2f Mbps)\n",
-			float64(bps)/1e6, float64(bandwidthBps)/1e6)
-
-		// Phase 0 smoke: assert there's *some* throughput (connectivity
-		// works, kind cluster is healthy, iperf pods can reach each
-		// other across nodes). The actual rate-limit assertion lives
-		// in PIt below and turns on with Phase 1 BPF code.
+		GinkgoWriter.Printf("measured throughput: %.2f Mbps\n", float64(bps)/1e6)
 		Expect(bps).To(BeNumerically(">", 0),
-			"smoke check: connectivity should work between iperf pods")
+			"connectivity should work between iperf pods")
 	})
 
-	PIt("enforces ingress-bandwidth annotation (Phase 1 — needs BPF dataplane)", func() {
+	It("enforces ingress-bandwidth annotation (Phase 1)", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		bps := runIperf(ctx)
+		GinkgoWriter.Printf("measured throughput: %.2f Mbps (target ≤ %.2f Mbps with +20%% slack)\n",
+			float64(bps)/1e6, float64(bandwidthBps)/1e6)
 		Expect(bps).To(BeNumerically("<=", int64(float64(bandwidthBps)*1.20)),
 			"throughput should be at or below the bandwidth annotation (+20%% slack)")
 	})

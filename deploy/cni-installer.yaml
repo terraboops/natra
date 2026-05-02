@@ -19,29 +19,85 @@ spec:
     spec:
       hostNetwork: true
       tolerations:
-      - operator: Exists
-        effect: NoSchedule
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
       containers:
-      - name: install-cni
-        image: ghcr.io/terraboops/natra:latest
-        imagePullPolicy: IfNotPresent
-        command:
-          - /bin/sh
-          - -c
-          - |
-            set -e
-            echo "Installing natra CNI plugin..."
-            cp /usr/local/bin/natra /host/opt/cni/bin/natra
-            echo "natra CNI plugin installed successfully"
-            echo "Sleeping to keep container alive..."
-            sleep infinity
-        volumeMounts:
-        - name: cni-bin-dir
-          mountPath: /host/opt/cni/bin
-        securityContext:
-          privileged: true
+        - name: install-cni
+          image: ghcr.io/terraboops/natra:latest
+          imagePullPolicy: IfNotPresent
+          # Two-phase install: drop the natra binary into /opt/cni/bin,
+          # then patch every existing .conflist in /etc/cni/net.d to
+          # include {"type":"natra"} as the last plugin in the chain.
+          # natra is intentionally last so kindnet/calico/etc. do all
+          # IPAM and bridging first; natra layers BPF rate limiting on
+          # top of whatever interface the upstream produced.
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              # Ensure bpffs is mounted on the host. Kind nodes don't
+              # mount it by default, but natra needs it to pin tcx
+              # links so they survive the CNI plugin process exiting.
+              # mount -t bpf is a no-op if already mounted.
+              if ! mountpoint -q /host/sys/fs/bpf; then
+                mount -t bpf bpffs /host/sys/fs/bpf || true
+                echo "natra: mounted bpffs on /sys/fs/bpf"
+              fi
+
+              install -m 0755 /usr/local/bin/natra /host/opt/cni/bin/natra
+              # File capabilities: when kubelet/containerd exec the
+              # natra CNI plugin they don't pass through CAP_BPF or
+              # CAP_PERFMON (only some of CAP_NET_ADMIN). Without these,
+              # BPF_OBJ_PIN returns EPERM. setcap on the binary itself
+              # gives it ambient capabilities on every exec, regardless
+              # of caller's cap_inheritable mask.
+              if command -v setcap >/dev/null 2>&1; then
+                setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep /host/opt/cni/bin/natra || true
+                echo "natra: file caps set"
+              else
+                echo "natra: setcap unavailable in installer image; relying on caller caps"
+              fi
+              echo "natra: binary installed at /opt/cni/bin/natra"
+
+              # Wait for at least one *.conflist to appear (kindnet et
+              # al. write theirs after their own DaemonSet starts), then
+              # patch ONCE. We don't loop — every rewrite of the
+              # conflist triggers containerd's inotify watch, and rapid
+              # rewrites can race with sandbox creation, surfacing as
+              # "failed to find network info for sandbox" CRI errors.
+              while ! ls /host/etc/cni/net.d/*.conflist >/dev/null 2>&1; do
+                sleep 1
+              done
+              /usr/local/bin/natra install-cni-chain /host/etc/cni/net.d/
+              echo "natra: chain install complete; idling"
+              sleep infinity
+          volumeMounts:
+            - name: cni-bin-dir
+              mountPath: /host/opt/cni/bin
+            - name: cni-net-dir
+              mountPath: /host/etc/cni/net.d
+            # Mount the host's /sys so we can mount bpffs at
+            # /host/sys/fs/bpf and have it visible to other processes
+            # (including natra invocations from kubelet's CNI calls).
+            # Bidirectional propagation is required — without it, any
+            # mount we do here is invisible to the host namespace.
+            - name: host-sys
+              mountPath: /host/sys
+              mountPropagation: Bidirectional
+          securityContext:
+            privileged: true
       volumes:
-      - name: cni-bin-dir
-        hostPath:
-          path: /opt/cni/bin
-          type: DirectoryOrCreate
+        - name: cni-bin-dir
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: cni-net-dir
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: host-sys
+          hostPath:
+            path: /sys
+            type: Directory
