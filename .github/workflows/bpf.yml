@@ -1,0 +1,41 @@
+name: BPF Dataplane Matrix (Layer 3)
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bpf:
+    name: BPF on kernel ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["5.15", "6.6", "bpf-next"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache lvh image
+        uses: actions/cache@v4
+        with:
+          path: ~/.lvh-images
+          key: lvh-images-${{ matrix.kernel }}
+
+      - name: Provision lvh VM
+        uses: cilium/little-vm-helper@main
+        with:
+          test-name: natra-bpf-${{ matrix.kernel }}
+          image: 'kind'
+          image-version: ${{ matrix.kernel }}
+          host-mount: ./
+          install-dependencies: 'true'
+          cmd: |
+            cd /host
+            apt-get update -qq
+            apt-get install -y -qq clang llvm make
+            make build-bpf
+            go test -tags=bpf -v ./test/bpf/...

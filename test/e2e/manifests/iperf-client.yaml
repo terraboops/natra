@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: iperf-client
+  namespace: natra-e2e
+  labels:
+    app: iperf-client
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: natra-e2e-control-plane
+  # Tolerate the control-plane no-schedule taint so the client lands here.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: iperf
+      image: networkstatic/iperf3:latest
+      command: ["sleep", "infinity"]

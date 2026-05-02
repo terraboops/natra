@@ -3,9 +3,15 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
+
+// maxRate is the largest rate we'll accept. Half of int64-max so the
+// default `burst = rate * 2` computation can't overflow. Real-world
+// networks don't exceed this in any meaningful sense (it's ~4.6 EB/s).
+const maxRate = math.MaxInt64 / 2
 
 // Config holds CNI plugin configuration parsed from Pod annotations
 type Config struct {
@@ -159,25 +165,33 @@ func parseBandwidth(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid number: %s", numStr)
 	}
 
-	// Apply multiplier based on suffix
+	var multiplier int64
 	switch suffix {
 	case "", "B":
-		return num, nil
+		multiplier = 1
 	case "K", "KB":
-		return num * 1000, nil
+		multiplier = 1000
 	case "M", "MB":
-		return num * 1000 * 1000, nil
+		multiplier = 1000 * 1000
 	case "G", "GB":
-		return num * 1000 * 1000 * 1000, nil
+		multiplier = 1000 * 1000 * 1000
 	case "KI", "KIB":
-		return num * 1024, nil
+		multiplier = 1024
 	case "MI", "MIB":
-		return num * 1024 * 1024, nil
+		multiplier = 1024 * 1024
 	case "GI", "GIB":
-		return num * 1024 * 1024 * 1024, nil
+		multiplier = 1024 * 1024 * 1024
 	default:
 		return 0, fmt.Errorf("unknown suffix: %s", suffix)
 	}
+
+	// Reject inputs that would overflow when multiplied (or when later
+	// doubled for the default burst). Catching it here gives a clear
+	// "value too large" error instead of silent wraparound.
+	if num > maxRate/multiplier {
+		return 0, fmt.Errorf("value too large: %d%s exceeds maxRate", num, suffix)
+	}
+	return num * multiplier, nil
 }
 
 // Validate checks if configuration is valid

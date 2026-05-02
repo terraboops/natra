@@ -1,0 +1,26 @@
+name: CNI Protocol (Layer 2)
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cni:
+    name: CNI integration + chaos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build natra binary
+        run: make build
+      - name: Run Layer 2 tests
+        run: |
+          # ubuntu-latest runners are root in the runner shell, so sudo is
+          # implicit. CAP_NET_ADMIN is available for netns.
+          sudo -E env "PATH=$PATH" go test -tags=integration -v ./test/cni/...

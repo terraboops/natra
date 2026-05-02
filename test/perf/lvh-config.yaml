@@ -1,0 +1,10 @@
+# Same kernel matrix as Layer 3 — perf comparison must match the kernel
+# coverage of the dataplane tests, otherwise we can validate behavior on
+# 5.15 but not know what its perf profile looks like there.
+kernels:
+  - name: "5.15"
+    image: "quay.io/lvh-images/kind:5.15"
+  - name: "6.6"
+    image: "quay.io/lvh-images/kind:6.6"
+  - name: "bpf-next"
+    image: "quay.io/lvh-images/kind:bpf-next"

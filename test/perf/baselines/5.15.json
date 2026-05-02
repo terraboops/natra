@@ -1,0 +1,5 @@
+{
+  "kernel": "5.15",
+  "_comment": "Phase-0 placeholder baseline. Refresh once Phase 1 BPF lands.",
+  "bpf_prog_run_ns_per_op_max": 5000.0
+}

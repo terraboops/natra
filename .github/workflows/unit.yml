@@ -1,0 +1,76 @@
+name: Unit + Fuzz + Bench (Layer 1)
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run unit tests
+        run: go test -race ./pkg/... -coverprofile cover.out
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./cover.out
+          fail_ci_if_error: false
+
+  fuzz:
+    name: Fuzz (30s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fuzz parser invariants
+        run: |
+          go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -run=^$ ./pkg/cni/config/...
+
+  bench:
+    name: Bench (compare to main)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+      - name: Bench HEAD
+        run: |
+          go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-head.txt
+      - name: Bench main baseline
+        run: |
+          git fetch origin main
+          git stash --include-untracked || true
+          git checkout origin/main || git checkout main || true
+          go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-main.txt || echo "no benchmarks on main yet"
+          git checkout -
+          git stash pop || true
+      - name: Compare with benchstat
+        run: |
+          if [ -s bench-main.txt ]; then
+            benchstat bench-main.txt bench-head.txt | tee bench-compare.txt
+          else
+            echo "No baseline on main yet — skipping regression check"
+          fi
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-*.txt

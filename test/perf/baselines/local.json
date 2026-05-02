@@ -1,0 +1,5 @@
+{
+  "kernel": "local",
+  "_comment": "Local-Mac (colima) baseline. Generous ceiling — placeholder.bpf.o is essentially a NOP, real measurements are 700-800 ns/op on M-series. Refresh with `make perf-baseline KERNEL=local` once Phase 1 BPF lands.",
+  "bpf_prog_run_ns_per_op_max": 5000.0
+}

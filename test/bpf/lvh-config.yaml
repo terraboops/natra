@@ -1,0 +1,16 @@
+# lvh kernel matrix for Layer 3 BPF dataplane tests.
+#
+# 5.15  — Ubuntu 22.04 LTS floor; common in production today.
+# 6.6   — first kernel where tcx is fully usable (the natra-preferred path).
+# bpf-next — moving target; catches verifier regressions before they ship.
+#
+# Image source: https://quay.io/repository/lvh-images/kind
+# Updated by the lvh image registry on a roughly monthly cadence; we pin
+# the kernel name (not a sha) so we follow security-patched versions.
+kernels:
+  - name: "5.15"
+    image: "quay.io/lvh-images/kind:5.15"
+  - name: "6.6"
+    image: "quay.io/lvh-images/kind:6.6"
+  - name: "bpf-next"
+    image: "quay.io/lvh-images/kind:bpf-next"

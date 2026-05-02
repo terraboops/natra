@@ -1,0 +1,49 @@
+name: Perf Matrix (Layer 5)
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf:
+    name: Perf on kernel ${{ matrix.kernel }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["5.15", "6.6", "bpf-next"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache lvh image
+        uses: actions/cache@v4
+        with:
+          path: ~/.lvh-images
+          key: lvh-images-${{ matrix.kernel }}-perf
+
+      - name: Provision lvh VM and run perf
+        uses: cilium/little-vm-helper@main
+        with:
+          test-name: natra-perf-${{ matrix.kernel }}
+          image: 'kind'
+          image-version: ${{ matrix.kernel }}
+          host-mount: ./
+          install-dependencies: 'true'
+          cmd: |
+            cd /host
+            apt-get update -qq
+            apt-get install -y -qq clang llvm make iperf3
+            bash test/perf/run.sh ${{ matrix.kernel }}
+            go test -tags=perf -v ./test/perf/...
+
+      - name: Upload perf results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-${{ matrix.kernel }}
+          path: test/perf/results-${{ matrix.kernel }}.json
+          if-no-files-found: ignore
