@@ -1,0 +1,45 @@
+name: License Scan
+
+# Two-stage license scan for due-diligence-grade detection of GPL family
+# obligations. Runs on every push (fast Go-deps check) and weekly
+# (full scancode-toolkit scan).
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Mondays 08:00 UTC — full scancode scan, catches new transitive
+    # dependencies and any vendored code that drifted.
+    - cron: '0 8 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-deps:
+    name: Go module licenses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@latest
+      - name: Scan
+        run: bash scripts/license-scan.sh go-only
+
+  scancode:
+    name: Full repo scan (scancode-toolkit)
+    # Run on PRs, push to main, and the weekly schedule. Not gating on
+    # every feature branch to keep CI under 10 minutes — go-deps catches
+    # most drift; scancode is the periodic deep audit.
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq (for precise reporting)
+        run: sudo apt-get install -y jq
+      - name: Run scancode in Docker
+        run: bash scripts/license-scan.sh scancode

@@ -55,6 +55,14 @@ vet: ## Run go vet against code.
 lint: golangci-lint ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
 
+.PHONY: license-scan
+license-scan: ## Two-stage license scan (go-licenses + scancode-toolkit). Fails on GPL family.
+	@bash scripts/license-scan.sh
+
+.PHONY: license-scan-fast
+license-scan-fast: ## Quick license check — Go module deps only (~5s).
+	@bash scripts/license-scan.sh go-only
+
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
@@ -192,7 +200,7 @@ endif
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers (auto-skips on Mac for L3/L5).
 
 .PHONY: ci
-ci: ## Run every layer end-to-end. Keeps going past failures; reports per-layer status; exits nonzero if any failed.
+ci: ## Run every layer end-to-end + lint + license scan. Keeps going past failures; reports per-layer status; exits nonzero if any failed.
 	@FAIL=0; \
 	declare -a RESULTS; \
 	run_layer() { \
@@ -206,6 +214,8 @@ ci: ## Run every layer end-to-end. Keeps going past failures; reports per-layer 
 			FAIL=$$((FAIL + 1)); \
 		fi; \
 	}; \
+	run_layer "lint"      $(MAKE) -s lint; \
+	run_layer "licenses"  $(MAKE) -s license-scan-fast; \
 	run_layer "L1  unit"  $(MAKE) -s test-unit; \
 	run_layer "L1  fuzz"  $(MAKE) -s test-fuzz; \
 	run_layer "L1  bench" $(MAKE) -s test-bench; \
