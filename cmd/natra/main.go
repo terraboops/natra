@@ -213,16 +213,16 @@ func parseConfig(stdin []byte) (*NetConf, error) {
 // resolveConfig reads natra's per-pod rate limit out of the parsed
 // CNI stdin. Two channels, in order of preference:
 //
-//   1. RuntimeConfig.Bandwidth — set by kubelet when the conflist
-//      entry declares `capabilities.bandwidth: true`. This is the
-//      canonical Kubernetes way and what kubelet derives from the
-//      `kubernetes.io/ingress-bandwidth` pod annotation. Rate is in
-//      BITS per second (kubelet/upstream-bandwidth convention); we
-//      divide by 8 to get the bytes/sec our BPF program expects.
+//  1. RuntimeConfig.Bandwidth — set by kubelet when the conflist
+//     entry declares `capabilities.bandwidth: true`. This is the
+//     canonical Kubernetes way and what kubelet derives from the
+//     `kubernetes.io/ingress-bandwidth` pod annotation. Rate is in
+//     BITS per second (kubelet/upstream-bandwidth convention); we
+//     divide by 8 to get the bytes/sec our BPF program expects.
 //
-//   2. RuntimeConfig.PodAnnotations — legacy / non-standard path some
-//      setups use, where the raw annotation string is passed through
-//      and we parse it ourselves. Already bytes/sec at that point.
+//  2. RuntimeConfig.PodAnnotations — legacy / non-standard path some
+//     setups use, where the raw annotation string is passed through
+//     and we parse it ourselves. Already bytes/sec at that point.
 //
 // Burst is clamped to 2× rate. Kubelet's default burst is MaxUint32
 // (4 GB) when the annotation doesn't specify one — that's effectively
