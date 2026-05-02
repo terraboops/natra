@@ -24,8 +24,7 @@ BPF_CLANG ?= clang
 endif
 
 CNI_BINARY := bin/natra
-BPF_OBJ := bpf/placeholder.bpf.o
-BPF_SRC := bpf/placeholder.bpf.c
+BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o
 
 # All Linux-test build tags. Each test file uses one of these.
 TAGS_INTEGRATION := integration
@@ -74,9 +73,12 @@ build-cni: ## Build natra binary for Linux (cross-compiles from macOS).
 	GOOS=linux CGO_ENABLED=0 go build -o $(CNI_BINARY) ./cmd/natra
 
 .PHONY: build-bpf
-build-bpf: $(BPF_OBJ) ## Compile BPF C source to bytecode (.o).
+build-bpf: $(BPF_OBJS) ## Compile BPF C sources to bytecode (.o).
 
-$(BPF_OBJ): $(BPF_SRC)
+# Pattern rule: bpf/%.bpf.o ← bpf/%.bpf.c. Includes libbpf + linux-libc
+# headers because natra.bpf.c uses real network headers and bpf_helpers.h.
+# placeholder.bpf.c is self-contained; the same flags work for both.
+bpf/%.bpf.o: bpf/%.bpf.c
 	@if [ ! -x "$(BPF_CLANG)" ] && ! command -v "$(BPF_CLANG)" >/dev/null 2>&1; then \
 		echo ""; \
 		echo "BPF compile needs LLVM clang ($(BPF_CLANG))."; \
@@ -89,12 +91,18 @@ $(BPF_OBJ): $(BPF_SRC)
 		echo ""; \
 		exit 0; \
 	fi; \
-	$(BPF_CLANG) -O2 -g -target bpf -c $(BPF_SRC) -o $(BPF_OBJ); \
-	echo "Built $(BPF_OBJ)"
+	HOST_ARCH=$$(uname -m); \
+	BPF_ARCH=$$(echo $$HOST_ARCH | sed 's/x86_64/x86/;s/aarch64/arm64/'); \
+	GNU_TRIPLE=$$(echo $$HOST_ARCH | sed 's/aarch64/aarch64-linux-gnu/;s/x86_64/x86_64-linux-gnu/'); \
+	$(BPF_CLANG) -O2 -g -Wall -Werror -target bpf -mcpu=v3 \
+		-D__TARGET_ARCH_$$BPF_ARCH \
+		-I/usr/include/$$GNU_TRIPLE \
+		-c $< -o $@; \
+	echo "Built $@"
 
 .PHONY: clean
 clean: ## Clean build artifacts.
-	rm -f $(CNI_BINARY) $(BPF_OBJ) cover.out
+	rm -f $(CNI_BINARY) $(BPF_OBJS) cover.out
 
 ##@ Testing
 
@@ -128,7 +136,7 @@ test-bpf: ## Layer 3 — BPF dataplane tests (Linux: lvh; Mac: colima kernel via
 ifeq ($(UNAME_S),Linux)
 	@KERNEL=$${KERNEL:-6.6}; bash test/bpf/run-in-vm.sh $$KERNEL
 else
-	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make >/dev/null && make build-bpf && go test -tags=bpf -v ./test/bpf/..."
+	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && make build-bpf && go test -tags=bpf -v ./test/bpf/..."
 endif
 
 .PHONY: test-bpf-all
