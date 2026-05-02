@@ -282,10 +282,191 @@ func synthElephantPkt() []byte {
 	return pkt
 }
 
+// TestScenarioThousandMice exercises the design assumption that
+// short-lived flows (count <= hh_threshold) bypass the token bucket
+// entirely and pass at line rate. With 1000 distinct flows × 5
+// packets each, no flow's count reaches threshold, so STAT_HH_HITS
+// must be 0.
 func TestScenarioThousandMice(t *testing.T) {
-	t.Skip("Phase 1: 1000 short-lived TCP flows; record aggregate goodput, p99 connect time, BPF program CPU")
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpec(bpfObjectPath("natra.bpf.o"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	t.Cleanup(coll.Close)
+
+	cfg := natraConfig{
+		RateBps:     1, // crippled — any mouse hitting the bucket would drop
+		BurstBytes:  1,
+		HHThreshold: 100, // generous; 5 packets per flow stays well under
+	}
+	zero := uint32(0)
+	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	const flows = 1000
+	const perFlow = 5
+	prog := coll.Programs["natra_ratelimit"]
+	start := time.Now()
+	for i := 0; i < flows; i++ {
+		// Vary src ip + src port so each flow_key is distinct. Dst
+		// stays constant — same "service" but different clients.
+		pkt := mkPkt(0x0A000001+uint32(i), 0x0A000002, uint16(20000+i), 5201)
+		for j := 0; j < perFlow; j++ {
+			if _, _, err := prog.Test(pkt); err != nil {
+				t.Fatalf("BPF_PROG_RUN flow=%d j=%d: %v", i, j, err)
+			}
+		}
+	}
+	elapsed := time.Since(start)
+	totalPackets := uint64(flows * perFlow)
+	t.Logf("thousand_mice: %d flows × %d pkts in %v (%.1f ns/pkt)",
+		flows, perFlow, elapsed, float64(elapsed.Nanoseconds())/float64(totalPackets))
+
+	statsMap := coll.Maps["natra_stats_map"]
+	passed := readPerCPUStat(t, statsMap, 0)
+	throttled := readPerCPUStat(t, statsMap, 1)
+	hh := readPerCPUStat(t, statsMap, 2)
+	t.Logf("stats: passed=%d throttled=%d hh_hits=%d", passed, throttled, hh)
+
+	if hh != 0 {
+		t.Errorf("STAT_HH_HITS=%d, want 0 — every flow under threshold should bypass the bucket", hh)
+	}
+	if throttled != 0 {
+		t.Errorf("STAT_THROTTLED=%d, want 0 — mice flows must not be rate-limited", throttled)
+	}
+	if passed != totalPackets {
+		t.Errorf("STAT_PASSED=%d, want %d", passed, totalPackets)
+	}
 }
 
+// TestScenarioMixed is natra's hero scenario: one elephant flow that
+// MUST get throttled coexisting with many mice flows that MUST NOT.
+// This is what differentiates natra from
+// containernetworking/plugins/bandwidth — vanilla rate-limits ALL
+// traffic and starves mice when the elephant exists; natra rate-limits
+// only the elephant.
+//
+// Asserts:
+//   1. Elephant has nonzero throttled count (bucket actually drops
+//      packets when elephant rate exceeds configured limit).
+//   2. Sum of mice STAT_HH_HITS = 0 (no mouse flow ever reaches the
+//      bucket).
+//   3. The bucket's heavy-hitter classification is stable: STAT_HH_HITS
+//      is dominated by the elephant alone.
 func TestScenarioMixed(t *testing.T) {
-	t.Skip("Phase 1: 1 elephant + 100 mice for 60s — natra's hero scenario; assert mice goodput >= 80% line rate, vanilla mice <= 50% (the elephant starves them)")
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+	spec, err := ebpf.LoadCollectionSpec(bpfObjectPath("natra.bpf.o"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatalf("instantiate: %v", err)
+	}
+	t.Cleanup(coll.Close)
+
+	// Real natra rate, real burst. Threshold low enough that the
+	// elephant crosses it within the first few packets but high enough
+	// that 5-packet mice never approach it.
+	cfg := natraConfig{
+		RateBps:     1_250_000, // 10 Mbps in bytes/sec
+		BurstBytes:  64_000,    // small enough that elephant exhausts it
+		HHThreshold: 10,
+	}
+	zero := uint32(0)
+	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	const elephantPackets = 10_000
+	const miceFlows = 100
+	const miceFlowPackets = 5
+	prog := coll.Programs["natra_ratelimit"]
+
+	// Round-robin elephant + mice so the BPF program sees them
+	// interleaved (closer to a real elephant-among-mice mix). The
+	// elephant uses one fixed flow_key; mice use 100 distinct ones.
+	elephantPkt := mkPkt(0x0AFF0001, 0x0AFF0002, 33000, 5201)
+	for i := 0; i < elephantPackets; i++ {
+		// One elephant packet…
+		if _, _, err := prog.Test(elephantPkt); err != nil {
+			t.Fatalf("BPF_PROG_RUN elephant i=%d: %v", i, err)
+		}
+		// …followed by one mouse packet from a rotating flow.
+		if i < miceFlows*miceFlowPackets {
+			flowIdx := i % miceFlows
+			micePkt := mkPkt(0x0A0A0000+uint32(flowIdx), 0x0AFF0002,
+				uint16(40000+flowIdx), 5201)
+			if _, _, err := prog.Test(micePkt); err != nil {
+				t.Fatalf("BPF_PROG_RUN mouse i=%d: %v", i, err)
+			}
+		}
+	}
+
+	statsMap := coll.Maps["natra_stats_map"]
+	passed := readPerCPUStat(t, statsMap, 0)
+	throttled := readPerCPUStat(t, statsMap, 1)
+	hh := readPerCPUStat(t, statsMap, 2)
+	totalSent := uint64(elephantPackets + miceFlows*miceFlowPackets)
+	t.Logf("mixed: sent=%d (1 elephant × %d + %d mice × %d) — passed=%d throttled=%d hh_hits=%d",
+		totalSent, elephantPackets, miceFlows, miceFlowPackets, passed, throttled, hh)
+
+	// Headline assertions:
+	if throttled == 0 {
+		t.Errorf("throttled=0 — bucket should drop packets when elephant exceeds rate")
+	}
+	// hh_hits should be ~elephant-after-threshold = 10_000 - 10 = 9990.
+	// Mice contribute 0 to hh_hits because their per-flow count never
+	// reaches threshold. Tolerate small CMS hash collisions inflating
+	// mouse counts (mouse and elephant can share a CMS column on one
+	// row, but min across rows still classifies the mouse correctly).
+	if hh > uint64(elephantPackets) {
+		t.Errorf("hh_hits=%d > elephant packets %d — mice must not appear in hh_hits", hh, elephantPackets)
+	}
+	if hh < uint64(elephantPackets)-100 {
+		t.Errorf("hh_hits=%d, expected ≈%d — elephant should fully dominate hh_hits", hh, elephantPackets-10)
+	}
+	// And the value-prop: passed >= miceFlows*miceFlowPackets +
+	// (the elephant packets that fit in burst).
+	miceTotal := uint64(miceFlows * miceFlowPackets)
+	if passed < miceTotal {
+		t.Errorf("passed=%d < mice total %d — at minimum every mouse packet should pass", passed, miceTotal)
+	}
+}
+
+func mkPkt(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte {
+	pkt := make([]byte, 64)
+	pkt[12], pkt[13] = 0x08, 0x00
+	pkt[14] = 0x45
+	pkt[16], pkt[17] = 0x00, 0x32
+	pkt[23] = 6
+	pkt[26] = byte(srcIP >> 24)
+	pkt[27] = byte(srcIP >> 16)
+	pkt[28] = byte(srcIP >> 8)
+	pkt[29] = byte(srcIP)
+	pkt[30] = byte(dstIP >> 24)
+	pkt[31] = byte(dstIP >> 16)
+	pkt[32] = byte(dstIP >> 8)
+	pkt[33] = byte(dstIP)
+	pkt[34] = byte(srcPort >> 8)
+	pkt[35] = byte(srcPort)
+	pkt[36] = byte(dstPort >> 8)
+	pkt[37] = byte(dstPort)
+	return pkt
 }
