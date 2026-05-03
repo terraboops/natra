@@ -1,4 +1,4 @@
-name: Perf Matrix (Layer 5)
+name: Perf (Layer 5)
 
 on:
   push:
@@ -9,41 +9,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Single-kernel run on the GH Actions runner. lvh-based multi-kernel
+  # matrix was attempted and removed for the same reason as bpf.yml —
+  # the lvh image tags bit-rotted. Re-introduce as perf-matrix.yml when
+  # quay.io/lvh-images stabilises.
   perf:
-    name: Perf on kernel ${{ matrix.kernel }}
+    name: Perf scenarios on runner kernel
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        kernel: ["5.15", "6.6", "bpf-next"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache lvh image
-        uses: actions/cache@v4
+      - uses: actions/setup-go@v5
         with:
-          path: ~/.lvh-images
-          key: lvh-images-${{ matrix.kernel }}-perf
-
-      - name: Provision lvh VM and run perf
-        uses: cilium/little-vm-helper@main
-        with:
-          test-name: natra-perf-${{ matrix.kernel }}
-          image: 'kind'
-          image-version: ${{ matrix.kernel }}
-          host-mount: ./
-          install-dependencies: 'true'
-          cmd: |
-            cd /host
-            apt-get update -qq
-            apt-get install -y -qq clang llvm make iperf3
-            bash test/perf/run.sh ${{ matrix.kernel }}
-            go test -tags=perf -v ./test/perf/...
-
-      - name: Upload perf results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: perf-${{ matrix.kernel }}
-          path: test/perf/results-${{ matrix.kernel }}.json
-          if-no-files-found: ignore
+          go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
+      - name: Show runner kernel
+        run: uname -r
+      - name: Run Layer 5 tests
+        # KERNEL=local matches the baseline file name we ship in
+        # test/perf/baselines/local.json — different from the lvh path
+        # which would have used kernel-version-named baselines.
+        env:
+          KERNEL: local
+        run: |
+          sudo -E env "PATH=$PATH" KERNEL=$KERNEL go test -tags=perf -v ./test/perf/...

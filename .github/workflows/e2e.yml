@@ -17,11 +17,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Build natra binary
-        run: make build
+      - uses: ./.github/actions/build-bpf
+      - name: Build natra binary (Linux native, no Docker wrap)
+        run: make build-cni-inner
       - name: Install kind
         uses: helm/kind-action@v1
         with:
           install_only: true
       - name: Run Layer 4 tests
-        run: go test -tags=e2e -v ./test/e2e/...
+        run: go test -tags=e2e -v -timeout=20m ./test/e2e/...

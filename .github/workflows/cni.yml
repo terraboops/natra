@@ -17,10 +17,18 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
+      - name: Install netns prerequisites
+        # iproute2 is required by the test helpers (netlink-driven veth
+        # setup falls back to `ip` for some link operations on older
+        # netlink versions).
+        run: sudo apt-get install -y -qq iproute2
       - name: Build natra binary
-        run: make build
+        # Native Linux build path — `make build-cni-inner` runs locally
+        # (no Docker wrap on the runner).
+        run: make build-cni-inner
       - name: Run Layer 2 tests
         run: |
-          # ubuntu-latest runners are root in the runner shell, so sudo is
-          # implicit. CAP_NET_ADMIN is available for netns.
+          # ubuntu-latest runners are root-equivalent via passwordless
+          # sudo. CAP_NET_ADMIN is available for netns operations.
           sudo -E env "PATH=$PATH" go test -tags=integration -v ./test/cni/...

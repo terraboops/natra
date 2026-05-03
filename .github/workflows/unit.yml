@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
       - name: Run unit tests
         run: go test -race ./pkg/... -coverprofile cover.out
       - name: Upload coverage
@@ -25,6 +26,10 @@ jobs:
         with:
           files: ./cover.out
           fail_ci_if_error: false
+          # Tokenless uploads on protected branches now require an explicit
+          # opt-out. Without this, codecov errors out and (despite
+          # fail_ci_if_error: false) leaves an annotation muddying the run.
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   fuzz:
     name: Fuzz (30s)
@@ -34,6 +39,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Fuzz only targets pkg/cni/config which doesn't import pkg/bpf,
+      # so we can skip the BPF build here. Saves ~30s per run.
       - name: Fuzz parser invariants
         run: |
           go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -run=^$ ./pkg/cni/config/...
@@ -48,6 +55,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
       - name: Bench HEAD
@@ -55,9 +63,16 @@ jobs:
           go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-head.txt
       - name: Bench main baseline
         run: |
+          # Main may not have benchmarks at first push to a PR branch — the
+          # `|| echo` fallback keeps the workflow green; the compare step
+          # below skips the diff when bench-main.txt is empty.
           git fetch origin main
           git stash --include-untracked || true
           git checkout origin/main || git checkout main || true
+          # build-bpf again at the main commit, since pkg/bpf/natra.bpf.o
+          # may differ between branches.
+          (sudo apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && \
+           make build-bpf && cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o) || true
           go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-main.txt || echo "no benchmarks on main yet"
           git checkout -
           git stash pop || true

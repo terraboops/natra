@@ -1,4 +1,4 @@
-name: BPF Dataplane Matrix (Layer 3)
+name: BPF Dataplane (Layer 3)
 
 on:
   push:
@@ -9,33 +9,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Single-kernel run on the GH Actions runner's kernel. lvh-based
+  # multi-kernel matrix was attempted and removed: the upstream
+  # quay.io/lvh-images/kind:<version> tags bit-rotted (manifest unknown)
+  # and lvh's image-pull retried indefinitely. When/if the lvh registry
+  # stabilises, the matrix can come back as a separate workflow named
+  # bpf-matrix.yml without disturbing this file.
   bpf:
-    name: BPF on kernel ${{ matrix.kernel }}
+    name: BPF tests on runner kernel
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        kernel: ["5.15", "6.6", "bpf-next"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache lvh image
-        uses: actions/cache@v4
+      - uses: actions/setup-go@v5
         with:
-          path: ~/.lvh-images
-          key: lvh-images-${{ matrix.kernel }}
-
-      - name: Provision lvh VM
-        uses: cilium/little-vm-helper@main
-        with:
-          test-name: natra-bpf-${{ matrix.kernel }}
-          image: 'kind'
-          image-version: ${{ matrix.kernel }}
-          host-mount: ./
-          install-dependencies: 'true'
-          cmd: |
-            cd /host
-            apt-get update -qq
-            apt-get install -y -qq clang llvm make
-            make build-bpf
-            go test -tags=bpf -v ./test/bpf/...
+          go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
+      - name: Show runner kernel
+        run: uname -r
+      - name: Run Layer 3 tests
+        run: |
+          sudo -E env "PATH=$PATH" go test -tags=bpf -v ./test/bpf/...

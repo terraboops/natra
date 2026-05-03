@@ -39,7 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install jq (for precise reporting)
-        run: sudo apt-get install -y jq
-      - name: Run scancode in Docker
+      - name: Install scancode prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq python3-pip
+      - name: Run scancode (pip install path)
         run: bash scripts/license-scan.sh scancode

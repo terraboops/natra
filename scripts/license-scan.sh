@@ -77,29 +77,40 @@ stage_go_licenses() {
 
 stage_scancode() {
 	echo "==> stage 2: scancode-toolkit"
-	if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-		echo "scancode needs Docker (running). Skipping."
-		return 0
+
+	# Use pip install rather than the Docker image — the upstream
+	# Docker registry path has been unstable (ghcr.io/aboutcode-org
+	# returns "manifest unknown" intermittently). pip install of the
+	# `scancode-toolkit` package is the upstream-recommended path and
+	# pulls a frozen-version wheel, which is more reproducible across
+	# CI runs anyway.
+	if ! command -v scancode >/dev/null 2>&1; then
+		if ! command -v pip3 >/dev/null 2>&1; then
+			echo "scancode needs pip3 (apt-get install python3-pip). Skipping."
+			return 0
+		fi
+		echo "installing scancode-toolkit via pip..."
+		pip3 install --quiet --user scancode-toolkit || {
+			echo "pip install scancode-toolkit failed. Skipping scan."
+			return 0
+		}
+		export PATH="$HOME/.local/bin:$PATH"
 	fi
 
-	# Output JSON to a temp file and parse with jq. Use the maintained
-	# image from the scancode project. -clp = copyrights, licenses,
-	# packages.  --processes 4 is enough for natra-sized repos.
 	local out_file
 	out_file=$(mktemp -t natra-scancode.XXXXXX.json)
 	trap "rm -f $out_file" EXIT
 
-	docker run --rm \
-		-v "$REPO_ROOT:/scan" \
-		ghcr.io/aboutcode-org/scancode-toolkit:latest \
-		--license --copyright --json-pp /scan/$(basename "$out_file") \
+	# -clp* = copyrights, licenses, packages. --processes 4 is enough
+	# for natra-sized repos. --strip-root removes the leading /scan/
+	# from reported paths so allowlist matching works portably.
+	scancode \
+		--license --copyright \
+		--json-pp "$out_file" \
 		--processes 4 \
 		--strip-root \
-		/scan \
+		"$REPO_ROOT" \
 		>/dev/null
-
-	# scancode wrote inside the mount; move it out so we can read it.
-	mv "$REPO_ROOT/$(basename "$out_file")" "$out_file" 2>/dev/null || true
 
 	# Use jq if available; otherwise grep. We're looking for files where
 	# any detected license expression matches the GPL family regex.

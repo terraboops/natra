@@ -1,0 +1,26 @@
+name: 'Build natra BPF object'
+description: |
+  Installs clang/llvm/libbpf-dev/linux-libc-dev on the runner and runs
+  `make build-bpf`, then copies the resulting bpf/natra.bpf.o into
+  pkg/bpf/ where loader.go's go:embed expects it.
+
+  Required because pkg/bpf/loader.go uses //go:embed natra.bpf.o, and
+  CI workflows that run `go test ./pkg/...` (unit, bench) or `go build`
+  (cni, e2e) would otherwise fail at compile time with
+  "pattern natra.bpf.o: no matching files found".
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install BPF build deps
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev
+    - name: Build BPF object
+      shell: bash
+      run: |
+        make build-bpf
+        mkdir -p pkg/bpf
+        cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
+        ls -la pkg/bpf/natra.bpf.o
