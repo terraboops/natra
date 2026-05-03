@@ -27,12 +27,22 @@ MODE="${1:-both}"
 # weak copyleft but still impose obligations.
 GPL_FAMILY_RE='GPL-[0-9]|AGPL|SSPL|CDDL|EPL-[0-9]'
 
-# Paths that are EXPECTED to contain copyleft and are intentional.
-# Update with comments when adding entries — the maintainer should
-# understand each one.
+# Paths that are EXPECTED to contain copyleft references and are
+# intentional. Update with comments when adding entries — the
+# maintainer should understand each one.
+#
+# Includes both:
+#   - real GPL files (BPF C, which uses GPL-only kernel helpers)
+#   - false-positive files that scancode flags because they MENTION
+#     license names in comments/strings (Makefiles documenting libbpf
+#     deps, the scancode wrapper script itself).
 ALLOWLIST=(
-	"bpf/natra.bpf.c"          # GPL header line; BPF kernel helpers are GPL-only.
-	"bpf/placeholder.bpf.c"    # Apache-2.0 placeholder; appears here for completeness.
+	"bpf/natra.bpf.c"                          # real: GPL header line; BPF kernel helpers are GPL-only.
+	"bpf/placeholder.bpf.c"                    # real: Apache-2.0 placeholder.
+	"bpf/testdata/invalid_oob_packet_access.bpf.c"  # real: GPL — BPF chaos fixture.
+	"Makefile"                                 # false-positive: Makefile comments mention libbpf/GPL deps.
+	"scripts/license-scan.sh"                  # false-positive: this script literally lists GPL/AGPL/SSPL names to detect them.
+	".github/workflows/license.yml"            # false-positive: workflow that runs this script.
 )
 
 is_allowed() {

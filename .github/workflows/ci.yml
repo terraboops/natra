@@ -24,9 +24,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # golangci-lint must be built against the same Go version (or
+      # newer) as the repo it lints. natra targets go 1.25; v2.3.0
+      # was built with go 1.24 and rejects the config. v2.5.0+ is
+      # built with go 1.25.
       - uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.3.0
+          version: v2.5.0
 
   build:
     name: Build
@@ -36,7 +40,16 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: make build
+      - uses: ./.github/actions/build-bpf
+      # `make build-cni-inner` skips the `fmt vet` chain that `make
+      # build` runs first — fmt+vet would re-`go vet ./...` against the
+      # whole tree, including pkg/bpf which needs the embed file we
+      # just produced. Doing fmt+vet separately AFTER the BPF prep
+      # keeps the build job linear.
+      - run: |
+          go fmt ./...
+          go vet ./...
+          make build-cni-inner
 
   # `all-green` waits for every other workflow on this commit to finish.
   # If any of them failed, this job fails too — giving branch protection
