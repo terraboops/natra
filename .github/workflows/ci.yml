@@ -24,6 +24,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Same BPF prep as the per-layer workflows — golangci-lint
+      # type-checks pkg/bpf which requires the embed file to exist.
+      - uses: ./.github/actions/build-bpf
       # golangci-lint must be built against the same Go version (or
       # newer) as the repo it lints. natra targets go 1.25; v2.3.0
       # was built with go 1.24 and rejects the config. v2.5.0+ is
