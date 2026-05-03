@@ -39,9 +39,14 @@ type Config struct {
 // TokenBucket mirrors `struct token_bucket`. Field order matters; the
 // 4-byte spin lock field at the front + 4 bytes of pad align the 64-bit
 // fields to 8 bytes (BPF spin lock fields are exactly u32-sized).
+//
+// The two leading reserved fields hold the kernel-managed spin lock
+// state. Userspace zero-fills them on map writes; we never read them.
+// The unused-field linter complains, but the layout match is the
+// whole point — drop them and the ABI silently slides.
 type TokenBucket struct {
-	_lock        uint32 // bpf_spin_lock — kernel writes; userspace zero-fills.
-	_pad         uint32
+	Reserved0    uint32 //nolint:unused // bpf_spin_lock layout placeholder
+	Reserved1    uint32 //nolint:unused // 64-bit alignment pad
 	Tokens       uint64
 	LastUpdateNs uint64
 }
@@ -182,7 +187,9 @@ func (p *Program) PinMaps(dir, containerID string) error {
 // 6.x where tcx is also available. Revisit when we have a confirmed
 // configuration where tcx-link pinning works.
 func (p *Program) AttachIngress(ifIndex int, _ string) error {
-	link, err := netlink.LinkByIndex(ifIndex)
+	// `nl` (not `link`) so we don't shadow the cilium/ebpf/link
+	// package imported above — golangci's revive flags the shadow.
+	nl, err := netlink.LinkByIndex(ifIndex)
 	if err != nil {
 		return fmt.Errorf("netlink LinkByIndex(%d): %w", ifIndex, err)
 	}
@@ -193,7 +200,7 @@ func (p *Program) AttachIngress(ifIndex int, _ string) error {
 	// EEXIST and ignore.
 	clsact := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
+			LinkIndex: nl.Attrs().Index,
 			Handle:    netlink.MakeHandle(0xffff, 0),
 			Parent:    netlink.HANDLE_CLSACT,
 		},
@@ -210,7 +217,7 @@ func (p *Program) AttachIngress(ifIndex int, _ string) error {
 	// directly without a follow-on policer.
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
+			LinkIndex: nl.Attrs().Index,
 			Parent:    netlink.HANDLE_MIN_INGRESS,
 			Handle:    netlink.MakeHandle(0, 1),
 			Protocol:  unix.ETH_P_ALL,

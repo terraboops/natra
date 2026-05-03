@@ -40,12 +40,12 @@ func dumpStats(args []string) error {
 	if err != nil {
 		return fmt.Errorf("open config map: %w", err)
 	}
-	defer cfgMap.Close()
+	defer func() { _ = cfgMap.Close() }()
 	statsMap, err := open("stats")
 	if err != nil {
 		return fmt.Errorf("open stats map: %w", err)
 	}
-	defer statsMap.Close()
+	defer func() { _ = statsMap.Close() }()
 
 	zero := uint32(0)
 	var rawCfg [24]byte
@@ -79,10 +79,10 @@ func dumpStats(args []string) error {
 	// CMS map is optional (absent for the placeholder program).
 	cmsMap, err := open("cms")
 	if err == nil {
-		defer cmsMap.Close()
+		defer func() { _ = cmsMap.Close() }()
 		var (
-			zeros, nonZero  int
-			max, total      uint32
+			zeros, nonZero int
+			max, total     uint32
 		)
 		var max32 uint32
 		_ = max32
