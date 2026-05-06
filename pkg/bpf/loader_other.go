@@ -1,10 +1,8 @@
 //go:build !linux
 
 // Stub for non-Linux platforms. The natra binary only ships for Linux,
-// but `go test ./...` on macOS still needs pkg/bpf to compile so plain
-// builds on developer machines don't error out. None of these stubs
-// would ever execute in production — natra binary on Linux compiles
-// loader.go instead.
+// but `go test ./...` on macOS needs pkg/bpf to compile so dev builds
+// don't error out. Nothing here ever runs in production.
 
 package bpf
 
@@ -17,13 +15,8 @@ type Config struct {
 }
 
 type TokenBucket struct {
-	// Reserved layout fields — see pkg/bpf/loader.go for the real
-	// ABI. The non-Linux build is type-only; nothing reads or writes
-	// these fields, but keeping the layout matched makes drift
-	// impossible to introduce silently. Underscore-prefixed names
-	// + a //nolint:unused directive document the intent.
-	Reserved0    uint32 //nolint:unused // bpf_spin_lock layout placeholder
-	Reserved1    uint32 //nolint:unused // 64-bit alignment pad
+	_            uint32 // bpf_spin_lock
+	_            uint32 // alignment
 	Tokens       uint64
 	LastUpdateNs uint64
 }
@@ -44,9 +37,9 @@ type Program struct{}
 
 var errNotLinux = errors.New("pkg/bpf: BPF requires Linux; the natra binary is Linux-only")
 
-func Load() (*Program, error)                    { return nil, errNotLinux }
-func (*Program) Configure(Config) error          { return errNotLinux }
-func (*Program) AttachIngress(int, string) error { return errNotLinux }
-func (*Program) PinMaps(string, string) error    { return errNotLinux }
-func (*Program) Stats() (Stats, error)           { return Stats{}, errNotLinux }
-func (*Program) Close() error                    { return nil }
+func Load() (*Program, error)                 { return nil, errNotLinux }
+func (*Program) Configure(Config) error       { return errNotLinux }
+func (*Program) AttachIngress(int) error      { return errNotLinux }
+func (*Program) PinMaps(string, string) error { return errNotLinux }
+func (*Program) Stats() (Stats, error)        { return Stats{}, errNotLinux }
+func (*Program) Close() error                 { return nil }

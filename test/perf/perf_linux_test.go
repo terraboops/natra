@@ -7,11 +7,12 @@
 // plugins; results are diffed against baselines/<kernel>.json and the
 // test fails if natra regresses or stops winning the mixed scenario.
 //
-// Phase 0: a single end-to-end micro-scenario runs (BPF_PROG_RUN
-// throughput against the placeholder program) and tries to compare
-// against a baseline. Without a baseline file it fails — surfacing the
-// "no baseline yet" state rather than silently passing. Phase 1 fills
-// in the real elephant/mice scenarios alongside natra's BPF dataplane.
+// Scenarios:
+//   - TestBPFProgRunThroughput     — micro: ns/op for the placeholder
+//   - TestScenarioOneElephant      — single elephant, expect throttling
+//   - TestScenarioThousandMice     — 1000 short flows, expect zero hh hits
+//   - TestScenarioMixed            — elephant + mice, mice survive
+//   - TestScenarioMixedVsVanilla   — head-to-head with bpf/vanilla.bpf.o
 
 package perf_test
 
@@ -25,6 +26,15 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+
+	"github.com/terraboops/natra/pkg/bpf"
+)
+
+// Pull canonical BPF struct shapes from pkg/bpf so the L5 perf tests
+// don't carry their own copy of the kernel ABI.
+type (
+	natraConfig = bpf.Config
+	tokenBucket = bpf.TokenBucket
 )
 
 func bpfObjectPath(name string) string {
@@ -72,10 +82,10 @@ func loadBaseline(kernel string) (*baseline, error) {
 	return &b, nil
 }
 
-// TestBPFProgRunThroughput is the Phase 0 scenario: run BPF_PROG_RUN
-// against the placeholder program for a fixed budget and report ns/op.
-// Compares to the per-kernel baseline; fails if there's no baseline (so
-// the absence is loud, not silent) or if we regress past the threshold.
+// TestBPFProgRunThroughput runs BPF_PROG_RUN against the placeholder
+// program for a fixed iteration count and compares ns/op to the
+// per-kernel baseline. Fails on missing baseline (loud absence) or on
+// regression past the recorded ceiling.
 func TestBPFProgRunThroughput(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -124,23 +134,6 @@ func TestBPFProgRunThroughput(t *testing.T) {
 		t.Errorf("regression: %.1f ns/op > baseline %.1f ns/op (kernel=%s)",
 			nsPerOp, bl.BPFProgRunNsPerOpMax, kernel)
 	}
-}
-
-// natraConfig / tokenBucket / synthEthIPpktFromFlow mirror the structs
-// in test/bpf/ratelimit_linux_test.go. Duplicated here rather than
-// shared so the L5 perf scenarios stay self-contained and test/bpf can
-// keep its build tag (`bpf`) distinct from L5's (`perf`).
-type natraConfig struct {
-	RateBps     uint64
-	BurstBytes  uint64
-	HHThreshold uint64
-}
-
-type tokenBucket struct {
-	Reserved0    uint32 //nolint:unused
-	Reserved1    uint32 //nolint:unused
-	Tokens       uint64
-	LastUpdateNs uint64
 }
 
 func TestScenarioOneElephant(t *testing.T) {
@@ -350,20 +343,14 @@ func TestScenarioThousandMice(t *testing.T) {
 	}
 }
 
-// TestScenarioMixed is natra's hero scenario: one elephant flow that
-// MUST get throttled coexisting with many mice flows that MUST NOT.
-// This is what differentiates natra from
-// containernetworking/plugins/bandwidth — vanilla rate-limits ALL
-// traffic and starves mice when the elephant exists; natra rate-limits
-// only the elephant.
-//
-// Asserts:
-//   1. Elephant has nonzero throttled count (bucket actually drops
-//      packets when elephant rate exceeds configured limit).
-//   2. Sum of mice STAT_HH_HITS = 0 (no mouse flow ever reaches the
-//      bucket).
-//   3. The bucket's heavy-hitter classification is stable: STAT_HH_HITS
-//      is dominated by the elephant alone.
+// TestScenarioMixed runs one elephant flow alongside many mice and
+// asserts the elephant gets throttled while the mice don't. Three
+// assertions:
+//   1. Elephant: nonzero throttled count (bucket drops packets when
+//      the elephant exceeds rate).
+//   2. Mice: zero hh_hits (no mouse flow ever crosses threshold).
+//   3. hh_hits is dominated by the elephant alone — the elephant
+//      stays classified heavy throughout.
 func TestScenarioMixed(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -450,22 +437,20 @@ func TestScenarioMixed(t *testing.T) {
 	}
 }
 
-// TestScenarioMixedVsVanilla — the headline differentiator test.
-// Loads natra.bpf.o AND vanilla.bpf.o (the upstream-bandwidth-emulator
-// in bpf/vanilla.bpf.c), runs the same elephant+mice packet sequence
-// through both, and asserts natra preserves mice goodput while vanilla
-// throttles them along with the elephant.
+// TestScenarioMixedVsVanilla loads both natra.bpf.o and vanilla.bpf.o
+// (the upstream-bandwidth emulator in bpf/vanilla.bpf.c), runs the
+// same elephant+mice packet sequence through each, and asserts natra
+// preserves mice goodput while vanilla throttles them along with the
+// elephant.
 //
-// The asymmetry vanilla suffers comes from its design: token-bucket-on-
-// every-packet has no flow-cardinality awareness, so mice arriving
-// after the elephant has drained the bucket get dropped exactly the
-// same as more elephant packets. natra's CMS classification gives
-// mice the fast-pass.
+// Vanilla's token-bucket-on-every-packet design has no flow awareness,
+// so mice arriving into the elephant-drained bucket get dropped the
+// same as more elephant packets. natra's CMS classification routes
+// mice around the bucket entirely.
 //
-// This is the falsifiable proof that natra > vanilla on this workload.
-// Failing this test would mean either (a) natra regressed to vanilla
-// behavior or (b) the comparison emulator drifted from upstream
-// semantics. Both warrant immediate triage.
+// A failure here means either natra regressed to vanilla behavior or
+// the comparison emulator drifted from upstream semantics — both
+// worth immediate attention.
 func TestScenarioMixedVsVanilla(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -530,16 +515,13 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 		_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 		_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
 	} else {
-		var cfg struct {
-			R, B uint64
-		}
-		cfg.R = rateBps
-		cfg.B = burstBytes
+		// vanilla.bpf.c has the same struct shape as natra for config
+		// (rate, burst — no HHThreshold) and bucket (spin lock + 8B
+		// fields), so we can reuse Vanilla's two-field config and the
+		// shared TokenBucket layout.
+		cfg := struct{ Rate, Burst uint64 }{rateBps, burstBytes}
 		_ = coll.Maps["vanilla_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
-		_ = coll.Maps["vanilla_bucket_map"].Update(&zero, &struct {
-			_lock, _pad        uint32
-			Tokens, LastUpdate uint64
-		}{Tokens: burstBytes}, ebpf.UpdateAny)
+		_ = coll.Maps["vanilla_bucket_map"].Update(&zero, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
 	}
 
 	var prog *ebpf.Program
@@ -556,11 +538,11 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 
 	var r mixedResult
 
-	// Phase 1: elephant pre-drains the bucket. After this, vanilla's
+	// Step 1: elephant pre-drains the bucket. After this, vanilla's
 	// bucket is empty (bps × elapsed-during-loop ≪ burst), so any
-	// subsequent mouse packet must wait for token refill. natra's
-	// bucket is also empty, but natra's mice never reach the bucket
-	// thanks to the CMS fast-pass.
+	// subsequent mouse packet has to wait for token refill. natra's
+	// bucket is also empty, but its mice never reach the bucket — they
+	// take the CMS fast pass.
 	for i := 0; i < elephantPrime; i++ {
 		ret, _, err := prog.Test(elephantPkt)
 		if err != nil {
@@ -572,7 +554,7 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 		}
 	}
 
-	// Phase 2: mice flow. Each is a distinct flow_key so its CMS
+	// Step 2: mice flow. Each is a distinct flow_key so its CMS
 	// count is small (≤ miceFlowPackets = 5, threshold = 10). natra
 	// classifies them as mice and skips the bucket. vanilla doesn't
 	// have CMS — every packet hits the (now-empty) bucket and most

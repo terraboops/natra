@@ -1,14 +1,9 @@
 //go:build linux && bpf
 
-// Layer 3 — BPF dataplane happy-path tests.
-//
-// Loads the natra BPF object via cilium/ebpf, exercises it with synthetic
-// packets via BPF_PROG_RUN, and verifies map state. Runs inside an lvh
-// qemu VM at the kernel requested in CI matrix (5.15 / 6.6 / bpf-next).
-//
-// Phase 0 placeholder: only loads bpf/placeholder.bpf.o and verifies the
-// program can be instantiated. The real heavy-hitter / token-bucket
-// assertions land alongside Phase 1 BPF code.
+// Layer 3 — BPF dataplane sanity test. Loads bpf/placeholder.bpf.o
+// and runs BPF_PROG_RUN against it, just to confirm the loader path
+// is wired up. The real natra BPF assertions are in
+// ratelimit_linux_test.go and edge_cases_linux_test.go.
 
 package bpf_test
 
@@ -48,8 +43,9 @@ func TestPlaceholderLoads(t *testing.T) {
 		t.Fatalf("program 'natra_placeholder' not found in collection; got: %v", maps(coll.Programs))
 	}
 
-	// 64-byte synthetic Ethernet+IP packet — minimal valid input for skb.
-	// Phase 0 only checks the program runs and returns TC_ACT_OK (= 0).
+	// 64-byte synthetic Ethernet+IP packet, the minimum valid input
+	// for an skb-typed BPF_PROG_RUN. Asserting only that the program
+	// runs and returns TC_ACT_OK.
 	pkt := make([]byte, 64)
 	ret, _, err := prog.Test(pkt)
 	if err != nil {

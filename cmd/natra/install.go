@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -60,64 +61,26 @@ func writeChainedSibling(src, dst string) error {
 		return fmt.Errorf("parse JSON: %w", err)
 	}
 
-	pluginsRaw, ok := conflist["plugins"]
+	plugins, ok := conflist["plugins"].([]any)
 	if !ok {
-		return fmt.Errorf("source conflist has no 'plugins' field")
-	}
-	plugins, ok := pluginsRaw.([]any)
-	if !ok {
-		return fmt.Errorf("source conflist 'plugins' is not an array")
+		return fmt.Errorf("source conflist has no plugins array")
 	}
 
-	// Idempotency: if the sibling already exists with natra appended,
-	// no-op. Compare against the source to detect upstream-rewrite
-	// drift; if they differ we overwrite with the new chained version.
-	if existing, err := os.ReadFile(dst); err == nil {
-		var have map[string]any
-		if json.Unmarshal(existing, &have) == nil {
-			if havePlugins, ok := have["plugins"].([]any); ok &&
-				len(havePlugins) == len(plugins)+1 {
-				last := havePlugins[len(havePlugins)-1]
-				if lm, ok := last.(map[string]any); ok && lm["type"] == "natra" {
-					// Ensure the upstream plugin set hasn't drifted
-					// (e.g. kindnet added a new plugin) by length-
-					// matching on the prefix.
-					match := true
-					for i := 0; i < len(plugins); i++ {
-						a, _ := json.Marshal(plugins[i])
-						b, _ := json.Marshal(havePlugins[i])
-						if string(a) != string(b) {
-							match = false
-							break
-						}
-					}
-					if match {
-						fmt.Fprintf(os.Stderr, "natra: %s up-to-date, skipping\n", dst)
-						return nil
-					}
-				}
-			}
-		}
-	}
-
+	// Keep the original network name and any other top-level fields,
+	// just append natra to the plugins list. Containerd CRI loads at
+	// most one conflist (maxConfNum:1) and keys it by "name" — renaming
+	// has left containerd in a half-loaded state where `crictl info`
+	// reports the conflist but pods fail with "failed to find network
+	// info for sandbox".
+	//
+	// `capabilities.bandwidth: true` tells kubelet to populate
+	// runtimeConfig.bandwidth from the kubernetes.io/ingress-bandwidth
+	// pod annotation. Without it the annotation is invisible — kubelet
+	// only forwards what the conflist explicitly opts into.
 	chained := make(map[string]any, len(conflist))
 	for k, v := range conflist {
 		chained[k] = v
 	}
-	// Keep the original network name. Containerd CRI loads only one
-	// conflist (`maxConfNum: 1`) and identifies it by the "name" field;
-	// changing the name to anything else has been observed to leave
-	// containerd in a state where `crictl info` reports the conflist
-	// loaded but pod sandboxes still fail with "failed to find network
-	// info for sandbox". Match what kindnet (or whatever upstream)
-	// chose so containerd's existing wiring keeps working.
-	//
-	// `capabilities.bandwidth: true` is what tells kubelet to populate
-	// `runtimeConfig.bandwidth.{ingressRate, ingressBurst}` in the
-	// stdin we receive from the kubernetes.io/ingress-bandwidth pod
-	// annotation. Without this, the annotation is invisible to the
-	// plugin — kubelet doesn't forward arbitrary annotations as
-	// runtime config; capabilities is the explicit opt-in protocol.
 	chained["plugins"] = append(append([]any{}, plugins...), map[string]any{
 		"type":         "natra",
 		"capabilities": map[string]any{"bandwidth": true},
@@ -127,6 +90,16 @@ func writeChainedSibling(src, dst string) error {
 	if err != nil {
 		return err
 	}
+
+	// Idempotency: if the existing sibling has identical bytes to what
+	// we'd write, skip. Containerd's inotify watch fires on every
+	// rewrite even of identical content, and rapid rewrites have raced
+	// with sandbox creation in the past.
+	if existing, err := os.ReadFile(dst); err == nil && bytes.Equal(existing, out) {
+		fmt.Fprintf(os.Stderr, "natra: %s up-to-date, skipping\n", dst)
+		return nil
+	}
+
 	tmp := dst + ".natra-tmp"
 	if err := os.WriteFile(tmp, out, 0o644); err != nil {
 		return err

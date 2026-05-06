@@ -8,16 +8,16 @@ import (
 	"github.com/vishvananda/netns"
 )
 
-// enterNetns moves the calling OS thread into the namespace at `path`
-// and returns a `restore` function that switches the thread back to its
-// origin namespace. Caller must runtime.LockOSThread() first; the
-// namespace switch is per-thread and goroutine migration would
-// otherwise corrupt state.
+// enterNetns moves the calling OS thread into the namespace at path
+// and returns a restore function that switches the thread back. The
+// caller has to runtime.LockOSThread() first — the netns switch is
+// per-thread, and a goroutine migration mid-flow would land in the
+// wrong namespace.
 //
-// The restore is critical: CNI's skel framework runs a post-flight
-// check that exits 1 if the plugin's final netns equals CNI_NETNS. If
-// we entered the pod netns and never came back, every CNI ADD that
-// touches BPF would fail at the protocol layer, regardless of stdout.
+// The restore matters: CNI's skel framework checks after the plugin
+// returns and exits 1 if the plugin's final netns equals CNI_NETNS.
+// Skipping the restore would fail every CNI ADD that touches BPF
+// regardless of what stdout said.
 func enterNetns(path string) (func(), error) {
 	origin, err := netns.Get()
 	if err != nil {

@@ -134,7 +134,7 @@ func TestEdgeICMP(t *testing.T) {
 	}
 
 	statsMap := coll.Maps["natra_stats_map"]
-	hh := readPerCPUStatLocal(t, statsMap, statHHHits)
+	hh := readPerCPUStat(t, statsMap, statHHHits)
 	if hh < 30 {
 		t.Errorf("STAT_HH_HITS=%d, expected >= 30 (50 packets - 10 threshold = 40 heavy hits)", hh)
 	}
@@ -163,7 +163,7 @@ func TestEdgeIPv4WithOptions(t *testing.T) {
 		t.Errorf("ret=%d, want 0 (TC_ACT_OK) — truncated IP options should pass through, not drop", ret)
 	}
 	// And no STAT_THROTTLED should fire.
-	throttled := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], statThrottled)
+	throttled := readPerCPUStat(t, coll.Maps["natra_stats_map"], statThrottled)
 	if throttled != 0 {
 		t.Errorf("STAT_THROTTLED=%d, want 0 — parse_flow failures must not throttle", throttled)
 	}
@@ -203,14 +203,14 @@ func TestEdgeRapidConfigChange(t *testing.T) {
 	zero := uint32(0)
 	pkt := edgeMkPkt(0x0A000001, 0x0A000002, 12345, 5201)
 
-	// Phase 1: high rate, low threshold. All packets pass.
+	// Step 1: high rate, low threshold. All packets pass.
 	cfg1 := natraConfig{RateBps: 1_000_000_000, BurstBytes: 1 << 30, HHThreshold: 5}
 	_ = cfgMap.Update(&zero, &cfg1, ebpf.UpdateAny)
 	for i := 0; i < 50; i++ {
 		_, _, _ = prog.Test(pkt)
 	}
 
-	// Phase 2: zero burst, mid-flow. Now any heavy hitter must drop.
+	// Step 2: zero burst, mid-flow. Any heavy hitter now drops.
 	cfg2 := natraConfig{RateBps: 1, BurstBytes: 0, HHThreshold: 5}
 	if err := cfgMap.Update(&zero, &cfg2, ebpf.UpdateAny); err != nil {
 		t.Fatalf("cfgMap update mid-flow: %v", err)
@@ -376,8 +376,8 @@ func TestEdgeCounterOverflow(t *testing.T) {
 	// We don't assert correctness of classification across the wrap
 	// (CMS is approximate; this edge case is by design "best effort").
 	// We DO assert: program survived, stats updated, no panic.
-	passed := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], statPassed)
-	throttled := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], statThrottled)
+	passed := readPerCPUStat(t, coll.Maps["natra_stats_map"], statPassed)
+	throttled := readPerCPUStat(t, coll.Maps["natra_stats_map"], statThrottled)
 	if passed+throttled != 10 {
 		t.Errorf("passed+throttled=%d, want 10 (program ran for every packet)", passed+throttled)
 	}

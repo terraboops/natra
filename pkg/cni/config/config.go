@@ -1,3 +1,11 @@
+// Package config parses the kubernetes.io/ingress-bandwidth pod
+// annotation. Two forms are accepted:
+//
+//   - Simple:   "10M"   →  Rate=10_000_000 Burst=20_000_000
+//   - Extended: {"rate":"10M","burst":"15M","heavyHitterThreshold":50}
+//
+// Pure parsing, no BPF or kernel dependencies — also the target of
+// the Layer 1 fuzz suite.
 package config
 
 import (
@@ -8,156 +16,100 @@ import (
 	"strings"
 )
 
-// maxRate is the largest rate we'll accept. Half of int64-max so the
-// default `burst = rate * 2` computation can't overflow. Real-world
-// networks don't exceed this in any meaningful sense (it's ~4.6 EB/s).
+// maxRate caps a single accepted value. Half of int64-max so default
+// `burst = rate * 2` can't overflow. ~4.6 EB/s — beyond any real link.
 const maxRate = math.MaxInt64 / 2
 
-// Config holds CNI plugin configuration parsed from Pod annotations
+// Config is what the BPF program needs per Pod: token-bucket refill
+// rate, bucket capacity, and the CMS count above which a flow is
+// classified heavy (and so subject to the bucket).
 type Config struct {
-	// Rate limit in bytes per second
-	Rate int64
-
-	// Burst size in bytes
-	Burst int64
-
-	// CMS configuration
-	CMSWidth             int
-	CMSDepth             int
-	HeavyHitterThreshold int64
-
-	// Token Bucket configuration
-	TokenBucketRate  int64
-	TokenBucketBurst int64
+	Rate                 int64 // bytes/sec; 0 disables rate limiting
+	Burst                int64 // bytes; bucket capacity, also the largest single skb that can be admitted
+	HeavyHitterThreshold int64 // CMS estimate above which a flow goes through the bucket
 }
 
-// DefaultConfig returns a Config with sensible defaults.
+// DefaultConfig returns the zero-rate baseline. Callers overwrite
+// Rate (and optionally Burst) from the parsed annotation.
 //
-// HeavyHitterThreshold is intentionally low. The CMS counts "packets"
-// from the BPF program's perspective, but on Linux paths with GRO/LRO
-// active a single skb the BPF sees can carry 30+ TCP segments — so a
-// 1000-packet threshold lets ~27 MB through unrate-limited per flow
-// before any throttling kicks in. 10 strikes the balance between
-// "let mice flow free" (DNS lookups, brief HTTP requests are <10
-// packets) and "rate-limit sustained flows quickly" (iperf-style
-// elephant flows cross 10 packets in <100 ms).
+// HeavyHitterThreshold defaults to 10 because GRO superpackets at the
+// BPF layer can be 30+ TCP segments each, so a 1000-packet threshold
+// lets ~27 MB through per flow before throttling kicks in. 10 catches
+// real elephants within a few skbs while leaving mice (DNS, brief
+// HTTP) untouched.
 func DefaultConfig() *Config {
 	return &Config{
-		Rate:                 0, // No rate limit
-		Burst:                0,
-		CMSWidth:             1024,
-		CMSDepth:             4,
 		HeavyHitterThreshold: 10,
-		TokenBucketRate:      100,
-		TokenBucketBurst:     200,
 	}
 }
 
-// ParseBandwidthAnnotation parses the kubernetes.io/ingress-bandwidth annotation
-// Supports both simple format ("10M") and extended JSON format
+// ParseBandwidthAnnotation parses the kubernetes.io/ingress-bandwidth
+// annotation. Empty input returns DefaultConfig. JSON shapes (any
+// leading whitespace then `{`) go through parseJSONConfig; everything
+// else is treated as a simple "10M"-style value.
 func ParseBandwidthAnnotation(annotation string) (*Config, error) {
 	if annotation == "" {
 		return DefaultConfig(), nil
 	}
-
-	cfg := DefaultConfig()
-
-	// Try parsing as JSON first (extended format)
 	if strings.HasPrefix(strings.TrimSpace(annotation), "{") {
 		return parseJSONConfig(annotation)
 	}
 
-	// Simple format: "10M", "1G", etc.
 	rate, err := parseBandwidth(annotation)
 	if err != nil {
 		return nil, fmt.Errorf("invalid bandwidth format: %w", err)
 	}
-
+	cfg := DefaultConfig()
 	cfg.Rate = rate
-	cfg.Burst = rate * 2 // Default burst is 2x rate
-	cfg.TokenBucketRate = rate
-	cfg.TokenBucketBurst = cfg.Burst
-
+	cfg.Burst = rate * 2
 	return cfg, nil
 }
 
-// parseJSONConfig parses the extended JSON configuration format
+// parseJSONConfig parses the extended JSON form. Unspecified fields
+// keep the DefaultConfig value; specified ones override.
 func parseJSONConfig(data string) (*Config, error) {
-	cfg := DefaultConfig()
-
 	var raw struct {
-		Rate  string `json:"rate"`
-		Burst string `json:"burst"`
-		CMS   struct {
-			Width                int   `json:"width"`
-			Depth                int   `json:"depth"`
-			HeavyHitterThreshold int64 `json:"heavyHitterThreshold"`
-		} `json:"cms"`
-		TokenBucket struct {
-			Rate  int64 `json:"rate"`
-			Burst int64 `json:"burst"`
-		} `json:"tokenBucket"`
+		Rate                 string `json:"rate"`
+		Burst                string `json:"burst"`
+		HeavyHitterThreshold int64  `json:"heavyHitterThreshold"`
 	}
-
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse JSON config: %w", err)
 	}
 
-	// Parse rate
+	cfg := DefaultConfig()
 	if raw.Rate != "" {
 		rate, err := parseBandwidth(raw.Rate)
 		if err != nil {
 			return nil, fmt.Errorf("invalid rate: %w", err)
 		}
 		cfg.Rate = rate
-		cfg.TokenBucketRate = rate
 	}
-
-	// Parse burst
 	if raw.Burst != "" {
 		burst, err := parseBandwidth(raw.Burst)
 		if err != nil {
 			return nil, fmt.Errorf("invalid burst: %w", err)
 		}
 		cfg.Burst = burst
-		cfg.TokenBucketBurst = burst
 	} else if cfg.Rate > 0 {
 		cfg.Burst = cfg.Rate * 2
-		cfg.TokenBucketBurst = cfg.Burst
 	}
-
-	// CMS config
-	if raw.CMS.Width > 0 {
-		cfg.CMSWidth = raw.CMS.Width
+	if raw.HeavyHitterThreshold > 0 {
+		cfg.HeavyHitterThreshold = raw.HeavyHitterThreshold
 	}
-	if raw.CMS.Depth > 0 {
-		cfg.CMSDepth = raw.CMS.Depth
-	}
-	if raw.CMS.HeavyHitterThreshold > 0 {
-		cfg.HeavyHitterThreshold = raw.CMS.HeavyHitterThreshold
-	}
-
-	// Token bucket config (overrides rate/burst if specified)
-	if raw.TokenBucket.Rate > 0 {
-		cfg.TokenBucketRate = raw.TokenBucket.Rate
-	}
-	if raw.TokenBucket.Burst > 0 {
-		cfg.TokenBucketBurst = raw.TokenBucket.Burst
-	}
-
 	return cfg, nil
 }
 
-// parseBandwidth parses bandwidth strings like "10M", "1G", "500K"
+// parseBandwidth parses a single quantity like "10M", "500K", "1Gi".
+// SI suffixes (K, M, G) are decimal; IEC suffixes (Ki, Mi, Gi) are
+// binary. Case-insensitive on the suffix.
 func parseBandwidth(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, nil
 	}
 
-	// Extract numeric part and suffix
-	var numStr string
-	var suffix string
+	var numStr, suffix string
 	for i, c := range s {
 		if c < '0' || c > '9' {
 			numStr = s[:i]
@@ -174,48 +126,50 @@ func parseBandwidth(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid number: %s", numStr)
 	}
 
-	var multiplier int64
-	switch suffix {
-	case "", "B":
-		multiplier = 1
-	case "K", "KB":
-		multiplier = 1000
-	case "M", "MB":
-		multiplier = 1000 * 1000
-	case "G", "GB":
-		multiplier = 1000 * 1000 * 1000
-	case "KI", "KIB":
-		multiplier = 1024
-	case "MI", "MIB":
-		multiplier = 1024 * 1024
-	case "GI", "GIB":
-		multiplier = 1024 * 1024 * 1024
-	default:
+	multiplier := suffixMultiplier(suffix)
+	if multiplier == 0 {
 		return 0, fmt.Errorf("unknown suffix: %s", suffix)
 	}
-
-	// Reject inputs that would overflow when multiplied (or when later
-	// doubled for the default burst). Catching it here gives a clear
-	// "value too large" error instead of silent wraparound.
 	if num > maxRate/multiplier {
 		return 0, fmt.Errorf("value too large: %d%s exceeds maxRate", num, suffix)
 	}
 	return num * multiplier, nil
 }
 
-// Validate checks if configuration is valid
+// suffixMultiplier returns the byte multiplier for the parsed suffix,
+// or 0 if the suffix is unknown. Pulled out so parseBandwidth's body
+// is one fact per line.
+func suffixMultiplier(suffix string) int64 {
+	switch suffix {
+	case "", "B":
+		return 1
+	case "K", "KB":
+		return 1000
+	case "M", "MB":
+		return 1000 * 1000
+	case "G", "GB":
+		return 1000 * 1000 * 1000
+	case "KI", "KIB":
+		return 1024
+	case "MI", "MIB":
+		return 1024 * 1024
+	case "GI", "GIB":
+		return 1024 * 1024 * 1024
+	}
+	return 0
+}
+
+// Validate rejects internally-inconsistent configs. Doesn't apply
+// defaults — that's DefaultConfig's job.
 func (c *Config) Validate() error {
-	if c.CMSWidth <= 0 {
-		return fmt.Errorf("CMS width must be positive")
-	}
-	if c.CMSDepth <= 0 {
-		return fmt.Errorf("CMS depth must be positive")
-	}
 	if c.Rate < 0 {
 		return fmt.Errorf("rate cannot be negative")
 	}
 	if c.Burst < 0 {
 		return fmt.Errorf("burst cannot be negative")
+	}
+	if c.HeavyHitterThreshold < 0 {
+		return fmt.Errorf("heavyHitterThreshold cannot be negative")
 	}
 	return nil
 }

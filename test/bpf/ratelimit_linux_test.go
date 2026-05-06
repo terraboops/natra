@@ -15,28 +15,21 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+
+	"github.com/terraboops/natra/pkg/bpf"
 )
 
-// natraConfig mirrors `struct natra_config` in bpf/natra.bpf.c.
-type natraConfig struct {
-	RateBps     uint64
-	BurstBytes  uint64
-	HHThreshold uint64
-}
-
-// tokenBucket mirrors `struct token_bucket`. The first field is the
-// bpf_spin_lock; cilium/ebpf zeroes it for us when we Update().
-type tokenBucket struct {
-	Lock         struct{ _ uint32 } // 4-byte spin lock placeholder
-	_            uint32             // 4-byte alignment pad before 8-byte fields
-	Tokens       uint64
-	LastUpdateNs uint64
-}
+// Tests use the canonical struct shapes from pkg/bpf so the BPF ABI
+// has one definition, not several drifting copies across test files.
+type (
+	natraConfig = bpf.Config
+	tokenBucket = bpf.TokenBucket
+)
 
 const (
-	statPassed    = 0
-	statThrottled = 1
-	statHHHits    = 2
+	statPassed    = bpf.StatPassed
+	statThrottled = bpf.StatThrottled
+	statHHHits    = bpf.StatHHHits
 )
 
 // loadNatraColl loads and instantiates bpf/natra.bpf.o. Returns the

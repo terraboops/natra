@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// natra dataplane — Phase 1 step 2: CMS-driven heavy-hitter detection
-// + token-bucket throttling.
+// natra dataplane — CMS-driven heavy-hitter detection plus a token
+// bucket on heavy traffic.
 //
 // Stage 1 (Count-Min Sketch): every packet's 5-tuple flow key is
-// hashed `CMS_DEPTH` times, each into one column of `CMS_WIDTH`. The
-// min across rows is the per-flow count estimator. Constant memory
-// (4096 u32 counters here) regardless of how many distinct flows the
-// pod sees.
+// hashed CMS_DEPTH times, each into one column of CMS_WIDTH. The min
+// across rows is the per-flow count estimator. Constant memory
+// (CMS_WIDTH * CMS_DEPTH = 4096 u32 counters) regardless of how many
+// distinct flows the pod sees.
 //
 // Stage 2 (token bucket): only flows whose CMS estimate exceeds
-// `hh_threshold` go through the bucket. Mice flows take the
-// fast-pass at the top of the program (TC_ACT_OK without lock or
-// stat increment beyond passed-counter), which is the natra
-// differentiator vs vanilla bandwidth: vanilla rate-limits ALL
-// traffic uniformly; we only rate-limit elephants.
+// `hh_threshold` go through the bucket. Mice flows take the fast
+// pass at the top of the program (TC_ACT_OK without locking or
+// stat increment beyond passed). The upstream bandwidth plugin
+// rate-limits all traffic uniformly via HTB-on-IFB; we only
+// rate-limit the elephants.
 //
 // Concurrency:
 //   - CMS counters use __sync_fetch_and_add (-mcpu=v3 atomic). Loose
@@ -251,8 +251,7 @@ int natra_ratelimit(struct __sk_buff *skb)
 
 	__u32 count = cms_update_and_min(&k);
 	if (count <= cfg->hh_threshold) {
-		// Mouse — fast-pass with no lock. This is the differentiator
-		// vs vanilla bandwidth: low-volume legitimate traffic stays
+		// Mouse: fast pass with no lock. Low-volume traffic stays
 		// at line rate even when an elephant exists on the same pod.
 		bump_stat(STAT_PASSED);
 		return TC_ACT_OK;

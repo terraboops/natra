@@ -23,8 +23,6 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 				Expect(err).NotTo(HaveOccurred())
 				Expect(cfg.Rate).To(Equal(expected))
 				Expect(cfg.Burst).To(Equal(expected * 2))
-				Expect(cfg.TokenBucketRate).To(Equal(expected))
-				Expect(cfg.TokenBucketBurst).To(Equal(expected * 2))
 			},
 			Entry("plain integer (bytes)", "100", int64(100)),
 			Entry("explicit B", "100B", int64(100)),
@@ -86,23 +84,12 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 			Expect(cfg.Burst).To(Equal(int64(75_000_000)))
 		})
 
-		It("parses CMS overrides", func() {
+		It("parses heavyHitterThreshold override", func() {
 			cfg, err := config.ParseBandwidthAnnotation(
-				`{"rate":"10M","cms":{"width":2048,"depth":8,"heavyHitterThreshold":5000}}`,
+				`{"rate":"10M","heavyHitterThreshold":5000}`,
 			)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cfg.CMSWidth).To(Equal(2048))
-			Expect(cfg.CMSDepth).To(Equal(8))
 			Expect(cfg.HeavyHitterThreshold).To(Equal(int64(5000)))
-		})
-
-		It("parses tokenBucket overrides", func() {
-			cfg, err := config.ParseBandwidthAnnotation(
-				`{"rate":"10M","tokenBucket":{"rate":42,"burst":99}}`,
-			)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(cfg.TokenBucketRate).To(Equal(int64(42)))
-			Expect(cfg.TokenBucketBurst).To(Equal(int64(99)))
 		})
 
 		It("rejects malformed JSON", func() {
@@ -118,8 +105,7 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 		It("preserves defaults for fields not specified", func() {
 			cfg, err := config.ParseBandwidthAnnotation(`{"rate":"10M"}`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cfg.CMSWidth).To(Equal(config.DefaultConfig().CMSWidth))
-			Expect(cfg.CMSDepth).To(Equal(config.DefaultConfig().CMSDepth))
+			Expect(cfg.HeavyHitterThreshold).To(Equal(config.DefaultConfig().HeavyHitterThreshold))
 		})
 
 		It("treats leading whitespace before { as JSON", func() {
@@ -135,23 +121,17 @@ var _ = Describe("Config.Validate", func() {
 		Expect(config.DefaultConfig().Validate()).To(Succeed())
 	})
 
-	It("rejects non-positive CMS dimensions", func() {
-		c := config.DefaultConfig()
-		c.CMSWidth = 0
-		Expect(c.Validate()).To(HaveOccurred())
-
-		c = config.DefaultConfig()
-		c.CMSDepth = -1
-		Expect(c.Validate()).To(HaveOccurred())
-	})
-
-	It("rejects negative rate or burst", func() {
+	It("rejects negative rate, burst, or threshold", func() {
 		c := config.DefaultConfig()
 		c.Rate = -1
 		Expect(c.Validate()).To(HaveOccurred())
 
 		c = config.DefaultConfig()
 		c.Burst = -1
+		Expect(c.Validate()).To(HaveOccurred())
+
+		c = config.DefaultConfig()
+		c.HeavyHitterThreshold = -1
 		Expect(c.Validate()).To(HaveOccurred())
 	})
 })

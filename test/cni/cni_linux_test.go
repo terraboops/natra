@@ -55,7 +55,7 @@ var _ = Describe("natra CNI binary", func() {
 			stdout, stderr, runErr := runPlugin(natra, "ADD", "test-no-annotation", netnsPath(ns), "eth0", stdin)
 			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
 
-			// Phase 0: with no annotation, natra returns the (empty) PrevResult
+			// With no annotation, natra returns the (empty) PrevResult
 			// directly. Just assert it's parseable JSON with cniVersion.
 			var result map[string]any
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
@@ -140,7 +140,7 @@ var _ = Describe("natra CNI binary", func() {
 	})
 
 	Context("CHECK", func() {
-		It("succeeds in Phase 0 (no BPF state to verify yet)", func() {
+		It("succeeds (CHECK is a best-effort no-op)", func() {
 			ns, cleanup, err := newTestNetns()
 			Expect(err).NotTo(HaveOccurred())
 			defer cleanup()

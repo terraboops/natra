@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -17,18 +19,11 @@ import (
 	"github.com/terraboops/natra/pkg/cni/config"
 )
 
-// pinDir holds the bpffs paths for natra's per-pod link pins. Using a
-// dedicated subdir keeps natra's pins separate from anything else
-// running on the node and makes cleanup easy (cmdDel just unlinks).
+// pinDir holds the bpffs paths for natra's per-pod map pins. A
+// dedicated subdir keeps natra's pins separate from other tooling on
+// the node and makes cleanup straightforward (cmdDel removes the
+// per-container files).
 const pinDir = "/sys/fs/bpf/natra"
-
-// pinPathFor returns the bpffs pin path for the link attached to the
-// given container's interface. Two pods with the same name on different
-// nodes get different paths because containerID is unique per kubelet
-// pod-sandbox.
-func pinPathFor(containerID, ifName string) string {
-	return filepath.Join(pinDir, containerID+"-"+ifName+".link")
-}
 
 var (
 	pluginVersion = "dev"
@@ -36,20 +31,18 @@ var (
 	date          = "unknown"
 )
 
-// NetConf is natra's slice of the CNI stdin payload. Embeds types.NetConf
-// for cniVersion / name / type / prevResult.
+// NetConf is natra's slice of the CNI stdin payload. Embeds
+// types.NetConf for cniVersion / name / type / prevResult.
 //
-// RuntimeConfig.Bandwidth is populated by kubelet when the conflist
-// declares `capabilities.bandwidth: true` (the standard CNI bandwidth
-// capability — same one upstream containernetworking/plugins/bandwidth
-// uses). Kubelet reads `kubernetes.io/ingress-bandwidth` and
-// `kubernetes.io/egress-bandwidth` pod annotations, parses them into
-// bytes/sec, and forwards them here. Rates of 0 mean "no limit".
+// RuntimeConfig.Bandwidth is what kubelet populates when the conflist
+// declares `capabilities.bandwidth: true` — kubelet reads the
+// kubernetes.io/{ingress,egress}-bandwidth annotations, parses them
+// into bytes/sec, and forwards them here. Rate=0 means no limit.
 //
-// PodAnnotations is preserved for backward compatibility with the
-// older annotation-via-runtimeConfig path some setups use; if both
-// are present, RuntimeConfig.Bandwidth wins because it's the kubelet-
-// canonical channel.
+// PodAnnotations is the older path where the raw annotation string is
+// passed through under runtimeConfig. Some setups still use it; if
+// both channels are present we prefer Bandwidth because it's what
+// kubelet actually populates today.
 type NetConf struct {
 	types.NetConf
 	RuntimeConfig struct {
@@ -96,27 +89,24 @@ func main() {
 	)
 }
 
-// cmdAdd is the heart of the plugin. Order:
+// cmdAdd handles a CNI ADD. Order:
 //  1. Parse stdin → NetConf.
-//  2. Read bandwidth annotation; if absent, pass through unchanged
-//     (natra is opt-in via annotation).
-//  3. Parse the annotation value into a config.Config.
-//  4. Load BPF object, configure rate/burst, attach to pod-side veth
-//     ingress inside the pod netns.
+//  2. Resolve bandwidth from runtimeConfig; pass through if no rate.
+//  3. Load BPF object, configure rate/burst, attach to the pod-side
+//     veth ingress inside the pod netns.
 //  5. Print PrevResult so the next chained plugin (or kubelet) sees
 //     what came in — natra doesn't modify networking, only adds rate
 //     limiting on top.
 //
-// natra's design philosophy is fail-open: if any step from BPF onwards
-// fails, we log to stderr and still return success. A pod stuck in
-// ContainerCreating because the rate limiter couldn't load is much
-// worse than a pod that runs at line rate.
+// Past stdin parsing, natra is fail-open: anything that goes wrong is
+// logged and the plugin still returns success. A Pod stuck in
+// ContainerCreating because BPF wouldn't load is worse than a Pod
+// running unrate-limited.
 //
-// Stderr is captured by the CNI runtime (containerd / kubelet) but
-// only on plugin error. We additionally write all log lines to a log
-// file at /var/log/natra-cni.log so a successful invocation leaves a
-// trace — useful for debugging "is natra even being called?" without
-// having to crank container runtime log levels.
+// Stderr is captured by the CNI runtime (containerd, kubelet) but only
+// on plugin error. We also append every log line to /var/log/natra-cni.log
+// so successful invocations leave a trace — useful for "is natra even
+// being called?" without cranking up runtime log levels.
 func cmdAdd(args *skel.CmdArgs) error {
 	logf("ADD containerID=%s netns=%s ifname=%s", args.ContainerID, args.Netns, args.IfName)
 	logCaps()
@@ -141,10 +131,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 	return passthrough(args)
 }
 
-// logf appends a timestamped line to /var/log/natra-cni.log. Best
-// effort: if /var/log isn't writable we fall back to stderr only. The
-// file is host-mounted by the DaemonSet so a single tail -f from a
-// debug shell shows every invocation across all pods on the node.
+// logf appends a line to /var/log/natra-cni.log. Best effort — if the
+// path isn't writable we drop the message. The file is host-mounted by
+// the DaemonSet so `tail -f /var/log/natra-cni.log` on a node shows
+// every CNI invocation across every pod.
 func logf(format string, args ...any) {
 	msg := fmt.Sprintf("[%d %s] ", os.Getpid(), os.Args[0]) + fmt.Sprintf(format, args...) + "\n"
 	if f, err := os.OpenFile("/var/log/natra-cni.log", os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644); err == nil {
@@ -153,59 +143,60 @@ func logf(format string, args ...any) {
 	}
 }
 
-// logCaps writes our process's effective capabilities to the log.
-// Useful for diagnosing EPERM on syscalls like BPF_OBJ_PIN — when
-// kubelet invokes natra via the CNI ABI, the runtime may strip caps
-// that bpf operations require, even though the parent kubelet has them.
+// logCaps writes the effective-capability lines from /proc/self/status
+// to the log. Useful for diagnosing EPERM on BPF_OBJ_PIN and similar:
+// kubelet may strip caps the parent process has when invoking the
+// CNI plugin, even with file-cap setcap on the binary.
 func logCaps() {
-	data, err := os.ReadFile("/proc/self/status")
+	f, err := os.Open("/proc/self/status")
 	if err != nil {
 		return
 	}
-	for _, line := range splitLines(data) {
-		if len(line) > 4 && line[:4] == "Cap" {
+	defer func() { _ = f.Close() }()
+	scan := bufio.NewScanner(f)
+	for scan.Scan() {
+		line := scan.Text()
+		if strings.HasPrefix(line, "Cap") {
 			logf("caps: %s", line)
 		}
 	}
 }
 
-func splitLines(b []byte) []string {
-	var out []string
-	start := 0
-	for i, c := range b {
-		if c == '\n' {
-			out = append(out, string(b[start:i]))
-			start = i + 1
-		}
-	}
-	if start < len(b) {
-		out = append(out, string(b[start:]))
-	}
-	return out
-}
-
-// cmdDel removes the bpffs pin we created in cmdAdd. Removing the pin
-// drops the kernel's last reference to the tcx link, which detaches
-// the BPF program from the (about-to-be-deleted) pod veth. CNI DEL is
-// idempotent — a missing pin is not an error.
+// cmdDel cleans up the bpffs map pins for this container. The clsact
+// filter on the veth is *not* unpinned here — the kernel auto-detaches
+// it when the chained CNI plugin's DEL deletes the underlying veth.
+// What we do clean up is the map pins (config / bucket / stats / cms)
+// that PinMaps wrote, which would otherwise leak per-pod files under
+// /sys/fs/bpf/natra/ for the lifetime of the node.
+//
+// CNI DEL is idempotent: missing files are not errors.
 func cmdDel(args *skel.CmdArgs) error {
-	pinPath := pinPathFor(args.ContainerID, args.IfName)
-	if err := os.Remove(pinPath); err != nil && !os.IsNotExist(err) {
-		// Per CNI spec, DEL should succeed if there's nothing to clean
-		// up. We log unexpected errors to stderr so kubelet captures
-		// them but still return nil — failing DEL would block the
-		// pod's teardown forever.
-		fmt.Fprintf(os.Stderr, "natra: failed to remove pin %s: %v\n", pinPath, err)
+	prefix := args.ContainerID + "-"
+	entries, err := os.ReadDir(pinDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "natra: read pin dir %s: %v\n", pinDir, err)
+		return nil
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(pinDir, e.Name())
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "natra: remove pin %s: %v\n", path, err)
+		}
 	}
 	return nil
 }
 
-// cmdCheck is best-effort: re-entering the pod netns and verifying a
-// tcx program is attached would require listing tcx links per ifindex,
-// which cilium/ebpf doesn't expose without a link reference. For now
-// we treat CHECK as a no-op success — kubelet uses CHECK as a liveness
-// hint, and a false-positive isn't worse than the existing fail-open.
-func cmdCheck(args *skel.CmdArgs) error {
+// cmdCheck is a no-op success. Re-entering the pod netns to verify the
+// clsact filter is attached would require listing tc filters per
+// ifindex; kubelet uses CHECK as a liveness hint and a false positive
+// is no worse than the fail-open path elsewhere.
+func cmdCheck(*skel.CmdArgs) error {
 	return nil
 }
 
@@ -217,25 +208,22 @@ func parseConfig(stdin []byte) (*NetConf, error) {
 	return conf, nil
 }
 
-// resolveConfig reads natra's per-pod rate limit out of the parsed
-// CNI stdin. Two channels, in order of preference:
+// resolveConfig pulls the per-pod rate limit out of the parsed stdin.
+// Two channels, in order of preference:
 //
-//  1. RuntimeConfig.Bandwidth — set by kubelet when the conflist
-//     entry declares `capabilities.bandwidth: true`. This is the
-//     canonical Kubernetes way and what kubelet derives from the
-//     `kubernetes.io/ingress-bandwidth` pod annotation. Rate is in
-//     BITS per second (kubelet/upstream-bandwidth convention); we
-//     divide by 8 to get the bytes/sec our BPF program expects.
+//  1. RuntimeConfig.Bandwidth, populated by kubelet when the conflist
+//     declares `capabilities.bandwidth: true`. Rate is in bits/sec
+//     (kubelet/upstream convention); we divide by 8 to get bytes/sec
+//     for the BPF program.
 //
-//  2. RuntimeConfig.PodAnnotations — legacy / non-standard path some
-//     setups use, where the raw annotation string is passed through
-//     and we parse it ourselves. Already bytes/sec at that point.
+//  2. RuntimeConfig.PodAnnotations, the older path where the raw
+//     annotation string passes through and we parse it ourselves.
+//     Already bytes/sec.
 //
-// Burst is clamped to 2× rate. Kubelet's default burst is MaxUint32
-// (4 GB) when the annotation doesn't specify one — that's effectively
-// "no burst limit" and would let a high-rate flow saturate the link
-// for ~30s before the token bucket caught up. 2× rate is a one-second
-// burst window, the same heuristic the upstream bandwidth plugin uses.
+// Burst is clamped to 2× rate. Kubelet sets burst to MaxUint32 (~4 GB)
+// when the annotation doesn't specify one, which would let a high-rate
+// flow saturate the link for ~30s before the bucket caught up. 2× rate
+// is a one-second burst window — same heuristic the upstream plugin uses.
 //
 // Returns nil if neither channel produces a usable rate.
 func resolveConfig(conf *NetConf) *config.Config {
@@ -247,8 +235,6 @@ func resolveConfig(conf *NetConf) *config.Config {
 			burst = out.Rate * 2
 		}
 		out.Burst = burst
-		out.TokenBucketRate = out.Rate
-		out.TokenBucketBurst = out.Burst
 		return out
 	}
 	if conf.RuntimeConfig.PodAnnotations != nil {
@@ -264,29 +250,26 @@ func resolveConfig(conf *NetConf) *config.Config {
 	return nil
 }
 
-// attachBPF enters the pod's network namespace, looks up the interface
+// attachBPF enters the pod's network namespace, finds the interface
 // kubelet asked us to operate on (CNI_IFNAME, typically "eth0"),
-// loads the BPF object, configures the bucket with the parsed rate /
-// burst values, and attaches the program to that interface's ingress
-// hook.
+// loads the BPF object, configures the bucket, and attaches the
+// program to the interface's ingress hook.
 //
-// Critical: we MUST leave the calling OS thread in the same netns we
-// entered with. CNI's skel framework runs a post-flight check after
-// the plugin returns; if the plugin's netns equals CNI_NETNS, skel
-// emits "code 8" and exits 1, regardless of what we wrote to stdout.
-// `restoreNetns` is deferred immediately after the switch so any error
-// path (including verifier rejection inside Load) returns us to origin.
+// We have to leave the calling OS thread in the same netns we entered
+// with. CNI's skel framework checks after the plugin returns and exits
+// "code 8" if the plugin's netns matches CNI_NETNS, regardless of what
+// stdout said. The restore is deferred immediately after the switch
+// so any error path returns us to origin.
 //
-// The Program is intentionally NOT closed on success — closing severs
-// the tcx link, which would unattach the BPF program. We "leak" the
-// Program when it's actually owned by the kernel: tcx attachments
-// persist after the userspace reference is gone, and the kernel cleans
-// them up when the underlying interface is deleted (which happens at
-// pod teardown, when the next chained plugin removes the veth pair).
+// We don't close prog on success — closing would drop the userspace
+// reference but the kernel keeps the clsact filter referenced by the
+// qdisc tree, so packets keep flowing through the rate limiter. Cleanup
+// happens at pod teardown when the next chained plugin's DEL deletes
+// the underlying veth.
 func attachBPF(args *skel.CmdArgs, cfg *config.Config) error {
-	// netns operations require locked OS thread — netns.Set switches the
-	// CALLING thread, so a goroutine migration mid-flow would leave us
-	// in a different namespace than we think.
+	// netns.Set switches the calling thread, so a goroutine migration
+	// mid-flow would leave us in a different namespace than we think.
+	// Lock the thread for the duration of the netns dance.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -320,24 +303,31 @@ func attachBPF(args *skel.CmdArgs, cfg *config.Config) error {
 		_ = prog.Close()
 		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
-	pinPath := pinPathFor(args.ContainerID, args.IfName)
-	if err := prog.AttachIngress(iface.Index, pinPath); err != nil {
+	if err := prog.AttachIngress(iface.Index); err != nil {
 		_ = prog.Close()
 		return fmt.Errorf("attach BPF to %s ingress: %w", args.IfName, err)
 	}
-	// Pin the maps too so `natra dump <containerID>` can read live
-	// stats/CMS counters from another process. Best-effort: if pinning
-	// fails (e.g. EPERM in some environments) we still keep the
-	// program attached.
+	// Pin the maps so `natra dump-stats <containerID>` can read live
+	// stats and CMS counters from a separate process. Best-effort —
+	// pinning failure (EPERM in some environments) doesn't tear down
+	// the attachment.
 	if err := prog.PinMaps(pinDir, args.ContainerID); err != nil {
 		fmt.Fprintf(os.Stderr, "natra: map pin failed (%v) — continuing without debug pins\n", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "natra: attached to %s (ifindex=%d) rate=%d bps burst=%d bytes pin=%s\n",
-		args.IfName, iface.Index, cfg.Rate, cfg.Burst, pinPath)
-	logf("attached: ifname=%s ifindex=%d rate=%d burst=%d hh=%d pin=%s",
-		args.IfName, iface.Index, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold, pinPath)
+	announce(args, iface.Index, cfg)
 	return nil
+}
+
+// announce writes the "attached" line to stderr (kubelet captures it)
+// and to the natra log. Two destinations because each is read by a
+// different audience: kubelet on plugin error, the log file on every
+// invocation regardless.
+func announce(args *skel.CmdArgs, ifIndex int, cfg *config.Config) {
+	fmt.Fprintf(os.Stderr, "natra: attached to %s (ifindex=%d) rate=%d bps burst=%d bytes\n",
+		args.IfName, ifIndex, cfg.Rate, cfg.Burst)
+	logf("attached: ifname=%s ifindex=%d rate=%d burst=%d hh=%d",
+		args.IfName, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
 func passthrough(args *skel.CmdArgs) error {

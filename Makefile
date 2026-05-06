@@ -204,7 +204,7 @@ ifeq ($(UNAME_S),Linux)
 	@KERNEL=$${KERNEL:-6.6}; bash test/perf/run.sh $$KERNEL && \
 		go test -tags=$(TAGS_PERF) ./test/perf/...
 else
-	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make >/dev/null && make build-bpf && go test -tags=perf -v ./test/perf/..."
+	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && make build-bpf && go test -tags=perf -v ./test/perf/..."
 endif
 
 .PHONY: test-perf-all

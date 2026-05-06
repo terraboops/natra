@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// Vanilla bandwidth emulator — for the L5 head-to-head comparison.
+// Vanilla bandwidth emulator — used only by the L5 head-to-head test.
 //
-// Mimics what the upstream containernetworking/plugins/bandwidth
-// plugin does: token-bucket rate-limiting applied UNIFORMLY to every
-// packet, no flow-cardinality awareness. The upstream plugin uses
-// kernel HTB (Hierarchical Token Bucket) qdisc on an IFB device; HTB
-// classifies all traffic into one class and enforces the rate. From
-// the perspective of "what fraction of mice flows survive when an
-// elephant is also present", that's algorithmically identical to a
-// global token bucket — the elephant exhausts tokens, mice starve.
+// This program emulates what containernetworking/plugins/bandwidth
+// does: token-bucket rate-limiting applied to every packet, no flow
+// awareness. The upstream plugin uses kernel HTB on an IFB device;
+// from the perspective of "what fraction of mice survive when an
+// elephant is present" that's the same shape as a global token
+// bucket — the elephant exhausts tokens, mice starve.
 //
-// This program is the "control" in the natra-vs-vanilla comparison.
-// Same input traffic, same rate config, no CMS bypass — the only
-// difference is the mouse-flow fast-pass that natra has and vanilla
-// doesn't. The L5 TestScenarioMixedVsVanilla driver runs identical
-// packet sequences through both this program and the real
-// natra.bpf.o, then asserts mice goodput differs in natra's favor.
-//
-// IMPORTANT: This is NOT what natra ships. It exists exclusively for
-// proof-by-comparison in tests. Production never loads it.
+// The L5 perf test loads both this program and natra.bpf.o, runs the
+// same packet sequence through each, and compares mice goodput. This
+// program is the control; production never loads it.
 
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>

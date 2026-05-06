@@ -84,8 +84,6 @@ func dumpStats(args []string) error {
 			zeros, nonZero int
 			max, total     uint32
 		)
-		var max32 uint32
-		_ = max32
 		for i := uint32(0); ; i++ {
 			var v uint32
 			if err := cmsMap.Lookup(&i, &v); err != nil {

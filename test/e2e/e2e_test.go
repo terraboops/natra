@@ -2,16 +2,11 @@
 
 // Layer 4 — kind end-to-end happy path.
 //
-// Brings up a 2-node kind cluster (kindnet as main CNI), builds + loads
-// the natra container image, installs the natra DaemonSet (which copies
-// the binary into /opt/cni/bin on every node), deploys iperf3 server +
-// client on different nodes, runs traffic, and verifies the bandwidth
-// limit is being enforced.
-//
-// Phase 0 expectation: cluster + DaemonSet come up, iperf connectivity
-// works, but the bandwidth assertion fails because Phase-0 natra doesn't
-// actually attach BPF programs (it's just installing the binary).
-// Phase 1 will replace this with real BPF-based rate-limiting.
+// Brings up a 2-node kind cluster (kindnet as main CNI), builds and
+// loads the natra container image, installs the natra DaemonSet
+// (which copies the binary into /opt/cni/bin on every node), deploys
+// iperf3 server and client on different nodes, runs traffic, and
+// verifies the bandwidth annotation is enforced.
 
 package e2e_test
 
@@ -130,7 +125,7 @@ var _ = Describe("natra e2e", func() {
 			"connectivity should work between iperf pods")
 	})
 
-	It("enforces ingress-bandwidth annotation (Phase 1)", func() {
+	It("enforces the ingress-bandwidth annotation", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		bps := runIperf(ctx)

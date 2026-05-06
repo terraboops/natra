@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Placeholder BPF program. Lets Layer 3 (lvh) prove its plumbing — load,
-// attach, BPF_PROG_RUN — works end-to-end before any real natra BPF code
-// exists. Phase 1 will replace this with the actual heavy-hitter / token
-// bucket dataplane.
+// Trivial pass-through BPF program. Used by the Layer 3 sanity test
+// to prove the loader plumbing — clang→bytecode→cilium/ebpf→kernel
+// →BPF_PROG_RUN — works end-to-end. Production never loads this; the
+// real dataplane is bpf/natra.bpf.c.
 //
-// Compiled on macOS via `clang -target bpf` (no kernel headers needed for
-// this trivial program). Loaded only on Linux (Layer 3 in lvh VMs).
+// Compiles via `clang -target bpf` without kernel headers; loaded only
+// on Linux.
 
 #define TC_ACT_OK 0
 

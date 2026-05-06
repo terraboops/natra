@@ -26,18 +26,15 @@ import (
 var chaosBpsCap = int64(float64(bandwidthBps) * 1.50)
 
 var _ = Describe("natra cluster chaos", func() {
-	// natra's BPF programs are attached via clsact qdisc + TC filter
-	// in each pod's netns. Because the attachment lives in the
-	// kernel's qdisc tree (not in the natra-installer process), the
-	// programs MUST survive the DaemonSet restarting — kubelet would
-	// kill the installer pod, the kernel keeps the rate-limit alive,
-	// and the new installer pod re-establishes the conflist patch
-	// without disturbing existing flows.
+	// natra's BPF programs are attached via clsact + tc filter in each
+	// pod's netns. The attachment lives in the kernel's qdisc tree —
+	// not in the natra-installer process — so the programs survive the
+	// DaemonSet restarting. Kubelet kills the installer pod, the kernel
+	// keeps the rate-limit alive, and the new installer pod re-applies
+	// the conflist patch without disturbing existing flows.
 	//
-	// This is a deliberate design property, not an accident; this
-	// test pins it so a future regression (e.g., naively pinning
-	// links to a host process tied to the DS pod's lifetime) can't
-	// silently break it.
+	// This test pins that property so a regression (e.g., switching to
+	// a host-process-pinned attachment) can't silently break it.
 	It("DaemonSet restart preserves rate-limiting on existing pods", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 		defer cancel()

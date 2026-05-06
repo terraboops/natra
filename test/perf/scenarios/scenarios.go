@@ -1,10 +1,8 @@
-// Package scenarios defines perf-comparison traffic patterns that Layer 5
-// runs against natra and the upstream containernetworking/plugins/bandwidth
-// plugin. Each scenario should be deterministic given a seed so per-kernel
-// runs in CI are reproducible enough for regression detection.
-//
-// Phase 0: type definitions only. Phase 1 fills in the actual packet
-// generation alongside natra's real BPF dataplane.
+// Package scenarios holds shared types for perf-comparison runs. The
+// actual perf scenarios live inline in perf_linux_test.go (using
+// BPF_PROG_RUN), so this package is currently unused by tests; it
+// stays as the place to put a Result/Config schema if/when we add
+// real-veth scenarios that need richer outputs.
 package scenarios
 
 import "time"

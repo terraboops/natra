@@ -1,14 +1,10 @@
 //go:build linux
 
-// Package bpf loads natra's compiled BPF object, attaches it to a
-// network interface as a tcx (kernel ≥ 6.6) or clsact (older) program,
-// and exposes typed accessors for the config / bucket / stats maps.
-//
-// The .bpf.o is embedded at build time so the natra binary is
-// self-contained — no /etc/natra/natra.bpf.o, no DaemonSet shipping
-// the bytecode separately. Embedding adds ~10 KB to the binary; in
-// exchange the install path is just "copy this binary to /opt/cni/bin
-// and you're done."
+// Package bpf loads the embedded natra BPF object, attaches it to a
+// veth ingress via clsact, and exposes typed accessors for the
+// config / bucket / stats / cms maps. The .bpf.o is embedded at build
+// time so the natra binary is self-contained — install is just "copy
+// the binary to /opt/cni/bin".
 package bpf
 
 import (
@@ -18,7 +14,6 @@ import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -27,31 +22,26 @@ import (
 //go:embed natra.bpf.o
 var natraBPF []byte
 
-// Config mirrors `struct natra_config` in bpf/natra.bpf.c. Field order
-// and types must match exactly — cilium/ebpf uses BTF to validate, but
-// only the C-side BTF; mismatched Go layout would silently corrupt.
+// Config mirrors `struct natra_config` in bpf/natra.bpf.c. Field
+// order and types must match the C side exactly.
 type Config struct {
 	RateBps     uint64
 	BurstBytes  uint64
 	HHThreshold uint64
 }
 
-// TokenBucket mirrors `struct token_bucket`. Field order matters; the
-// 4-byte spin lock field at the front + 4 bytes of pad align the 64-bit
-// fields to 8 bytes (BPF spin lock fields are exactly u32-sized).
-//
-// The two leading reserved fields hold the kernel-managed spin lock
-// state. Userspace zero-fills them on map writes; we never read them.
-// The unused-field linter complains, but the layout match is the
-// whole point — drop them and the ABI silently slides.
+// TokenBucket mirrors `struct token_bucket`. The first u32 is the
+// kernel's bpf_spin_lock; the second is alignment padding before the
+// 8-byte fields. Both are kernel-managed — userspace must include
+// them in the layout but never reads them.
 type TokenBucket struct {
-	Reserved0    uint32 //nolint:unused // bpf_spin_lock layout placeholder
-	Reserved1    uint32 //nolint:unused // 64-bit alignment pad
+	_            uint32 // bpf_spin_lock
+	_            uint32 // alignment
 	Tokens       uint64
 	LastUpdateNs uint64
 }
 
-// Stats slot indices match the BPF program's enum.
+// Stat slot indices match the enum in bpf/natra.bpf.c.
 const (
 	StatPassed    uint32 = 0
 	StatThrottled uint32 = 1
@@ -72,8 +62,7 @@ type Program struct {
 	configMap *ebpf.Map
 	bucketMap *ebpf.Map
 	statsMap  *ebpf.Map
-	cmsMap    *ebpf.Map // CMS counters; nil when running with the placeholder program
-	tcxLink   link.Link // unused for clsact path; reserved for future tcx-link path
+	cmsMap    *ebpf.Map // CMS counters; nil with the placeholder program
 }
 
 // Load instantiates the embedded BPF object. The kernel verifies it on
@@ -170,23 +159,18 @@ func (p *Program) PinMaps(dir, containerID string) error {
 	return nil
 }
 
-// AttachIngress binds the program to `ifIndex`'s INGRESS hook (packets
-// arriving at the interface). For natra this is the pod-side veth's
-// eth0 ingress — i.e., packets arriving INTO the pod, which is the
-// direction `kubernetes.io/ingress-bandwidth` describes.
+// AttachIngress binds the program to ifIndex's ingress hook (packets
+// arriving INTO the pod — the direction kubernetes.io/ingress-bandwidth
+// describes).
 //
-// Uses the legacy `clsact` + tc-filter path rather than tcx links,
-// because tcx links require BPF_OBJ_PIN to persist past the CNI
-// plugin process exit, and that syscall returned EPERM in our test
-// environment (likely an LSM/apparmor restriction on tcx-link pins
-// even with CAP_BPF). clsact attachment lives in the kernel's qdisc
-// tree — once `tc filter add` succeeds, the BPF program is referenced
-// by the filter and stays attached until the veth is deleted, with
-// no userspace fd / link / pin required. Tradeoff: clsact is older
-// (kernel 5.x+) but works on every kernel natra targets, including
-// 6.x where tcx is also available. Revisit when we have a confirmed
-// configuration where tcx-link pinning works.
-func (p *Program) AttachIngress(ifIndex int, _ string) error {
+// Uses clsact + tc-filter rather than tcx-link. tcx requires BPF_OBJ_PIN
+// to persist past the CNI plugin's process exit, and BPF_OBJ_PIN
+// returned EPERM in our test environments even with cap_bpf set on the
+// binary. clsact lives in the kernel's qdisc tree — once `tc filter add`
+// succeeds the kernel holds the program reference, no userspace handle
+// to track, and the filter is garbage-collected when the veth is
+// deleted (which the chained CNI's DEL does at pod teardown).
+func (p *Program) AttachIngress(ifIndex int) error {
 	// `nl` (not `link`) so we don't shadow the cilium/ebpf/link
 	// package imported above — golangci's revive flags the shadow.
 	nl, err := netlink.LinkByIndex(ifIndex)
@@ -231,10 +215,6 @@ func (p *Program) AttachIngress(ifIndex int, _ string) error {
 		return fmt.Errorf("replace tc bpf filter on ifindex %d: %w", ifIndex, err)
 	}
 
-	// p.link stays nil — clsact attachment is anchored in the kernel's
-	// qdisc tree, no userspace handle to track. Cleanup happens when
-	// the underlying veth is deleted (which the next chained CNI plugin
-	// does at pod teardown), so cmdDel is a no-op too.
 	return nil
 }
 
@@ -278,20 +258,13 @@ func (p *Program) readStat(idx uint32, sum *uint64) error {
 // Close releases the userspace BPF references. The kernel keeps the
 // program loaded and attached as long as the clsact filter holds a
 // reference, so closing here is safe — packets continue flowing
-// through the rate limiter after this call.
+// through the rate limiter.
 func (p *Program) Close() error {
-	var firstErr error
-	if p.tcxLink != nil {
-		if err := p.tcxLink.Close(); err != nil {
-			firstErr = err
-		}
-		p.tcxLink = nil
-	}
 	if p.coll != nil {
 		p.coll.Close()
 		p.coll = nil
 	}
-	return firstErr
+	return nil
 }
 
 // Program returns the underlying *ebpf.Program. Exposed for test code

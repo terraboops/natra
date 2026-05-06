@@ -1,11 +1,7 @@
 //go:build linux && bpf
 
-// Layer 3 chaos — BPF failure modes.
-//
-// Phase 1 lands TestVerifierRejection — a real test that loads an
-// intentionally-invalid BPF program and asserts the verifier rejects
-// it with a clear, multi-line *ebpf.VerifierError. The remaining
-// scenarios are still stubbed for future iterations.
+// Layer 3 chaos — BPF failure modes: verifier rejection, malformed
+// packets, concurrent map updates, CMS saturation.
 
 package bpf_test
 
@@ -22,8 +18,9 @@ import (
 )
 
 // invalidBPFPath returns the absolute path to a chaos-testdata BPF
-// object built by `make build-bpf`. Each .bpf.c under bpf/testdata/
-// compiles to a .bpf.o that the verifier MUST reject.
+// object. Each .bpf.c under bpf/testdata/ is a deliberately invalid
+// program — `make build-bpf` compiles them, but loading them must
+// fail verification.
 func invalidBPFPath(name string) string {
 	_, thisFile, _, _ := runtime.Caller(0)
 	return filepath.Join(filepath.Dir(thisFile), "..", "..", "bpf", "testdata", name)
@@ -105,17 +102,12 @@ func TestMalformedPackets(t *testing.T) {
 
 	// Even with a real config (not the fail-open path), malformed
 	// packets must pass through.
-	cfg := struct {
-		R, B, H uint64
-	}{R: 1_250_000, B: 64_000, H: 10}
+	cfg := natraConfig{RateBps: 1_250_000, BurstBytes: 64_000, HHThreshold: 10}
 	zero := uint32(0)
 	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	if err := coll.Maps["natra_bucket_map"].Update(&zero, &struct {
-		_lock, _pad        uint32
-		Tokens, LastUpdate uint64
-	}{Tokens: cfg.B}, ebpf.UpdateAny); err != nil {
+	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
 	prog := coll.Programs["natra_ratelimit"]
@@ -149,27 +141,10 @@ func TestMalformedPackets(t *testing.T) {
 		})
 	}
 
-	throttled := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], 1)
+	throttled := readPerCPUStat(t, coll.Maps["natra_stats_map"], 1)
 	if throttled != 0 {
 		t.Errorf("STAT_THROTTLED=%d after malformed-only packets, want 0", throttled)
 	}
-}
-
-// readPerCPUStatLocal duplicates readPerCPUStat from
-// ratelimit_linux_test.go — both files are in the same _test package,
-// so we keep the helper named distinctly to avoid name collision while
-// staying self-contained.
-func readPerCPUStatLocal(t *testing.T, m *ebpf.Map, idx uint32) uint64 {
-	t.Helper()
-	var values []uint64
-	if err := m.Lookup(&idx, &values); err != nil {
-		t.Fatalf("stats lookup idx=%d: %v", idx, err)
-	}
-	var sum uint64
-	for _, v := range values {
-		sum += v
-	}
-	return sum
 }
 
 // Test inputs constructed by hand to keep the test independent of any
@@ -221,15 +196,12 @@ func TestConcurrentMapUpdates(t *testing.T) {
 	}
 	t.Cleanup(coll.Close)
 
-	// Configure with high threshold so all packets are mice (no token
-	// bucket contention — we're stress-testing CMS atomic adds).
-	cfg := struct{ R, B, H uint64 }{R: 1_000_000_000, B: 1 << 30, H: 1 << 30}
+	// High threshold → every packet is a mouse, so we stress only the
+	// CMS atomic adds without token-bucket contention muddying it.
+	cfg := natraConfig{RateBps: 1_000_000_000, BurstBytes: 1 << 30, HHThreshold: 1 << 30}
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
-	_ = coll.Maps["natra_bucket_map"].Update(&zero, &struct {
-		_lock, _pad        uint32
-		Tokens, LastUpdate uint64
-	}{Tokens: cfg.B}, ebpf.UpdateAny)
+	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny)
 
 	prog := coll.Programs["natra_ratelimit"]
 	pkt := elephantPkt()
@@ -257,7 +229,7 @@ func TestConcurrentMapUpdates(t *testing.T) {
 	// Sum of STAT_PASSED across CPUs should equal the exact packet
 	// count we sent — the only path is mouse-pass with HHThreshold so
 	// high it's never crossed.
-	passed := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], 0)
+	passed := readPerCPUStat(t, coll.Maps["natra_stats_map"], 0)
 	if passed != expectedTotal {
 		t.Errorf("STAT_PASSED=%d, want %d (concurrent atomic adds lost packets?)", passed, expectedTotal)
 	}
@@ -302,15 +274,12 @@ func TestMapCapacityOOM(t *testing.T) {
 	}
 	t.Cleanup(coll.Close)
 
-	// All packets are mice (high threshold). The point is to load CMS
-	// to overflow without engaging the bucket.
-	cfg := struct{ R, B, H uint64 }{R: 1, B: 1, H: 1 << 30}
+	// All mice (high threshold) so the test loads CMS past capacity
+	// without engaging the bucket.
+	cfg := natraConfig{RateBps: 1, BurstBytes: 1, HHThreshold: 1 << 30}
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
-	_ = coll.Maps["natra_bucket_map"].Update(&zero, &struct {
-		_lock, _pad        uint32
-		Tokens, LastUpdate uint64
-	}{}, ebpf.UpdateAny)
+	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny)
 
 	prog := coll.Programs["natra_ratelimit"]
 	const flows = 8192 // 2× CMS capacity
@@ -321,7 +290,7 @@ func TestMapCapacityOOM(t *testing.T) {
 		}
 	}
 
-	passed := readPerCPUStatLocal(t, coll.Maps["natra_stats_map"], 0)
+	passed := readPerCPUStat(t, coll.Maps["natra_stats_map"], 0)
 	if passed != flows {
 		t.Errorf("STAT_PASSED=%d, want %d (program crashed mid-overflow?)", passed, flows)
 	}
