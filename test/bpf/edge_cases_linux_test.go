@@ -1,11 +1,11 @@
 //go:build linux && bpf
 
-// Edge-case stress tests for natra's BPF dataplane. The intent is
-// adversarial: try to break the program, then either fix what breaks
-// or document why the failure mode is acceptable. Sprawling
-// intentionally — these aren't intended to enforce a tight contract,
-// they're documenting the actual robustness boundary so future
-// regressions are visible.
+// Edge-case tests for natra's BPF dataplane. Each documents an
+// adversarial input or unusual operating condition (oversize packet
+// vs burst, ICMP without L4 ports, IPv4 options, zero burst, rapid
+// config change, jumbo packets, CMS counter overflow). Useful as
+// regression coverage and as documentation of the robustness
+// boundary.
 
 package bpf_test
 
@@ -18,9 +18,8 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// edgeMkPkt is a local copy of test/perf/perf_linux_test.go's mkPkt
-// helper. Packages can't share `*_test.go` symbols, and the perf
-// suite has its own build tag.
+// edgeMkPkt builds a 64-byte ETH+IPv4+TCP packet with the given
+// 5-tuple. Used by the edge-case tests below.
 func edgeMkPkt(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte {
 	pkt := make([]byte, 64)
 	pkt[12], pkt[13] = 0x08, 0x00

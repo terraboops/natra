@@ -9,7 +9,6 @@ package cni_test
 import (
 	"bytes"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -139,7 +138,6 @@ func newTestNetnsWithVeth(ifName string) (netns.NsHandle, func(), error) {
 		cleanup()
 		return 0, nil, fmt.Errorf("set %s up in pod netns: %w", ifName, err)
 	}
-	_ = net.IPv4zero // pin the `net` import for future helpers
 	return ns, cleanup, nil
 }
 

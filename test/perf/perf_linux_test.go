@@ -1,11 +1,8 @@
 //go:build linux && perf
 
-// Layer 5 — head-to-head perf vs upstream containernetworking/plugins/bandwidth.
-//
-// The project's pitch is "smarter than vanilla." This layer makes that
-// claim falsifiable on every push. Each scenario runs against both
-// plugins; results are diffed against baselines/<kernel>.json and the
-// test fails if natra regresses or stops winning the mixed scenario.
+// Layer 5 — perf scenarios, including a head-to-head comparison against
+// the bpf/vanilla.bpf.c emulator of the upstream bandwidth plugin.
+// Results are diffed against baselines/<kernel>.json on every run.
 //
 // Scenarios:
 //   - TestBPFProgRunThroughput     — micro: ns/op for the placeholder
@@ -47,9 +44,10 @@ func baselinePath(kernel string) string {
 	return filepath.Join(filepath.Dir(thisFile), "baselines", kernel+".json")
 }
 
-// kernelTag returns a coarse kernel identifier for baseline lookup. On lvh
-// it's set via env (KERNEL=5.15 / 6.6 / bpf-next); local Mac dev runs
-// against whatever kernel colima's VM provides, which we tag "local".
+// kernelTag returns the identifier under which we look up a baseline.
+// `KERNEL` is set by the Makefile when running against a specific
+// kernel version; otherwise we tag the run "local" (Docker Desktop on
+// Mac, the runner kernel in CI).
 func kernelTag() string {
 	if k := os.Getenv("KERNEL"); k != "" {
 		return k
@@ -62,10 +60,10 @@ type baseline struct {
 	BPFProgRunNsPerOpMax float64 `json:"bpf_prog_run_ns_per_op_max"`
 }
 
-// loadBPFRunBaseline reads the kernel-specific perf baseline. Returns nil
-// (with no error) if the file doesn't exist — the caller decides how to
-// react. Decoding errors are propagated so a corrupt baseline isn't silently
-// treated as "no baseline."
+// loadBaseline reads the per-kernel baseline file. Returns (nil, nil)
+// if the file doesn't exist — the caller decides whether absence is
+// an error. Decoding errors propagate so a corrupt baseline isn't
+// silently treated as no-baseline.
 func loadBaseline(kernel string) (*baseline, error) {
 	path := baselinePath(kernel)
 	data, err := os.ReadFile(path)
@@ -222,8 +220,7 @@ func TestScenarioOneElephant(t *testing.T) {
 	}
 }
 
-// readPerCPUStat sums a per-CPU stats counter. Mirrors the helper in
-// test/bpf/ratelimit_linux_test.go (different package, can't share).
+// readPerCPUStat sums a per-CPU stats counter across all CPUs.
 func readPerCPUStat(t *testing.T, m *ebpf.Map, idx uint32) uint64 {
 	t.Helper()
 	var values []uint64
@@ -346,11 +343,11 @@ func TestScenarioThousandMice(t *testing.T) {
 // TestScenarioMixed runs one elephant flow alongside many mice and
 // asserts the elephant gets throttled while the mice don't. Three
 // assertions:
-//   1. Elephant: nonzero throttled count (bucket drops packets when
-//      the elephant exceeds rate).
-//   2. Mice: zero hh_hits (no mouse flow ever crosses threshold).
-//   3. hh_hits is dominated by the elephant alone — the elephant
-//      stays classified heavy throughout.
+//  1. Elephant: nonzero throttled count (bucket drops packets when
+//     the elephant exceeds rate).
+//  2. Mice: zero hh_hits (no mouse flow ever crosses threshold).
+//  3. hh_hits is dominated by the elephant alone — the elephant
+//     stays classified heavy throughout.
 func TestScenarioMixed(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -487,7 +484,7 @@ func TestScenarioMixedVsVanilla(t *testing.T) {
 }
 
 type mixedResult struct {
-	miceSent, micePassed         uint64
+	miceSent, micePassed            uint64
 	elephantSent, elephantThrottled uint64
 }
 
@@ -505,9 +502,9 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 
 	// Same config for both — the only difference is what the program
 	// does with each packet.
-	const rateBps = 1_250_000     // 10 Mbps in bytes/sec
-	const burstBytes = 64_000     // small bucket → elephant exhausts it quickly
-	const hhThreshold = 10        // ignored by vanilla; natra uses it
+	const rateBps = 1_250_000 // 10 Mbps in bytes/sec
+	const burstBytes = 64_000 // small bucket → elephant exhausts it quickly
+	const hhThreshold = 10    // ignored by vanilla; natra uses it
 	zero := uint32(0)
 
 	if isNatra {
@@ -531,7 +528,7 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 		prog = coll.Programs["vanilla_ratelimit"]
 	}
 
-	const elephantPrime = 5_000   // packets to send BEFORE the mice — drains the bucket
+	const elephantPrime = 5_000 // packets to send BEFORE the mice — drains the bucket
 	const miceFlows = 100
 	const miceFlowPackets = 5
 	elephantPkt := mkPkt(0x0AFF0001, 0x0AFF0002, 33000, 5201)

@@ -74,7 +74,7 @@ func parseJSONConfig(data string) (*Config, error) {
 		HeavyHitterThreshold int64  `json:"heavyHitterThreshold"`
 	}
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON config: %w", err)
+		return nil, fmt.Errorf("parse JSON config: %w", err)
 	}
 
 	cfg := DefaultConfig()

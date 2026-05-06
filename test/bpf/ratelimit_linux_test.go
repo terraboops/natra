@@ -1,11 +1,9 @@
 //go:build linux && bpf
 
-// Incremental BPF tests for natra.bpf.o. Exercises the token-bucket
-// behavior at the BPF level — loading the program, populating config
-// and bucket maps, running BPF_PROG_RUN with synthetic packets, and
-// asserting the verdicts and stats. These tests catch BPF-level
-// regressions independent of the Go loader and CNI integration; they
-// are the first thing to fail when the BPF program itself breaks.
+// BPF-level tests for natra.bpf.o: load the program, populate config
+// and bucket maps, run BPF_PROG_RUN with synthetic packets, assert the
+// verdicts and stats. Catches BPF-level regressions independent of the
+// Go loader and CNI integration.
 
 package bpf_test
 
@@ -92,8 +90,8 @@ func readPerCPUStat(t *testing.T, statsMap *ebpf.Map, idx uint32) uint64 {
 }
 
 // synthEthIPpkt returns a 64-byte ETH+IPv4 packet, valid enough that
-// future flow-parsing code (CMS step) won't reject it but minimal for
-// step 1's "ignore content, just count length" token bucket.
+// the BPF flow parser accepts it. The 5-tuple fields aren't filled in;
+// callers that care about flow identity use synthEthIPpktFromFlow.
 func synthEthIPpkt() []byte {
 	pkt := make([]byte, 64)
 	// EtherType IPv4
@@ -131,7 +129,7 @@ func TestNatraTokenBucketUnderRate(t *testing.T) {
 	cfg := natraConfig{
 		RateBps:     100_000_000 / 8, // 12.5 MB/s
 		BurstBytes:  1 << 20,         // 1 MB
-		HHThreshold: 0,               // unused in step 1
+		HHThreshold: 0,               // not exercised here
 	}
 	zero := uint32(0)
 	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
@@ -225,7 +223,7 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 
 	cfg := natraConfig{
 		RateBps:     1,
-		BurstBytes:  64,  // exactly one packet's worth
+		BurstBytes:  64, // exactly one packet's worth
 		HHThreshold: 10, // 11th packet onward is "heavy"
 	}
 	zero := uint32(0)

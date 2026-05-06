@@ -112,13 +112,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 	logCaps()
 	conf, err := parseConfig(args.StdinData)
 	if err != nil {
-		return fmt.Errorf("failed to parse config: %w", err)
+		return fmt.Errorf("parse config: %w", err)
 	}
 
 	cfg := resolveConfig(conf)
 	if cfg == nil || cfg.Rate <= 0 {
 		logf("no rate limit, passing through")
-		return passthrough(args)
+		return passthrough(args, conf)
 	}
 	logf("config resolved: rate=%d burst=%d", cfg.Rate, cfg.Burst)
 
@@ -128,7 +128,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logf("attachBPF FAILED: %v", err)
 	}
 
-	return passthrough(args)
+	return passthrough(args, conf)
 }
 
 // logf appends a line to /var/log/natra-cni.log. Best effort — if the
@@ -203,7 +203,7 @@ func cmdCheck(*skel.CmdArgs) error {
 func parseConfig(stdin []byte) (*NetConf, error) {
 	conf := &NetConf{}
 	if err := json.Unmarshal(stdin, conf); err != nil {
-		return nil, fmt.Errorf("failed to parse network config: %w", err)
+		return nil, fmt.Errorf("parse network config: %w", err)
 	}
 	return conf, nil
 }
@@ -330,20 +330,14 @@ func announce(args *skel.CmdArgs, ifIndex int, cfg *config.Config) {
 		args.IfName, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
-func passthrough(args *skel.CmdArgs) error {
-	conf, err := parseConfig(args.StdinData)
-	if err != nil {
-		return err
-	}
-
+func passthrough(args *skel.CmdArgs, conf *NetConf) error {
 	// In a chained call kubelet writes the upstream plugin's Result
-	// into stdin as `prevResult`. encoding/json populates
-	// conf.RawPrevResult (a generic map), but the typed PrevResult
-	// only gets populated when we ask the version framework to parse
-	// it for us. Without this call, natra always treats prevResult as
-	// nil and writes back a minimal Result missing the IPs that
-	// kindnet/ptp produced — containerd then sees no network info for
-	// the sandbox and pod creation hangs in ContainerCreating with
+	// into stdin as `prevResult`. encoding/json fills conf.RawPrevResult
+	// (a generic map), but conf.PrevResult only gets populated after
+	// version.ParsePrevResult walks it. Skipping this call leaves
+	// PrevResult nil and we write back a minimal Result missing the
+	// IPs kindnet/ptp produced — containerd then sees no network info
+	// for the sandbox and pod creation hangs in ContainerCreating with
 	// "failed to find network info for sandbox" errors.
 	if err := version.ParsePrevResult(&conf.NetConf); err != nil {
 		return fmt.Errorf("parse prevResult: %w", err)
@@ -352,7 +346,7 @@ func passthrough(args *skel.CmdArgs) error {
 	if conf.PrevResult != nil {
 		result, err := current.NewResultFromResult(conf.PrevResult)
 		if err != nil {
-			return fmt.Errorf("failed to convert previous result: %w", err)
+			return fmt.Errorf("convert previous result: %w", err)
 		}
 		return types.PrintResult(result, conf.CNIVersion)
 	}
