@@ -450,6 +450,150 @@ func TestScenarioMixed(t *testing.T) {
 	}
 }
 
+// TestScenarioMixedVsVanilla — the headline differentiator test.
+// Loads natra.bpf.o AND vanilla.bpf.o (the upstream-bandwidth-emulator
+// in bpf/vanilla.bpf.c), runs the same elephant+mice packet sequence
+// through both, and asserts natra preserves mice goodput while vanilla
+// throttles them along with the elephant.
+//
+// The asymmetry vanilla suffers comes from its design: token-bucket-on-
+// every-packet has no flow-cardinality awareness, so mice arriving
+// after the elephant has drained the bucket get dropped exactly the
+// same as more elephant packets. natra's CMS classification gives
+// mice the fast-pass.
+//
+// This is the falsifiable proof that natra > vanilla on this workload.
+// Failing this test would mean either (a) natra regressed to vanilla
+// behavior or (b) the comparison emulator drifted from upstream
+// semantics. Both warrant immediate triage.
+func TestScenarioMixedVsVanilla(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+
+	natraResult := runMixed(t, "natra.bpf.o", true)
+	vanillaResult := runMixed(t, "vanilla.bpf.o", false)
+
+	natraMicePassRate := float64(natraResult.micePassed) / float64(natraResult.miceSent)
+	vanillaMicePassRate := float64(vanillaResult.micePassed) / float64(vanillaResult.miceSent)
+	t.Logf("natra mice goodput: %d/%d = %.1f%%", natraResult.micePassed, natraResult.miceSent, natraMicePassRate*100)
+	t.Logf("vanilla mice goodput: %d/%d = %.1f%%", vanillaResult.micePassed, vanillaResult.miceSent, vanillaMicePassRate*100)
+
+	// Headline assertions:
+	// 1. natra mice goodput must be ≥ 95% — every mouse packet should
+	//    stay below threshold and bypass the bucket.
+	if natraMicePassRate < 0.95 {
+		t.Errorf("natra mice goodput %.1f%% < 95%%, want near 100%%", natraMicePassRate*100)
+	}
+	// 2. vanilla mice goodput must be substantially worse — its bucket
+	//    is shared with the elephant. With our config (rate ≪ elephant
+	//    rate) the bucket gets drained, and mice arriving after that
+	//    are dropped indiscriminately. Realistic ratio: 30%-60% of mice
+	//    survive depending on interleave order with the elephant.
+	if vanillaMicePassRate >= natraMicePassRate {
+		t.Errorf("vanilla mice goodput %.1f%% >= natra %.1f%% — comparison emulator broken or natra regressed",
+			vanillaMicePassRate*100, natraMicePassRate*100)
+	}
+	// 3. The gap should be meaningful — at least 20 percentage points.
+	if natraMicePassRate-vanillaMicePassRate < 0.20 {
+		t.Errorf("natra-vs-vanilla mice gap %.1fpp < 20pp — value-prop is too small to claim",
+			(natraMicePassRate-vanillaMicePassRate)*100)
+	}
+}
+
+type mixedResult struct {
+	miceSent, micePassed         uint64
+	elephantSent, elephantThrottled uint64
+}
+
+func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
+	t.Helper()
+	spec, err := ebpf.LoadCollectionSpec(bpfObjectPath(bpfObject))
+	if err != nil {
+		t.Fatalf("load %s: %v", bpfObject, err)
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatalf("instantiate %s: %v", bpfObject, err)
+	}
+	t.Cleanup(coll.Close)
+
+	// Same config for both — the only difference is what the program
+	// does with each packet.
+	const rateBps = 1_250_000     // 10 Mbps in bytes/sec
+	const burstBytes = 64_000     // small bucket → elephant exhausts it quickly
+	const hhThreshold = 10        // ignored by vanilla; natra uses it
+	zero := uint32(0)
+
+	if isNatra {
+		cfg := natraConfig{RateBps: rateBps, BurstBytes: burstBytes, HHThreshold: hhThreshold}
+		_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
+		_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
+	} else {
+		var cfg struct {
+			R, B uint64
+		}
+		cfg.R = rateBps
+		cfg.B = burstBytes
+		_ = coll.Maps["vanilla_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
+		_ = coll.Maps["vanilla_bucket_map"].Update(&zero, &struct {
+			_lock, _pad        uint32
+			Tokens, LastUpdate uint64
+		}{Tokens: burstBytes}, ebpf.UpdateAny)
+	}
+
+	var prog *ebpf.Program
+	if isNatra {
+		prog = coll.Programs["natra_ratelimit"]
+	} else {
+		prog = coll.Programs["vanilla_ratelimit"]
+	}
+
+	const elephantPrime = 5_000   // packets to send BEFORE the mice — drains the bucket
+	const miceFlows = 100
+	const miceFlowPackets = 5
+	elephantPkt := mkPkt(0x0AFF0001, 0x0AFF0002, 33000, 5201)
+
+	var r mixedResult
+
+	// Phase 1: elephant pre-drains the bucket. After this, vanilla's
+	// bucket is empty (bps × elapsed-during-loop ≪ burst), so any
+	// subsequent mouse packet must wait for token refill. natra's
+	// bucket is also empty, but natra's mice never reach the bucket
+	// thanks to the CMS fast-pass.
+	for i := 0; i < elephantPrime; i++ {
+		ret, _, err := prog.Test(elephantPkt)
+		if err != nil {
+			t.Fatalf("BPF_PROG_RUN elephant prime i=%d: %v", i, err)
+		}
+		r.elephantSent++
+		if ret == 2 {
+			r.elephantThrottled++
+		}
+	}
+
+	// Phase 2: mice flow. Each is a distinct flow_key so its CMS
+	// count is small (≤ miceFlowPackets = 5, threshold = 10). natra
+	// classifies them as mice and skips the bucket. vanilla doesn't
+	// have CMS — every packet hits the (now-empty) bucket and most
+	// drop.
+	for f := 0; f < miceFlows; f++ {
+		micePkt := mkPkt(0x0A0A0000+uint32(f), 0x0AFF0002,
+			uint16(40000+f), 5201)
+		for j := 0; j < miceFlowPackets; j++ {
+			ret, _, err := prog.Test(micePkt)
+			if err != nil {
+				t.Fatalf("BPF_PROG_RUN mouse f=%d j=%d: %v", f, j, err)
+			}
+			r.miceSent++
+			if ret == 0 {
+				r.micePassed++
+			}
+		}
+	}
+	return r
+}
+
 func mkPkt(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte {
 	pkt := make([]byte, 64)
 	pkt[12], pkt[13] = 0x08, 0x00

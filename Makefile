@@ -24,7 +24,7 @@ BPF_CLANG ?= clang
 endif
 
 CNI_BINARY := bin/natra
-BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o
+BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o bpf/vanilla.bpf.o
 # Intentionally-invalid programs used by the L3 chaos suite. They MUST
 # build (clang accepts them) but FAIL to load (verifier rejects). Listed
 # here so `make build-bpf` produces them alongside the real ones.

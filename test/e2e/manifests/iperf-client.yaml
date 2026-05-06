@@ -6,13 +6,16 @@ metadata:
   labels:
     app: iperf-client
 spec:
-  # Co-located with iperf-server on the worker node. natra's BPF
-  # program attaches to iperf-server's eth0 ingress hook regardless of
-  # where the traffic originates, so same-node still exercises the
-  # full rate-limit datapath. Cross-node testing is a follow-up — see
-  # the multi-node TODO in test/e2e/README.md.
+  # Pinned to the control-plane node so traffic to iperf-server crosses
+  # the inter-node fabric (kindnet bridge + vxlan), exercising natra's
+  # clsact filter on the *server* side veth where the packet arrives
+  # from a remote source — the production-shaped scenario.
   nodeSelector:
-    kubernetes.io/hostname: natra-e2e-worker
+    kubernetes.io/hostname: natra-e2e-control-plane
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
   containers:
     - name: iperf
       image: networkstatic/iperf3:latest

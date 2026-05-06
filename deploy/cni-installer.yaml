@@ -23,94 +23,82 @@ spec:
           effect: NoSchedule
         - operator: Exists
           effect: NoExecute
-      containers:
-        - name: install-cni
+      # Init container does the work, then exits. Pod readiness is
+      # naturally gated on init completion — no marker file, no
+      # readinessProbe shimming. The pause container exists only to
+      # keep the Pod present so the DaemonSet controller is happy and
+      # `kubectl get pods` shows one entry per node.
+      initContainers:
+        - name: install
           image: ghcr.io/terraboops/natra:latest
           imagePullPolicy: IfNotPresent
-          # Two-phase install: drop the natra binary into /opt/cni/bin,
-          # then patch every existing .conflist in /etc/cni/net.d to
-          # include {"type":"natra"} as the last plugin in the chain.
-          # natra is intentionally last so kindnet/calico/etc. do all
-          # IPAM and bridging first; natra layers BPF rate limiting on
-          # top of whatever interface the upstream produced.
           command:
             - /bin/sh
             - -ec
             - |
-              # Ensure bpffs is mounted on the host. Kind nodes don't
-              # mount it by default, but natra needs it to pin tcx
-              # links so they survive the CNI plugin process exiting.
-              # mount -t bpf is a no-op if already mounted.
+              # Mount bpffs into the host's mount namespace via
+              # Bidirectional propagation so it survives this init
+              # container exiting. Kubelet's CNI invocations need
+              # /sys/fs/bpf available long after the install finishes.
               if ! mountpoint -q /host/sys/fs/bpf; then
                 mount -t bpf bpffs /host/sys/fs/bpf || true
                 echo "natra: mounted bpffs on /sys/fs/bpf"
               fi
 
               install -m 0755 /usr/local/bin/natra /host/opt/cni/bin/natra
-              # File capabilities: when kubelet/containerd exec the
-              # natra CNI plugin they don't pass through CAP_BPF or
-              # CAP_PERFMON (only some of CAP_NET_ADMIN). Without these,
-              # BPF_OBJ_PIN returns EPERM. setcap on the binary itself
-              # gives it ambient capabilities on every exec, regardless
+              # File capabilities: kubelet/containerd exec the natra
+              # CNI plugin without CAP_BPF or CAP_PERFMON in the
+              # ambient set, so BPF_OBJ_PIN returns EPERM. setcap
+              # gives the binary ambient caps on every exec regardless
               # of caller's cap_inheritable mask.
               if command -v setcap >/dev/null 2>&1; then
                 setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep /host/opt/cni/bin/natra || true
                 echo "natra: file caps set"
               else
-                echo "natra: setcap unavailable in installer image; relying on caller caps"
+                echo "natra: setcap unavailable; relying on caller caps"
               fi
               echo "natra: binary installed at /opt/cni/bin/natra"
 
-              # Wait for at least one *.conflist to appear (kindnet et
-              # al. write theirs after their own DaemonSet starts), then
-              # patch ONCE. We don't loop — every rewrite of the
-              # conflist triggers containerd's inotify watch, and rapid
-              # rewrites can race with sandbox creation, surfacing as
-              # "failed to find network info for sandbox" CRI errors.
+              # Wait for at least one *.conflist to appear (kindnet
+              # writes its conflist after its own DaemonSet starts),
+              # then patch ONCE. We don't loop — every rewrite of the
+              # conflist triggers containerd's inotify watch, and
+              # rapid rewrites can race with sandbox creation,
+              # surfacing as "failed to find network info for sandbox"
+              # CRI errors.
               while ! ls /host/etc/cni/net.d/*.conflist >/dev/null 2>&1; do
                 sleep 1
               done
               /usr/local/bin/natra install-cni-chain /host/etc/cni/net.d/
-              # Marker file the readiness probe watches for. Until this
-              # exists, kubelet keeps the DS pod NotReady and any test
-              # that does `kubectl rollout status` blocks. Without this
-              # gate, e2e tests racily schedule iperf pods before the
-              # install script finishes patching the conflist, and
-              # those pods get the un-natra-chained CNI.
-              mkdir -p /host/var/run/natra
-              touch /host/var/run/natra/installed
-              echo "natra: chain install complete; idling"
-              sleep infinity
-          # Readiness probe gates Ready on install completion. Without
-          # this, `kubectl rollout status` returns as soon as the
-          # container starts running, which is BEFORE the install
-          # script finishes patching the CNI conflist — then any pod
-          # the test creates immediately afterwards gets the un-chained
-          # CNI and natra never runs on its traffic.
-          readinessProbe:
-            exec:
-              command: ["test", "-f", "/host/var/run/natra/installed"]
-            initialDelaySeconds: 1
-            periodSeconds: 1
-            timeoutSeconds: 1
+              echo "natra: chain install complete"
           volumeMounts:
             - name: cni-bin-dir
               mountPath: /host/opt/cni/bin
             - name: cni-net-dir
               mountPath: /host/etc/cni/net.d
-            # Mount the host's /sys so we can mount bpffs at
-            # /host/sys/fs/bpf and have it visible to other processes
-            # (including natra invocations from kubelet's CNI calls).
-            # Bidirectional propagation is required — without it, any
-            # mount we do here is invisible to the host namespace.
             - name: host-sys
               mountPath: /host/sys
+              # Bidirectional so the bpffs mount escapes into the
+              # host's mount namespace — without it, the mount would
+              # die with this container.
               mountPropagation: Bidirectional
-            # Marker file location the readiness probe checks.
-            - name: host-var-run
-              mountPath: /host/var/run
           securityContext:
             privileged: true
+      # Pause sidecar: anchors the Pod for the DaemonSet controller's
+      # benefit. No CPU, no work, no logs of its own. Same image
+      # kubelet uses for Pod sandbox containers, so it's already
+      # cached on every node.
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "1Mi"
+            limits:
+              cpu: "10m"
+              memory: "8Mi"
       volumes:
         - name: cni-bin-dir
           hostPath:
@@ -124,7 +112,3 @@ spec:
           hostPath:
             path: /sys
             type: Directory
-        - name: host-var-run
-          hostPath:
-            path: /var/run
-            type: DirectoryOrCreate

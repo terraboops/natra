@@ -40,6 +40,7 @@ ALLOWLIST=(
 	"bpf/natra.bpf.c"                          # real: GPL header line; BPF kernel helpers are GPL-only.
 	"bpf/placeholder.bpf.c"                    # real: Apache-2.0 placeholder.
 	"bpf/testdata/invalid_oob_packet_access.bpf.c"  # real: GPL — BPF chaos fixture.
+	"bpf/vanilla.bpf.c"                        # real: GPL — head-to-head comparison emulator (test-only).
 	"Makefile"                                 # false-positive: Makefile comments mention libbpf/GPL deps.
 	"scripts/license-scan.sh"                  # false-positive: this script literally lists GPL/AGPL/SSPL names to detect them.
 	".github/workflows/license.yml"            # false-positive: workflow that runs this script.

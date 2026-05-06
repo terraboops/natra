@@ -105,7 +105,7 @@ var _ = BeforeSuite(func() {
 		}
 		dump("kubectl describe pod/iperf-server", "kubectl", "describe", "pod/iperf-server", "-n", namespace)
 		dump("kubectl describe pod/iperf-client", "kubectl", "describe", "pod/iperf-client", "-n", namespace)
-		dump("daemonset logs", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "--tail=50")
+		dump("install init-container logs", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "-c", "install", "--tail=50")
 		dump("conflist on worker node", "docker", "exec", clusterName+"-worker", "sh", "-c", "ls /etc/cni/net.d && cat /etc/cni/net.d/*.conflist 2>/dev/null")
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
