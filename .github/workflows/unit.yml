@@ -42,8 +42,13 @@ jobs:
       # Fuzz only targets pkg/cni/config which doesn't import pkg/bpf,
       # so we can skip the BPF build here. Saves ~30s per run.
       - name: Fuzz parser invariants
+        # -fuzztime is the *generation* budget; iterations in flight when
+        # the deadline fires can take a few seconds to wind down on a
+        # slow runner. -test.timeout caps the whole job a comfortable
+        # margin above fuzztime so wind-down doesn't trip the test
+        # framework's deadline.
         run: |
-          go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -run=^$ ./pkg/cni/config/...
+          go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -test.timeout=2m -run=^$ ./pkg/cni/config/...
 
   bench:
     name: Bench (compare to main)

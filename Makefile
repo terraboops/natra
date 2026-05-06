@@ -155,7 +155,7 @@ test-unit: ## Layer 1a — Ginkgo unit tests.
 
 .PHONY: test-fuzz
 test-fuzz: ## Layer 1b — 30s fuzz against the bandwidth annotation parser.
-	go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -run=^$$ ./pkg/cni/config/...
+	go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=30s -test.timeout=2m -run=^$$ ./pkg/cni/config/...
 
 .PHONY: test-bench
 test-bench: ## Layer 1c — Hot-path benchmarks (no regression check; CI does that).
