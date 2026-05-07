@@ -170,3 +170,39 @@ func requireRoot() error {
 	}
 	return nil
 }
+
+// remainingPinsFor returns the entries in /sys/fs/bpf/natra/ whose name
+// starts with the given containerID. Used after a CNI DEL to assert
+// that nothing leaked. Empty slice if the pin dir doesn't exist.
+//
+// Uses ReadDir rather than per-file stat because bpffs returns EPERM
+// (not ENOENT) on stat of a non-existent pin file, which makes
+// os.IsNotExist unreliable.
+func remainingPinsFor(containerID string) []string {
+	const pinDir = "/sys/fs/bpf/natra"
+	entries, err := os.ReadDir(pinDir)
+	if err != nil {
+		return nil
+	}
+	prefix := containerID + "-"
+	var out []string
+	for _, e := range entries {
+		if len(e.Name()) >= len(prefix) && e.Name()[:len(prefix)] == prefix {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// linkPinExists reports whether /sys/fs/bpf/natra/<containerID>-<ifName>.link
+// is present. Uses ReadDir + name match because bpffs returns EPERM
+// (not ENOENT) on stat of a non-existent file.
+func linkPinExists(containerID, ifName string) bool {
+	target := containerID + "-" + ifName + ".link"
+	for _, name := range remainingPinsFor(containerID) {
+		if name == target {
+			return true
+		}
+	}
+	return false
+}

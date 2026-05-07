@@ -81,10 +81,24 @@ func writeChainedSibling(src, dst string) error {
 	for k, v := range conflist {
 		chained[k] = v
 	}
-	chained["plugins"] = append(append([]any{}, plugins...), map[string]any{
+	natraEntry := map[string]any{
 		"type":         "natra",
 		"capabilities": map[string]any{"bandwidth": true},
-	})
+	}
+	// NATRA_ATTACH_MODE on the install init container surfaces here.
+	// Empty (default) → omit, the binary picks tcx. "clsact-podside" →
+	// emit the field so cmdAdd resolves to the fallback. Reject anything
+	// else loudly so a typo in the DaemonSet env doesn't silently fall
+	// through to default tcx on a kernel that needed the fallback.
+	if mode := os.Getenv("NATRA_ATTACH_MODE"); mode != "" {
+		switch mode {
+		case "tcx", "clsact-podside":
+			natraEntry["attachMode"] = mode
+		default:
+			return fmt.Errorf("NATRA_ATTACH_MODE=%q is not recognized (want \"tcx\" or \"clsact-podside\")", mode)
+		}
+	}
+	chained["plugins"] = append(append([]any{}, plugins...), natraEntry)
 
 	out, err := json.MarshalIndent(chained, "", "  ")
 	if err != nil {

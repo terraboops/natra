@@ -73,9 +73,23 @@ var _ = BeforeSuite(func() {
 	mustExec("kubectl", "apply", "-f", repoFile("manifests", "namespace.yaml"))
 
 	By("installing natra DaemonSet (with overridden image)")
+	// NATRA_E2E_ATTACH_MODE picks the attach path the test rig
+	// exercises. Default is "clsact-podside" because some
+	// Docker-Desktop / colima kernels return EPERM on BPF_OBJ_PIN of
+	// TCX_INGRESS links, which would make the L4 throughput assertion
+	// fail-open and the test useless. CI runners with a stock Ubuntu
+	// kernel can set NATRA_E2E_ATTACH_MODE=tcx to exercise the
+	// production default.
+	attachMode := os.Getenv("NATRA_E2E_ATTACH_MODE")
+	if attachMode == "" {
+		attachMode = "clsact-podside"
+	}
+	if attachMode == "tcx" {
+		attachMode = "" // empty in the manifest = tcx default
+	}
 	mustExec("bash", "-c",
-		fmt.Sprintf("sed 's|ghcr.io/terraboops/natra:latest|%s|; s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' %s | kubectl apply -f -",
-			natraImage, repoFile("..", "..", "deploy", "cni-installer.yaml")),
+		fmt.Sprintf(`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' -e 's|value: ""$|value: "%s"|' %s | kubectl apply -f -`,
+			natraImage, attachMode, repoFile("..", "..", "deploy", "cni-installer.yaml")),
 	)
 
 	By("waiting for natra DaemonSet to roll out")

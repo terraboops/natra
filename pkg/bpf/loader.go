@@ -1,10 +1,20 @@
 //go:build linux
 
-// Package bpf loads the embedded natra BPF object, attaches it to a
-// veth ingress via clsact, and exposes typed accessors for the
-// config / bucket / stats / cms maps. The .bpf.o is embedded at build
-// time so the natra binary is self-contained — install is just "copy
-// the binary to /opt/cni/bin".
+// Package bpf loads the embedded natra BPF object and attaches it to a
+// pod-side veth ingress. Two attach modes:
+//
+//   - AttachTCX (default): cilium/ebpf link.AttachTCX, pin the resulting
+//     link to bpffs so it survives the CNI plugin's process exit. Uses
+//     bpf_mprog under the hood and composes cleanly with other
+//     pod-side BPF (cilium-agent, aws-network-policy-agent).
+//   - AttachClsactPodside (opt-in): clsact qdisc + tc filter on the
+//     pod-side veth from inside the pod netns. No userspace handle to
+//     track; the kernel garbage-collects the filter when the veth is
+//     deleted. Useful on kernels < 6.6 where tcx isn't available, but
+//     can collide with other pod-side clsact users.
+//
+// The .bpf.o is embedded at build time so the natra binary is
+// self-contained — install is just "copy the binary to /opt/cni/bin".
 package bpf
 
 import (
@@ -14,6 +24,7 @@ import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -21,6 +32,20 @@ import (
 
 //go:embed natra.bpf.o
 var natraBPF []byte
+
+// AttachMode selects how AttachIngress wires the BPF program to a veth.
+type AttachMode int
+
+const (
+	// AttachTCX is the default. Requires kernel 6.6+ and a bpffs mount
+	// at /sys/fs/bpf (or wherever pinPath lives). Composes cleanly with
+	// other pod-side BPF.
+	AttachTCX AttachMode = iota
+	// AttachClsactPodside is the opt-in fallback for older kernels.
+	// Works on 5.x+, no bpffs requirement, but collides with anything
+	// else attaching clsact filters in the pod's netns.
+	AttachClsactPodside
+)
 
 // Config mirrors `struct natra_config` in bpf/natra.bpf.c. Field
 // order and types must match the C side exactly.
@@ -49,13 +74,9 @@ const (
 )
 
 // Program holds a loaded natra BPF program plus its maps. One Program
-// per attached veth — the maps are not shared across pods because each
-// pod has its own rate limit, so concurrent CNI ADDs each instantiate
-// their own Program/Collection.
-//
-// Attachment goes via clsact qdisc + tc filter (see AttachIngress for
-// the rationale). The kernel's qdisc tree owns the attachment after
-// FilterReplace returns, so we don't track a userspace link handle.
+// per attached veth — maps are not shared across pods because each pod
+// has its own rate limit, so concurrent CNI ADDs each instantiate their
+// own Program/Collection.
 type Program struct {
 	coll      *ebpf.Collection
 	prog      *ebpf.Program
@@ -63,12 +84,12 @@ type Program struct {
 	bucketMap *ebpf.Map
 	statsMap  *ebpf.Map
 	cmsMap    *ebpf.Map // CMS counters; nil with the placeholder program
+	tcxLink   link.Link // set on AttachTCX, nil on AttachClsactPodside
 }
 
-// Load instantiates the embedded BPF object. The kernel verifies it on
-// NewCollection; verification failures surface here as
-// `*ebpf.VerifierError`, which has a multi-line `.Error()` showing the
-// rejected instruction. Caller closes via Close().
+// Load instantiates the embedded BPF object. Verification failures
+// surface as `*ebpf.VerifierError`, which has a multi-line `.Error()`
+// showing the rejected instruction. Caller closes via Close().
 func Load() (*Program, error) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return nil, fmt.Errorf("remove memlock: %w", err)
@@ -81,7 +102,6 @@ func Load() (*Program, error) {
 
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		// Verifier errors are usually multi-line; preserve them.
 		var verr *ebpf.VerifierError
 		if errors.As(err, &verr) {
 			return nil, fmt.Errorf("BPF verifier rejected program:\n%+v", verr)
@@ -124,8 +144,6 @@ func (p *Program) Configure(cfg Config) error {
 	if err := p.configMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("config map update: %w", err)
 	}
-	// Pre-fill the bucket to burst capacity so the first packet doesn't
-	// have to wait on the refill clock.
 	tb := TokenBucket{Tokens: cfg.BurstBytes}
 	if err := p.bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("bucket map update: %w", err)
@@ -133,11 +151,8 @@ func (p *Program) Configure(cfg Config) error {
 	return nil
 }
 
-// PinMaps pins the program's maps under `dir`/<containerID>-<map> so a
-// debug subcommand can read stats and CMS counters out-of-band. The
-// program itself doesn't need pinned maps to function (clsact filter
-// holds the references), but pinning is the easiest way to expose
-// runtime state to a separate `natra dump` invocation.
+// PinMaps pins the program's maps under `dir`/<containerID>-<map>.map so
+// `natra dump-stats` can read them out-of-band. Best-effort.
 func (p *Program) PinMaps(dir, containerID string) error {
 	if dir == "" || containerID == "" {
 		return nil
@@ -161,27 +176,55 @@ func (p *Program) PinMaps(dir, containerID string) error {
 
 // AttachIngress binds the program to ifIndex's ingress hook (packets
 // arriving INTO the pod — the direction kubernetes.io/ingress-bandwidth
-// describes).
+// describes). Caller should already be inside the pod's netns when the
+// AttachClsactPodside mode is used; for AttachTCX the netns of the
+// caller is what determines which veth the link binds to.
 //
-// Uses clsact + tc-filter rather than tcx-link. tcx requires BPF_OBJ_PIN
-// to persist past the CNI plugin's process exit, and BPF_OBJ_PIN
-// returned EPERM in our test environments even with cap_bpf set on the
-// binary. clsact lives in the kernel's qdisc tree — once `tc filter add`
-// succeeds the kernel holds the program reference, no userspace handle
-// to track, and the filter is garbage-collected when the veth is
-// deleted (which the chained CNI's DEL does at pod teardown).
-func (p *Program) AttachIngress(ifIndex int) error {
-	// `nl` (not `link`) so we don't shadow the cilium/ebpf/link
-	// package imported above — golangci's revive flags the shadow.
+// pinPath is the bpffs path the tcx link gets pinned to so it survives
+// the plugin's process exit. Ignored for AttachClsactPodside.
+func (p *Program) AttachIngress(ifIndex int, mode AttachMode, pinPath string) error {
+	switch mode {
+	case AttachTCX:
+		return p.attachTCX(ifIndex, pinPath)
+	case AttachClsactPodside:
+		return p.attachClsactPodside(ifIndex)
+	default:
+		return fmt.Errorf("unknown AttachMode %d", mode)
+	}
+}
+
+func (p *Program) attachTCX(ifIndex int, pinPath string) error {
+	l, err := link.AttachTCX(link.TCXOptions{
+		Interface: ifIndex,
+		Program:   p.prog,
+		Attach:    ebpf.AttachTCXIngress,
+	})
+	if err != nil {
+		return fmt.Errorf("AttachTCX ingress on ifindex %d: %w", ifIndex, err)
+	}
+	if pinPath != "" {
+		if err := l.Pin(pinPath); err != nil {
+			_ = l.Close()
+			return fmt.Errorf("pin tcx link to %s: %w", pinPath, err)
+		}
+	}
+	p.tcxLink = l
+	return nil
+}
+
+// attachClsactPodside is the opt-in fallback. Adds a clsact qdisc to
+// the link (idempotent), then attaches the BPF program via a tc filter
+// on the ingress hook. Because the caller has already entered the pod's
+// netns, this attaches to the pod-side end of the veth pair — host-side
+// AWS VPC CNI clsact filters live in the host netns and don't see this.
+func (p *Program) attachClsactPodside(ifIndex int) error {
+	// Local name `nl` (not `link`) so we don't shadow the cilium/ebpf/link
+	// import.
 	nl, err := netlink.LinkByIndex(ifIndex)
 	if err != nil {
 		return fmt.Errorf("netlink LinkByIndex(%d): %w", ifIndex, err)
 	}
 
-	// 1. Make sure clsact qdisc exists on the link. Idempotent — if
-	// another tc filter (e.g. kindnet's, or a previous natra ADD on
-	// the same veth before recreate) already added clsact, we get
-	// EEXIST and ignore.
 	clsact := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: nl.Attrs().Index,
@@ -194,11 +237,6 @@ func (p *Program) AttachIngress(ifIndex int) error {
 		return fmt.Errorf("add clsact qdisc to ifindex %d: %w", ifIndex, err)
 	}
 
-	// 2. Attach the BPF program via a tc filter on the ingress hook.
-	// `Parent: HANDLE_MIN_INGRESS` selects the clsact ingress branch.
-	// `Priority: 1, Protocol: ETH_P_ALL` is the conventional default.
-	// `DirectAction: true` lets the BPF program return TC_ACT_* verdicts
-	// directly without a follow-on policer.
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: nl.Attrs().Index,
@@ -214,20 +252,18 @@ func (p *Program) AttachIngress(ifIndex int) error {
 	if err := netlink.FilterReplace(filter); err != nil {
 		return fmt.Errorf("replace tc bpf filter on ifindex %d: %w", ifIndex, err)
 	}
-
 	return nil
 }
 
-// Stats returns the accumulated counter values across all CPUs.
+// Stats holds the aggregate per-CPU counter values.
 type Stats struct {
 	Passed    uint64
 	Throttled uint64
 	HHHits    uint64
 }
 
-// Stats reads the per-CPU stats map and returns the aggregate. Cheap
-// (no syscall per CPU; cilium/ebpf does one BPF_MAP_LOOKUP that returns
-// all per-CPU values).
+// Stats reads the per-CPU stats map and returns the aggregate. One
+// BPF_MAP_LOOKUP per slot returns all per-CPU values.
 func (p *Program) Stats() (Stats, error) {
 	var s Stats
 	if err := p.readStat(StatPassed, &s.Passed); err != nil {
@@ -255,11 +291,15 @@ func (p *Program) readStat(idx uint32, sum *uint64) error {
 	return nil
 }
 
-// Close releases the userspace BPF references. The kernel keeps the
-// program loaded and attached as long as the clsact filter holds a
-// reference, so closing here is safe — packets continue flowing
-// through the rate limiter.
+// Close releases the userspace BPF references. For tcx, the kernel
+// keeps the program loaded and attached as long as the pinned link
+// exists, so packets keep flowing after Close. For clsact-podside the
+// kernel similarly holds the program via the qdisc tree.
 func (p *Program) Close() error {
+	if p.tcxLink != nil {
+		_ = p.tcxLink.Close()
+		p.tcxLink = nil
+	}
 	if p.coll != nil {
 		p.coll.Close()
 		p.coll = nil

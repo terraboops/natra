@@ -19,11 +19,19 @@ import (
 	"github.com/terraboops/natra/pkg/cni/config"
 )
 
-// pinDir holds the bpffs paths for natra's per-pod map pins. A
-// dedicated subdir keeps natra's pins separate from other tooling on
-// the node and makes cleanup straightforward (cmdDel removes the
-// per-container files).
+// pinDir holds the bpffs paths for natra's per-pod tcx-link pins and
+// per-pod map pins. A dedicated subdir keeps natra's pins separate from
+// other tooling on the node and makes cleanup straightforward (cmdDel
+// removes the per-container files).
 const pinDir = "/sys/fs/bpf/natra"
+
+// pinPathFor is the bpffs path for the pinned tcx link of a given
+// container's interface. Two pods with the same name on different
+// nodes get different paths because containerID is unique per kubelet
+// pod sandbox.
+func pinPathFor(containerID, ifName string) string {
+	return filepath.Join(pinDir, containerID+"-"+ifName+".link")
+}
 
 var (
 	pluginVersion = "dev"
@@ -43,8 +51,14 @@ var (
 // passed through under runtimeConfig. Some setups still use it; if
 // both channels are present we prefer Bandwidth because it's what
 // kubelet actually populates today.
+//
+// AttachMode is a top-level natra-specific field on the conflist
+// entry. Empty defaults to "tcx". The other accepted value is
+// "clsact-podside", an opt-in fallback for kernels that don't support
+// tcx — see pkg/bpf/loader.go for tradeoffs.
 type NetConf struct {
 	types.NetConf
+	AttachMode    string `json:"attachMode,omitempty"`
 	RuntimeConfig struct {
 		Bandwidth *struct {
 			IngressRate  int64 `json:"ingressRate,omitempty"`
@@ -54,6 +68,20 @@ type NetConf struct {
 		} `json:"bandwidth,omitempty"`
 		PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
+}
+
+// resolveAttachMode parses NetConf.AttachMode into the bpf package's
+// enum. Empty string and "tcx" both resolve to the default; any other
+// value is rejected.
+func resolveAttachMode(s string) (bpf.AttachMode, error) {
+	switch s {
+	case "", "tcx":
+		return bpf.AttachTCX, nil
+	case "clsact-podside":
+		return bpf.AttachClsactPodside, nil
+	default:
+		return 0, fmt.Errorf("unknown attachMode %q (want \"tcx\" or \"clsact-podside\")", s)
+	}
 }
 
 func main() {
@@ -115,14 +143,19 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
+	mode, err := resolveAttachMode(conf.AttachMode)
+	if err != nil {
+		return fmt.Errorf("attachMode: %w", err)
+	}
+
 	cfg := resolveConfig(conf)
 	if cfg == nil || cfg.Rate <= 0 {
 		logf("no rate limit, passing through")
 		return passthrough(args, conf)
 	}
-	logf("config resolved: rate=%d burst=%d", cfg.Rate, cfg.Burst)
+	logf("config resolved: rate=%d burst=%d attachMode=%v", cfg.Rate, cfg.Burst, mode)
 
-	if err := attachBPF(args, cfg); err != nil {
+	if err := attachBPF(args, cfg, mode); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
@@ -162,14 +195,19 @@ func logCaps() {
 	}
 }
 
-// cmdDel cleans up the bpffs map pins for this container. The clsact
-// filter on the veth is *not* unpinned here — the kernel auto-detaches
-// it when the chained CNI plugin's DEL deletes the underlying veth.
-// What we do clean up is the map pins (config / bucket / stats / cms)
-// that PinMaps wrote, which would otherwise leak per-pod files under
-// /sys/fs/bpf/natra/ for the lifetime of the node.
+// cmdDel cleans up the bpffs pins for this container. Two kinds of pins
+// can exist:
 //
-// CNI DEL is idempotent: missing files are not errors.
+//   - The tcx-link pin (<containerID>-<ifName>.link). Removing it drops
+//     the kernel's last reference to the link, which detaches the BPF
+//     program from the pod-side veth. Only present in AttachTCX mode.
+//   - The per-container map pins (<containerID>-{config,bucket,stats,cms}.map).
+//     Useful for the dump-stats subcommand. Both attach modes write these.
+//
+// Walks the pin dir once and removes everything with the container's
+// prefix. CNI DEL is idempotent — missing files are not errors. We
+// don't bother distinguishing modes because both branches end at the
+// same result: the container's pins are gone.
 func cmdDel(args *skel.CmdArgs) error {
 	prefix := args.ContainerID + "-"
 	entries, err := os.ReadDir(pinDir)
@@ -261,12 +299,12 @@ func resolveConfig(conf *NetConf) *config.Config {
 // stdout said. The restore is deferred immediately after the switch
 // so any error path returns us to origin.
 //
-// We don't close prog on success — closing would drop the userspace
-// reference but the kernel keeps the clsact filter referenced by the
-// qdisc tree, so packets keep flowing through the rate limiter. Cleanup
-// happens at pod teardown when the next chained plugin's DEL deletes
-// the underlying veth.
-func attachBPF(args *skel.CmdArgs, cfg *config.Config) error {
+// We don't close prog on success. For tcx, the link is pinned to
+// bpffs and the kernel holds the program reference via the link until
+// the pin is removed (cmdDel). For clsact-podside, the kernel holds
+// the program reference via the qdisc tree until the underlying veth
+// is deleted (the chained CNI plugin's DEL).
+func attachBPF(args *skel.CmdArgs, cfg *config.Config, mode bpf.AttachMode) error {
 	// netns.Set switches the calling thread, so a goroutine migration
 	// mid-flow would leave us in a different namespace than we think.
 	// Lock the thread for the duration of the netns dance.
@@ -303,7 +341,8 @@ func attachBPF(args *skel.CmdArgs, cfg *config.Config) error {
 		_ = prog.Close()
 		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
-	if err := prog.AttachIngress(iface.Index); err != nil {
+	pinPath := pinPathFor(args.ContainerID, args.IfName)
+	if err := prog.AttachIngress(iface.Index, mode, pinPath); err != nil {
 		_ = prog.Close()
 		return fmt.Errorf("attach BPF to %s ingress: %w", args.IfName, err)
 	}
