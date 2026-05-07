@@ -218,6 +218,10 @@ else
 	@$(MAKE) test-perf
 endif
 
+.PHONY: perf-vs-vanilla
+perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugin (~6 min).
+	@bash scripts/perf-vs-vanilla.sh
+
 .PHONY: perf-baseline
 perf-baseline: ## Refresh perf baselines (run on main, commit in dedicated PR).
 ifeq ($(UNAME_S),Linux)

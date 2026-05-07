@@ -1,0 +1,125 @@
+# Chains the upstream containernetworking/plugins/bandwidth plugin
+# after kindnet. The bandwidth binary ships in /opt/cni/bin/ on kind
+# nodes already, so this is just a conflist patch.
+#
+# Same shape as deploy/cni-installer.yaml but writes a 00-bandwidth-...
+# sibling conflist instead of a 00-natra-... one. Used by
+# scripts/perf-vs-vanilla.sh to stand up the "vanilla" half of the
+# real-cluster head-to-head.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vanilla-bandwidth-installer
+  namespace: kube-system
+  labels:
+    app: vanilla-bandwidth
+    component: cni-installer
+spec:
+  selector:
+    matchLabels:
+      app: vanilla-bandwidth
+      component: cni-installer
+  template:
+    metadata:
+      labels:
+        app: vanilla-bandwidth
+        component: cni-installer
+    spec:
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+        - operator: Exists
+          effect: NoExecute
+      initContainers:
+        - name: install
+          image: alpine:3.20
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              # kind nodes only ship a subset of CNI plugins
+              # (host-local, loopback, portmap, ptp). The bandwidth
+              # plugin needs to be fetched from the upstream release.
+              CNI_VERSION="v1.5.1"
+              ARCH="$(uname -m)"
+              case "$ARCH" in
+                x86_64)  CNI_ARCH=amd64 ;;
+                aarch64) CNI_ARCH=arm64 ;;
+                *)       echo "unsupported arch: $ARCH"; exit 1 ;;
+              esac
+
+              # The upstream bandwidth plugin needs the ifb kernel
+              # module loaded — it uses HTB on an IFB device. The
+              # init container can't modprobe (alpine has no
+              # /lib/modules); the perf-vs-vanilla.sh script handles
+              # this via `docker exec <node> modprobe ifb` before
+              # applying this manifest.
+
+              if [ ! -x /host/opt/cni/bin/bandwidth ]; then
+                apk add --quiet --no-cache curl
+                TARBALL="cni-plugins-linux-${CNI_ARCH}-${CNI_VERSION}.tgz"
+                URL="https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/${TARBALL}"
+                echo "vanilla-bandwidth: fetching $URL"
+                curl -fsSL -o /tmp/$TARBALL "$URL"
+                # The release tarball stores members under "./bandwidth"
+                # etc.; extract the whole thing and pick the binary.
+                mkdir -p /tmp/cni-extract
+                tar -xzf /tmp/$TARBALL -C /tmp/cni-extract/
+                if [ ! -f /tmp/cni-extract/bandwidth ]; then
+                  echo "vanilla-bandwidth: tarball did not contain a bandwidth binary"
+                  ls /tmp/cni-extract/
+                  exit 1
+                fi
+                install -m 0755 /tmp/cni-extract/bandwidth /host/opt/cni/bin/bandwidth
+                echo "vanilla-bandwidth: installed bandwidth plugin"
+              fi
+
+              # Wait for the main CNI conflist to appear, then patch
+              # ONCE. Same race-avoidance reasoning as natra's installer.
+              while ! ls /host/etc/cni/net.d/*.conflist >/dev/null 2>&1; do
+                sleep 1
+              done
+
+              SRC=$(ls /host/etc/cni/net.d/*.conflist | grep -v '^/host/etc/cni/net\.d/00-' | head -1)
+              if [ -z "$SRC" ]; then
+                echo "vanilla-bandwidth: no main conflist found"
+                exit 1
+              fi
+              DST="/host/etc/cni/net.d/00-bandwidth-$(basename $SRC)"
+
+              # Append {"type":"bandwidth","capabilities":{"bandwidth":true}}
+              # to the plugins array of the source conflist.
+              apk add --quiet --no-cache jq
+              jq '.plugins += [{"type":"bandwidth","capabilities":{"bandwidth":true}}]' \
+                "$SRC" > "$DST.tmp"
+              mv "$DST.tmp" "$DST"
+              echo "vanilla-bandwidth: wrote chained conflist at $DST"
+          volumeMounts:
+            - name: cni-bin-dir
+              mountPath: /host/opt/cni/bin
+            - name: cni-net-dir
+              mountPath: /host/etc/cni/net.d
+          securityContext:
+            privileged: true
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1m"
+              memory: "1Mi"
+            limits:
+              cpu: "10m"
+              memory: "8Mi"
+      volumes:
+        - name: cni-bin-dir
+          hostPath:
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
+        - name: cni-net-dir
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
