@@ -124,8 +124,8 @@ func TestBPFProgRunThroughput(t *testing.T) {
 		t.Fatalf("load baseline %s: %v", kernel, err)
 	}
 	if bl == nil {
-		t.Fatalf("no baseline for kernel %q (expected at %s) — record one with `make perf-baseline KERNEL=%s`",
-			kernel, baselinePath(kernel), kernel)
+		t.Fatalf("no baseline for kernel %q at %s — see test/perf/baselines/README.md",
+			kernel, baselinePath(kernel))
 	}
 
 	if nsPerOp > bl.BPFProgRunNsPerOpMax {

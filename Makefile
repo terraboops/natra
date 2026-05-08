@@ -172,68 +172,35 @@ else
 endif
 
 .PHONY: test-bpf
-test-bpf: ## Layer 3 — BPF dataplane tests (Linux: lvh; Mac: colima kernel via Docker).
+test-bpf: ## Layer 3 — BPF dataplane (Linux native; macOS: via Docker).
 ifeq ($(UNAME_S),Linux)
-	@KERNEL=$${KERNEL:-6.6}; bash test/bpf/run-in-vm.sh $$KERNEL
+	sudo -E env "PATH=$$PATH" go test -tags=$(TAGS_BPF) -v ./test/bpf/...
 else
 	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && make build-bpf && go test -tags=bpf -v ./test/bpf/..."
 endif
 
-.PHONY: test-bpf-all
-test-bpf-all: ## Layer 3 — BPF tests across the kernel matrix (Linux only; Mac runs single colima kernel).
-ifeq ($(UNAME_S),Linux)
-	@for k in 5.15 6.6 bpf-next; do \
-		echo "=== kernel $$k ==="; \
-		bash test/bpf/run-in-vm.sh $$k || exit $$?; \
-	done
-else
-	@$(MAKE) test-bpf
-endif
-
 .PHONY: test-e2e
-test-e2e: ## Layer 4 — kind end-to-end tests (Linux native or Mac via Docker Desktop).
+test-e2e: ## Layer 4 — kind end-to-end (works on Mac with Docker; Linux native too).
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then \
-		echo "Layer 4 needs Docker (Docker Desktop on macOS). Start it and retry, or see TODO_LINUX.md. Skipping."; \
+		echo "Layer 4 needs Docker. Start the daemon and retry."; \
 	else \
 		go test -tags=$(TAGS_E2E) ./test/e2e/...; \
 	fi
 
 .PHONY: test-perf
-test-perf: ## Layer 5 — perf vs vanilla (Linux: lvh; Mac: colima kernel via Docker).
+test-perf: ## Layer 5 — perf scenarios (Linux native; macOS: via Docker).
 ifeq ($(UNAME_S),Linux)
-	@KERNEL=$${KERNEL:-6.6}; bash test/perf/run.sh $$KERNEL && \
-		go test -tags=$(TAGS_PERF) ./test/perf/...
+	sudo -E env "PATH=$$PATH" KERNEL=local go test -tags=$(TAGS_PERF) -v ./test/perf/...
 else
 	@bash scripts/run-in-docker.sh "apt-get update -qq >/dev/null && apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && make build-bpf && go test -tags=perf -v ./test/perf/..."
-endif
-
-.PHONY: test-perf-all
-test-perf-all: ## Layer 5 — full kernel matrix (Linux only).
-ifeq ($(UNAME_S),Linux)
-	@for k in 5.15 6.6 bpf-next; do \
-		echo "=== kernel $$k ==="; \
-		KERNEL=$$k $(MAKE) test-perf || exit $$?; \
-	done
-else
-	@$(MAKE) test-perf
 endif
 
 .PHONY: perf-vs-vanilla
 perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugin (~6 min).
 	@bash scripts/perf-vs-vanilla.sh
 
-.PHONY: perf-baseline
-perf-baseline: ## Refresh perf baselines (run on main, commit in dedicated PR).
-ifeq ($(UNAME_S),Linux)
-	@KERNEL=$${KERNEL:-6.6}; \
-		echo "Phase 1: regenerate test/perf/baselines/$$KERNEL.json"; \
-		echo "Then commit in a dedicated PR titled: perf: refresh baselines for kernel $$KERNEL"
-else
-	@echo "perf-baseline must run on Linux. See TODO_LINUX.md."
-endif
-
 .PHONY: test-all
-test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers (auto-skips on Mac for L3/L5).
+test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.
 
 .PHONY: ci
 ci: ## Run every layer end-to-end + lint + license scan. Keeps going past failures; reports per-layer status; exits nonzero if any failed.
@@ -328,7 +295,3 @@ endef
 .PHONY: verify-kernel
 verify-kernel: ## Verify kernel version and tcx support
 	./scripts/verify-kernel.sh
-
-.PHONY: generate-vmlinux
-generate-vmlinux: ## Generate vmlinux.h from kernel BTF
-	./scripts/generate-vmlinux.sh

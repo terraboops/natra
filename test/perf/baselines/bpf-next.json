@@ -1,5 +1,0 @@
-{
-  "kernel": "bpf-next",
-  "_comment": "Generous ceiling — refresh with `make perf-baseline KERNEL=bpf-next` after a real run on this kernel.",
-  "bpf_prog_run_ns_per_op_max": 5000.0
-}

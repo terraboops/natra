@@ -1,18 +1,14 @@
 # Layer 5 perf baselines
 
-One JSON file per kernel target. The L5 perf test compares the current
-run's `bpf_prog_run_ns_per_op` against the recorded ceiling and fails
-on regression. Baselines:
+The L5 perf test compares each run's `bpf_prog_run_ns_per_op` against
+a recorded ceiling and fails on regression. The kernel tag comes from
+the `KERNEL` env var (set to `local` in the GH Actions workflow and
+absent in `make test-perf` defaults; the test falls back to `local`).
 
-- `local.json` — Docker (Mac) / local Linux, `KERNEL` unset
-- `5.15.json`, `6.6.json`, `bpf-next.json` — when the kernel matrix is
-  back (lvh registry currently unusable; see TODO_LINUX.md)
+Currently the only baseline file is `local.json` — generous ceiling
+sized for the GH Actions runner.
 
-To regenerate after an intentional perf-affecting change:
-
-```bash
-make perf-baseline KERNEL=6.6
-# inspect the diff and commit in a dedicated PR
-```
-
-Don't regenerate to silence a regression — investigate first.
+To regenerate after an intentional perf-affecting change, run the
+test, take the reported `ns/op`, write it (with headroom) into
+`local.json`, and commit. Don't refresh to silence a regression —
+investigate first.

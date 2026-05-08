@@ -9,12 +9,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Single-kernel run on the GH Actions runner's kernel. lvh-based
-  # multi-kernel matrix was attempted and removed: the upstream
-  # quay.io/lvh-images/kind:<version> tags bit-rotted (manifest unknown)
-  # and lvh's image-pull retried indefinitely. When/if the lvh registry
-  # stabilises, the matrix can come back as a separate workflow named
-  # bpf-matrix.yml without disturbing this file.
+  # Single-kernel run on the GH Actions runner's kernel. See
+  # TODO_LINUX.md for restoring multi-kernel coverage.
   bpf:
     name: BPF tests on runner kernel
     runs-on: ubuntu-latest

@@ -9,10 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Single-kernel run on the GH Actions runner. lvh-based multi-kernel
-  # matrix was attempted and removed for the same reason as bpf.yml —
-  # the lvh image tags bit-rotted. Re-introduce as perf-matrix.yml when
-  # quay.io/lvh-images stabilises.
+  # Single-kernel run on the GH Actions runner.
   perf:
     name: Perf scenarios on runner kernel
     runs-on: ubuntu-latest
@@ -25,9 +22,7 @@ jobs:
       - name: Show runner kernel
         run: uname -r
       - name: Run Layer 5 tests
-        # KERNEL=local matches the baseline file name we ship in
-        # test/perf/baselines/local.json — different from the lvh path
-        # which would have used kernel-version-named baselines.
+        # KERNEL=local matches test/perf/baselines/local.json.
         env:
           KERNEL: local
         run: |
