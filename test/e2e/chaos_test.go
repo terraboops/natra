@@ -26,61 +26,21 @@ import (
 var chaosBpsCap = int64(float64(bandwidthBps) * 1.50)
 
 var _ = Describe("natra cluster chaos", func() {
-	// natra's BPF programs are attached via tcx (default) or clsact +
-	// tc filter (opt-in fallback). For tcx, the kernel keeps each
-	// program loaded as long as its bpffs link pin exists; for
-	// clsact-podside, the kernel holds the program via the qdisc tree
-	// until the veth is deleted. Either way the attachment outlives
-	// the natra-installer process. Kubelet kills the installer pod,
-	// the kernel keeps the rate-limit alive, and the new installer
-	// pod re-applies the conflist patch without disturbing existing
-	// flows.
+	// natra's BPF programs are attached via clsact + tc filter in each
+	// pod's netns. The attachment lives in the kernel's qdisc tree —
+	// not in the natra-installer process — so the programs survive the
+	// DaemonSet restarting. Kubelet kills the installer pod, the kernel
+	// keeps the rate-limit alive, and the new installer pod re-applies
+	// the conflist patch without disturbing existing flows.
 	//
 	// This test pins that property so a regression (e.g., switching to
 	// a host-process-pinned attachment) can't silently break it.
-	// Mirror of the ingress restart spec, targeting an egress-only pod.
-	// Pins that the egress program's tcx link / clsact filter survives
-	// a DaemonSet restart the same way the ingress one does. Both
-	// directions should share the same kernel-side persistence story;
-	// this asserts no asymmetry crept in (e.g., one direction's link
-	// being stored in the installer process and dying with it).
-	It("DaemonSet restart preserves egress rate-limiting on existing pods", func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-		defer cancel()
-
-		opts := iperfOpts{Target: "iperf-server-egress", Reverse: true}
-
-		By("baseline: egress is throttled before any chaos")
-		baseline := runIperf(ctx, opts)
-		GinkgoWriter.Printf("baseline egress throughput: %.2f Mbps\n", float64(baseline)/1e6)
-		Expect(baseline).To(BeNumerically("<=", chaosBpsCap),
-			"egress baseline must already be throttled before chaos starts")
-
-		By("rollout restart natra-installer DaemonSet")
-		mustExec("kubectl", "rollout", "restart", "daemonset/natra-installer", "-n", "kube-system")
-
-		By("running iperf during the restart window")
-		duringRestart := runIperf(ctx, opts)
-		GinkgoWriter.Printf("during-restart egress throughput: %.2f Mbps\n", float64(duringRestart)/1e6)
-		Expect(duringRestart).To(BeNumerically("<=", chaosBpsCap),
-			"egress throttling must persist while installer DS is being recreated")
-
-		By("waiting for the new natra-installer DaemonSet to roll out")
-		mustExec("kubectl", "rollout", "status", "daemonset/natra-installer", "-n", "kube-system", "--timeout=120s")
-
-		By("post-restart iperf is still throttled")
-		afterRestart := runIperf(ctx, opts)
-		GinkgoWriter.Printf("post-restart egress throughput: %.2f Mbps\n", float64(afterRestart)/1e6)
-		Expect(afterRestart).To(BeNumerically("<=", chaosBpsCap),
-			"egress throttling must hold after the new installer pod is Ready")
-	})
-
 	It("DaemonSet restart preserves rate-limiting on existing pods", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 		defer cancel()
 
 		By("baseline: iperf is throttled before any chaos")
-		baseline := runIperf(ctx, iperfOpts{})
+		baseline := runIperf(ctx)
 		GinkgoWriter.Printf("baseline throughput: %.2f Mbps\n", float64(baseline)/1e6)
 		Expect(baseline).To(BeNumerically("<=", chaosBpsCap),
 			"baseline must already be throttled before chaos starts")
@@ -89,7 +49,7 @@ var _ = Describe("natra cluster chaos", func() {
 		mustExec("kubectl", "rollout", "restart", "daemonset/natra-installer", "-n", "kube-system")
 
 		By("running iperf during the restart window")
-		duringRestart := runIperf(ctx, iperfOpts{})
+		duringRestart := runIperf(ctx)
 		GinkgoWriter.Printf("during-restart throughput: %.2f Mbps\n", float64(duringRestart)/1e6)
 		Expect(duringRestart).To(BeNumerically("<=", chaosBpsCap),
 			"throttling must persist while installer DS is being recreated")
@@ -98,18 +58,16 @@ var _ = Describe("natra cluster chaos", func() {
 		mustExec("kubectl", "rollout", "status", "daemonset/natra-installer", "-n", "kube-system", "--timeout=120s")
 
 		By("post-restart iperf is still throttled")
-		afterRestart := runIperf(ctx, iperfOpts{})
+		afterRestart := runIperf(ctx)
 		GinkgoWriter.Printf("post-restart throughput: %.2f Mbps\n", float64(afterRestart)/1e6)
 		Expect(afterRestart).To(BeNumerically("<=", chaosBpsCap),
 			"throttling must hold after the new installer pod is Ready")
 	})
 
 	// Pod churn stresses two natra paths simultaneously:
-	//   - CNI ADD on each new pod (loads BPF, configures, attaches via tcx
-	//     in default mode or clsact in fallback mode)
-	//   - CNI DEL on each pod teardown (cmdDel removes per-direction link
-	//     pins from bpffs; for clsact-podside the kernel auto-detaches
-	//     the program when the veth disappears)
+	//   - CNI ADD on each new pod (loads BPF, configures, attaches via clsact)
+	//   - veth deletion on each pod teardown (kernel auto-detaches the BPF
+	//     program; cmdDel is a no-op for the clsact path)
 	//
 	// The check isn't byte-exact — at this volume some pods may still
 	// be in ContainerCreating when the test ends and that's fine — but
@@ -157,7 +115,7 @@ var _ = Describe("natra cluster chaos", func() {
 		}()
 
 		By("running iperf concurrently with the churn")
-		iperfBps := runIperf(ctx, iperfOpts{})
+		iperfBps := runIperf(ctx)
 		GinkgoWriter.Printf("during-churn throughput: %.2f Mbps\n", float64(iperfBps)/1e6)
 		Expect(iperfBps).To(BeNumerically("<=", chaosBpsCap),
 			"existing iperf flow must keep its rate-limit while churn happens around it")

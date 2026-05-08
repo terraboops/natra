@@ -25,12 +25,11 @@ on-demand via `make perf-vs-vanilla`, not part of `make ci`.
 
 Files under `test/cni/`:
 - `cni_linux_test.go` — happy-path ADD/DEL/CHECK + the two attach
-  modes (tcx, clsact-podside) + per-direction specs (ingress only,
-  egress only, both, neither).
-- `chaos_linux_test.go` — malformed stdin, annotation injection on
-  both ingress and egress channels, bad CNI env vars.
+  modes (tcx, clsact-podside).
+- `chaos_linux_test.go` — malformed stdin, annotation injection, bad
+  CNI env vars.
 - `helpers_linux_test.go` — netns lifecycle, exec, env-var
-  construction, direction-aware `linkPinExists`, `remainingPinsFor`.
+  construction, `linkPinExists` and `remainingPinsFor`.
 - `cni_stub_test.go` — non-Linux skip stub.
 
 Run:
@@ -58,17 +57,13 @@ surface here. CNI errors come back as JSON on stdout, not stderr.
 
 Files under `test/bpf/`:
 - `prog_linux_test.go` — placeholder load + sanity.
-- `ratelimit_linux_test.go` — token-bucket and CMS classification,
-  table-driven across `natra_ingress` and `natra_egress`. Includes
-  `TestCrossDirectionIsolation` — configures one direction tight and
-  the other wide-open, asserts no bleed.
-- `chaos_linux_test.go` — verifier rejection of intentionally
-  invalid programs, malformed packets, concurrent map updates, CMS
+- `ratelimit_linux_test.go` — token-bucket and CMS classification.
+- `chaos_linux_test.go` — verifier rejection of intentionally invalid
+  programs, malformed packets, concurrent map updates, CMS
   saturation.
 - `edge_cases_linux_test.go` — packet > burst, ICMP without L4 ports,
   IPv4 options, zero burst, rapid config change, jumbo packets,
-  counter overflow. Direction-agnostic; runs against
-  `natra_ingress` only (the egress program shares the same code).
+  counter overflow.
 - `prog_stub_test.go` — non-Linux skip.
 - `testdata/invalid_oob_packet_access.bpf.c` — verifier-rejection
   fixture.
@@ -99,33 +94,14 @@ Constraints to be aware of when extending L3 tests:
 
 Files under `test/e2e/`:
 - `kind-config.yaml` — 2-node kind cluster, kindnet as main CNI.
-- `manifests/iperf-server.yaml` — server with
-  `kubernetes.io/ingress-bandwidth: "10M"` (Topology A).
-- `manifests/iperf-server-egress.yaml` — egress only (Topology B).
-- `manifests/iperf-server-bidi.yaml` — both annotations at 10M
-  (Topologies C and G).
-- `manifests/iperf-server-mixed-{a,b,c}.yaml` — three pods on the
-  worker; only mixed-a is annotated (Topology D, also reused by E).
-- `manifests/iperf-server-noplugin.yaml` — unannotated, used by the
-  no-plugin regression test (Topology F).
-- `manifests/iperf-client.yaml` — client on the control-plane.
-- `e2e_test.go` — Topologies A through G, plus a connectivity smoke
-  in Topology A.
-- `chaos_test.go` — DaemonSet restart preserves rate-limiting on
-  ingress and egress pods, pod churn, three pending characterization
-  specs (PIt).
-
-Topologies asserted:
-
-| Topology | What it pins                                                                 |
-|----------|------------------------------------------------------------------------------|
-| A        | ingress annotation throttles forward iperf3                                  |
-| B        | egress annotation throttles reverse iperf3 (`-R`)                            |
-| C        | both annotations throttle forward then reverse, sequential                   |
-| D        | mixed: only annotated pods throttled; unannotated pods on the same node free |
-| E        | no-annotation case: natra in path, no throttling                             |
-| F        | no-plugin regression: with-natra delta vs. no-natra baseline < 10%           |
-| G        | proxy-like: both directions throttle independently under concurrent traffic  |
+- `manifests/{namespace,iperf-server,iperf-client}.yaml` — server
+  on the worker with the `kubernetes.io/ingress-bandwidth: "10M"`
+  annotation, client on the control-plane with the standard
+  control-plane toleration so traffic crosses the inter-node fabric.
+- `e2e_test.go` — connectivity smoke + bandwidth-enforcement
+  assertion (within +20% of the annotated rate).
+- `chaos_test.go` — DaemonSet restart mid-traffic, pod churn, plus
+  three pending characterization specs (PIt).
 
 Run:
 ```bash
@@ -148,20 +124,18 @@ cluster up after the test.
 Files under `test/perf/`:
 - `perf_linux_test.go` —
   - `TestBPFProgRunThroughput` — placeholder ns/op vs baseline.
-  - `TestScenarioOneElephant{,Egress}` — single elephant per
-    direction, expect throttling.
-  - `TestScenarioThousandMice` — 1000 short flows on ingress, expect
-    zero `hh_hits`.
-  - `TestScenarioMixed` — elephant + mice on ingress, mice survive.
-  - `TestScenarioMixedVsVanilla{,Egress}` — head-to-head vs
-    `bpf/vanilla.bpf.o`, both directions.
+  - `TestScenarioOneElephant` — single elephant, expect throttling.
+  - `TestScenarioThousandMice` — 1000 short flows, expect zero
+    `hh_hits`.
+  - `TestScenarioMixed` — elephant + mice, mice survive.
+  - `TestScenarioMixedVsVanilla` — head-to-head vs `bpf/vanilla.bpf.o`.
 - `perf_stub_test.go` — non-Linux skip.
 - `baselines/local.json` — ns/op ceiling for the synthetic
   BPF_PROG_RUN tests; the test fails on regression past the recorded
   value.
 - `realworld/vanilla-installer.yaml` — DaemonSet that fetches the
   upstream `bandwidth` plugin and chains it after kindnet, used by
-  `make perf-vs-vanilla` for both ingress and egress phases.
+  `make perf-vs-vanilla`.
 
 Run:
 ```bash
@@ -181,11 +155,6 @@ natra's default is `tcx` (kernel 6.6+). The opt-in fallback
 `attachMode` field at the plugin level, or via `NATRA_ATTACH_MODE`
 on the install init container, or via `NATRA_E2E_ATTACH_MODE` /
 `NATRA_PERF_ATTACH_MODE` on the test rig.
-
-Each annotated direction adds one tcx link per pod (or one clsact
-filter on the matching `HANDLE_MIN_*` parent). A bidi-annotated pod
-in tcx mode therefore has two link pins under
-`/sys/fs/bpf/natra/<containerID>-<ifName>-{ingress,egress}-link`.
 
 Bpffs forbids `.` in pin path components — `kernel/bpf/inode.c::bpf_lookup`
 returns EPERM on any name containing a dot when the parent has any
