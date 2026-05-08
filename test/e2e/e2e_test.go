@@ -29,6 +29,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,15 +52,41 @@ const (
 	namespace    = "natra-e2e"
 	natraImage   = "ghcr.io/terraboops/natra:e2e"
 	bandwidthBps = 10_000_000 // 10 Mbps annotation under test
-	// throttledCap is the headline assertion's upper bound on a
-	// throttled iperf measurement. +20% absorbs kindnet/iperf3 jitter.
-	throttledCap = int64(float64(bandwidthBps) * 1.20)
+	// throttledCapRatio is the +20% slack against the configured rate;
+	// throttledCap is the literal byte/sec ceiling.
+	throttledCapRatio       = 1.20
+	throttledCap      int64 = int64(float64(bandwidthBps) * throttledCapRatio)
 	// unthrottledFloor is the lower bound for a pod that is NOT
 	// supposed to be throttled. Conservative — kind cross-node TCP
 	// over kindnet on a CI runner sustains > 1 Gbps without natra,
 	// and natra-the-no-op should not change that meaningfully.
 	unthrottledFloor int64 = 100_000_000 // 100 Mbps
+	// burstSeconds is how many seconds of free traffic a freshly-full
+	// bucket grants. Set by natra's clamp at burst = 2 × rate, which
+	// in time terms is 2 seconds at the configured rate.
+	burstSeconds = 2.0
+	// throttleDurationFloor / Ceiling clamp the calibrated duration so
+	// pathological calibrations can't make tests trivially short or
+	// runaway-slow.
+	throttleDurationFloor   = 10
+	throttleDurationCeiling = 30
 )
+
+// throttleDuration is the iperf3 -t value the per-direction throttle
+// assertions use. Set by calibrateThrottleDuration in BeforeSuite based
+// on measured kindnet jitter; falls back to 15 if calibration fails.
+//
+// The bucket-saturation math: starting from a full bucket, an iperf3
+// run of d seconds averages rate × (1 + burstSeconds/d). To keep that
+// below throttledCap × rate even under jitter j (relative stddev), we
+// need:
+//
+//	(1 + burstSeconds/d) × (1 + 2j) < throttledCapRatio
+//	d > burstSeconds / (throttledCapRatio / (1 + 2j) - 1)
+//
+// At j=2% this gives d≈13s; at j=5% it gives d≈22s. The runner kernel
+// influences j heavily, so we measure rather than guess.
+var throttleDuration = 15
 
 func repoFile(parts ...string) string {
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -136,6 +163,9 @@ var _ = BeforeSuite(func() {
 		dump("conflist on worker node", "docker", "exec", clusterName+"-worker", "sh", "-c", "ls /etc/cni/net.d && cat /etc/cni/net.d/*.conflist 2>/dev/null")
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
+
+	By("calibrating throttle duration against measured jitter")
+	calibrateThrottleDuration()
 })
 
 var _ = AfterSuite(func() {
@@ -218,6 +248,91 @@ func waitForServiceEndpoints(svcName string) {
 	GinkgoWriter.Printf("WARN: %s endpoints did not populate within 30s\n", svcName)
 }
 
+// calibrateThrottleDuration measures kindnet/iperf3 jitter on this
+// runner and picks the shortest iperf3 duration that keeps the
+// bucket-saturation effect comfortably below throttledCapRatio under
+// the observed jitter. Sets the package-level throttleDuration; on
+// any error keeps the safe fallback.
+//
+// Procedure:
+//  1. Drain iperf-server's bucket with a long iperf3 so subsequent
+//     short measurements aren't bucket-saturation-inflated.
+//  2. Run 3 short measurements back-to-back (each starts at near-empty
+//     bucket → measured rate ≈ configured rate, variance ≈ jitter).
+//  3. Compute relative stddev j = σ/μ.
+//  4. Solve: throttleDuration > burstSeconds / (cap/(1+2j) - 1).
+//
+// Calibration on iperf-server (annotated 10M ingress) leaves its
+// bucket drained — that's fine, it's what makes Topology A's
+// enforcement assertion robust.
+func calibrateThrottleDuration() {
+	defer func() {
+		GinkgoWriter.Printf("throttleDuration = %ds\n", throttleDuration)
+	}()
+
+	const drainSeconds = 10
+	const calibSamples = 3
+	const calibSeconds = 5
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if _, err := runIperfWithError(drainCtx, iperfOpts{Target: "iperf-server", Duration: drainSeconds}); err != nil {
+		GinkgoWriter.Printf("calibration drain failed (%v); keeping fallback duration\n", err)
+		drainCancel()
+		return
+	}
+	drainCancel()
+
+	samples := make([]float64, 0, calibSamples)
+	for i := 0; i < calibSamples; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		bps, err := runIperfWithError(ctx, iperfOpts{Target: "iperf-server", Duration: calibSeconds})
+		cancel()
+		if err != nil || bps == 0 {
+			GinkgoWriter.Printf("calibration sample %d/%d failed (err=%v bps=%d); keeping fallback duration\n",
+				i+1, calibSamples, err, bps)
+			return
+		}
+		samples = append(samples, float64(bps))
+	}
+
+	var sum float64
+	for _, s := range samples {
+		sum += s
+	}
+	mean := sum / float64(len(samples))
+	if mean <= 0 {
+		GinkgoWriter.Printf("calibration mean=0; keeping fallback duration\n")
+		return
+	}
+	var sumSq float64
+	for _, s := range samples {
+		d := s - mean
+		sumSq += d * d
+	}
+	stddev := math.Sqrt(sumSq / float64(len(samples)))
+	jitter := stddev / mean
+
+	safe := 1.0 + 2.0*jitter
+	if throttledCapRatio <= safe+0.005 {
+		// Jitter so high that no reasonable duration helps; clamp.
+		throttleDuration = throttleDurationCeiling
+		GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% — high jitter, clamping to %ds\n",
+			mean/1e6, stddev/1e6, jitter*100, throttleDuration)
+		return
+	}
+	optimal := math.Ceil(burstSeconds / (throttledCapRatio/safe - 1.0))
+	d := int(optimal)
+	if d < throttleDurationFloor {
+		d = throttleDurationFloor
+	}
+	if d > throttleDurationCeiling {
+		d = throttleDurationCeiling
+	}
+	throttleDuration = d
+	GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% → throttleDuration=%ds (raw %.1fs, clamped to [%d, %d])\n",
+		mean/1e6, stddev/1e6, jitter*100, throttleDuration, optimal, throttleDurationFloor, throttleDurationCeiling)
+}
+
 // runIperfWithDiagnostics is runIperf plus a 0-bps retry loop and a
 // debug dump on persistent failure. Used by Topology F where a 0
 // measurement is not just a failed assertion — it means we have no
@@ -293,15 +408,17 @@ var _ = Describe("Topology A — ingress only", func() {
 
 // Topology B — egress only. iperf3 reverse: server is the data sender.
 //
-// 10-second iperf duration to dilute the burst-saturation effect: a
-// 5-second test starting from a full bucket measures
-// rate × (1 + 2×burst_seconds/duration) = rate × 1.4, which exceeds
-// the +20% cap. 10 seconds → rate × 1.2, fits.
+// Uses the dynamically-calibrated throttleDuration (see
+// calibrateThrottleDuration). The bucket-saturation rate over a
+// duration d starting from a full bucket is rate × (1 + burstSeconds/d);
+// at d=10 against jitter on a slow runner that crosses the +20% cap.
+// Calibration measures the per-runner jitter and picks the shortest
+// duration with comfortable margin.
 var _ = Describe("Topology B — egress only", func() {
 	It("enforces egress-bandwidth on the server's outbound traffic", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-egress", Reverse: true, Duration: 10})
+		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-egress", Reverse: true, Duration: throttleDuration})
 		logThrottled("egress", bps)
 		Expect(bps).To(BeNumerically("<=", throttledCap),
 			"reverse iperf3 should be throttled to ≈10 Mbps")
@@ -309,13 +426,13 @@ var _ = Describe("Topology B — egress only", func() {
 })
 
 // Topology C — sequential bidi. Both annotations on one pod, two
-// iperf3 runs back-to-back. 10s duration for the same burst-dilution
-// reason as Topology B.
+// iperf3 runs back-to-back. Uses calibrated throttleDuration for the
+// same burst-dilution reason as Topology B.
 var _ = Describe("Topology C — bidi sequential", func() {
 	It("throttles forward to the ingress cap", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-bidi", Duration: 10})
+		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-bidi", Duration: throttleDuration})
 		logThrottled("bidi/forward", bps)
 		Expect(bps).To(BeNumerically("<=", throttledCap),
 			"forward iperf3 on a both-annotated pod should be throttled")
@@ -324,7 +441,7 @@ var _ = Describe("Topology C — bidi sequential", func() {
 	It("throttles reverse to the egress cap", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-bidi", Reverse: true, Duration: 10})
+		bps := runIperf(ctx, iperfOpts{Target: "iperf-server-bidi", Reverse: true, Duration: throttleDuration})
 		logThrottled("bidi/reverse", bps)
 		Expect(bps).To(BeNumerically("<=", throttledCap),
 			"reverse iperf3 on a both-annotated pod should be throttled")
@@ -335,15 +452,15 @@ var _ = Describe("Topology C — bidi sequential", func() {
 // is annotated. mixed-b and mixed-c must keep baseline throughput so
 // natra doesn't penalize unannotated pods sharing a node.
 //
-// mixed-a uses 10s for the same burst-dilution reason as B and C.
-// mixed-b and mixed-c stay at the default 5s — they're unthrottled,
-// so the floor assertion is robust to short measurement windows.
+// mixed-a uses the calibrated throttleDuration. mixed-b and mixed-c
+// stay at the default 5s — they're unthrottled, so the floor
+// assertion is robust to short measurement windows.
 var _ = Describe("Topology D — mixed (only some pods annotated)", func() {
 	It("throttles only the annotated pod; other pods stay near baseline", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
 
-		bpsA := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-a", Duration: 10})
+		bpsA := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-a", Duration: throttleDuration})
 		bpsB := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-b"})
 		bpsC := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-c"})
 
@@ -402,13 +519,13 @@ var _ = Describe("Topology G — proxy-like simultaneous bidirectional", func() 
 		go func() {
 			defer wg.Done()
 			fwdBps, fwdErr = runIperfWithError(ctx, iperfOpts{
-				Target: "iperf-server-bidi", Duration: 10,
+				Target: "iperf-server-bidi", Duration: throttleDuration,
 			})
 		}()
 		go func() {
 			defer wg.Done()
 			revBps, revErr = runIperfWithError(ctx, iperfOpts{
-				Target: "iperf-server-bidi", Reverse: true, Duration: 10,
+				Target: "iperf-server-bidi", Reverse: true, Duration: throttleDuration,
 			})
 		}()
 		wg.Wait()
@@ -465,7 +582,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		// and CoreDNS take a beat longer to propagate.
 		waitForServiceEndpoints(podName)
 
-		baselineNoPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: 10})
+		baselineNoPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: throttleDuration})
 		GinkgoWriter.Printf("no-plugin baseline: %.2f Mbps\n", float64(baselineNoPlugin)/1e6)
 		Expect(baselineNoPlugin).To(BeNumerically(">", 0),
 			"baseline should produce a real number")
@@ -482,7 +599,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		reapplyPod(podName, manifest)
 		waitForServiceEndpoints(podName)
 
-		baselineWithPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: 10})
+		baselineWithPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: throttleDuration})
 		GinkgoWriter.Printf("with-natra baseline: %.2f Mbps\n", float64(baselineWithPlugin)/1e6)
 		Expect(baselineWithPlugin).To(BeNumerically(">", 0),
 			"with-plugin throughput should produce a real number")
