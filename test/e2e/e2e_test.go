@@ -509,11 +509,11 @@ var _ = Describe("Topology G — proxy-like simultaneous bidirectional", func() 
 		defer cancel()
 
 		var (
-			wg       sync.WaitGroup
-			fwdBps   int64
-			revBps   int64
-			fwdErr   error
-			revErr   error
+			wg     sync.WaitGroup
+			fwdBps int64
+			revBps int64
+			fwdErr error
+			revErr error
 		)
 		wg.Add(2)
 		go func() {

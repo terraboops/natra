@@ -9,6 +9,27 @@
   `brew install llvm` and the Makefile picks up `/opt/homebrew/opt/llvm/bin/clang`.
 - `kubectl` and `kind` for L4
 
+## Git hooks
+
+Once per clone:
+
+```bash
+make hooks-install
+```
+
+That points `core.hooksPath` at `./.githooks/`, which contains:
+
+- **pre-commit** → `make pre-commit` (fmt-check, vet, lint, build).
+  ~20s. Catches what would otherwise burn a CI cycle.
+- **pre-push** → `make pre-push` (pre-commit + L1 unit tests + 10s
+  fuzz). ~1-2 min.
+
+CI's lint job invokes `make pre-commit` too — same target, same
+binary, same config. Local and CI can't drift.
+
+Bypass with `--no-verify` if you really need to. To disable the
+hooks entirely: `make hooks-uninstall`.
+
 ## Build
 
 ```bash

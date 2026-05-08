@@ -27,13 +27,12 @@ jobs:
       # Same BPF prep as the per-layer workflows — golangci-lint
       # type-checks pkg/bpf which requires the embed file to exist.
       - uses: ./.github/actions/build-bpf
-      # golangci-lint must be built against the same Go version (or
-      # newer) as the repo it lints. natra targets go 1.25; v2.3.0
-      # was built with go 1.24 and rejects the config. v2.5.0+ is
-      # built with go 1.25.
-      - uses: golangci/golangci-lint-action@v7
-        with:
-          version: v2.5.0
+      # `make pre-commit` is the target the .githooks/pre-commit hook
+      # invokes locally. Running the same target here means anything
+      # caught locally is caught here, and vice versa — no drift. The
+      # Makefile pins golangci-lint v2.5.0 (matches go.mod's 1.25
+      # requirement) and installs it into ./bin via go-install.
+      - run: make pre-commit
 
   build:
     name: Build

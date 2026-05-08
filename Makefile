@@ -51,6 +51,15 @@ help: ## Display this help.
 fmt: ## Run go fmt against code.
 	go fmt ./...
 
+.PHONY: fmt-check
+fmt-check: ## Verify code is gofmt'd; non-zero exit if not. Read-only.
+	@out=$$(gofmt -l .); \
+	if [ -n "$$out" ]; then \
+		echo "gofmt issues — run 'make fmt':"; \
+		echo "$$out"; \
+		exit 1; \
+	fi
+
 .PHONY: vet
 vet: ## Run go vet against code.
 	go vet ./...
@@ -73,6 +82,29 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 
 .PHONY: check
 check: fmt vet lint ## Run all code quality checks
+
+# pre-commit and pre-push are the targets the git hooks invoke. CI's
+# `lint` job runs `make pre-commit` too, so what catches issues
+# locally is exactly what catches them in CI — no drift possible.
+.PHONY: pre-commit
+pre-commit: fmt-check vet lint ## Fast checks the pre-commit hook runs (~20s). Run by CI's lint job.
+	@go build ./...
+
+.PHONY: pre-push
+pre-push: pre-commit test-unit ## Pre-commit + L1 unit tests + a short fuzz (~1-2 min). Run by the pre-push hook.
+	@go test -fuzz=FuzzParseBandwidthAnnotation -fuzztime=10s -test.timeout=60s -run=^$$ ./pkg/cni/config/...
+
+.PHONY: hooks-install
+hooks-install: ## Point git at .githooks/ so commit/push run the same checks CI does.
+	@git config core.hooksPath ./.githooks
+	@echo "Hooks installed: core.hooksPath = $$(git config core.hooksPath)"
+	@echo "  pre-commit  → make pre-commit  (fmt-check, vet, lint, build)"
+	@echo "  pre-push    → make pre-push    (pre-commit + L1 unit + 10s fuzz)"
+
+.PHONY: hooks-uninstall
+hooks-uninstall: ## Restore git's default hooks path.
+	@git config --unset core.hooksPath || true
+	@echo "Hooks uninstalled: core.hooksPath now $$(git config core.hooksPath || echo '(default)')"
 
 ##@ Build
 

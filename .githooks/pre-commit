@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fast checks that should never be skipped before a commit.
+#
+# Runs `make pre-commit` — the same target CI's lint job invokes.
+# Drift between local and CI is impossible by construction.
+#
+# Bypass with `git commit --no-verify` if you really need to skip
+# (CI will still catch it).
+
+set -euo pipefail
+exec make -s pre-commit

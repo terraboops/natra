@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Slightly heavier checks that run before `git push`. Catches what
+# pre-commit didn't (unit-test regressions, fuzz crashes) before the
+# push burns a CI cycle.
+#
+# Runs `make pre-push` — same target you can invoke locally to
+# preview what CI will see.
+#
+# Bypass with `git push --no-verify` if you really need to skip.
+
+set -euo pipefail
+exec make -s pre-push
