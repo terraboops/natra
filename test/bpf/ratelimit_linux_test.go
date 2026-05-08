@@ -4,6 +4,11 @@
 // and bucket maps, run BPF_PROG_RUN with synthetic packets, assert the
 // verdicts and stats. Catches BPF-level regressions independent of the
 // Go loader and CNI integration.
+//
+// Headline scenarios run as sub-tests across both directions
+// (natra_ingress and natra_egress) to assert per-direction
+// independence. A separate cross-direction isolation test verifies
+// that configuring one direction's rate doesn't bleed into the other.
 
 package bpf_test
 
@@ -30,10 +35,41 @@ const (
 	statHHHits    = bpf.StatHHHits
 )
 
+// directionCases lists the per-direction setup the headline tests
+// iterate over. Each case binds together a program FD, the matching
+// userspace map key for config/bucket, and the matching stats key
+// helper — keeps individual tests free of direction arithmetic.
+type directionCase struct {
+	name    string
+	dir     bpf.Direction
+	prog    *ebpf.Program
+	mapKey  uint32
+	statKey func(slot uint32) uint32
+}
+
+func directionCases(progIngress, progEgress *ebpf.Program) []directionCase {
+	return []directionCase{
+		{
+			name:    "ingress",
+			dir:     bpf.DirectionIngress,
+			prog:    progIngress,
+			mapKey:  uint32(bpf.DirectionIngress),
+			statKey: func(slot uint32) uint32 { return bpf.StatKey(bpf.DirectionIngress, slot) },
+		},
+		{
+			name:    "egress",
+			dir:     bpf.DirectionEgress,
+			prog:    progEgress,
+			mapKey:  uint32(bpf.DirectionEgress),
+			statKey: func(slot uint32) uint32 { return bpf.StatKey(bpf.DirectionEgress, slot) },
+		},
+	}
+}
+
 // loadNatraColl loads and instantiates bpf/natra.bpf.o. Returns the
-// collection (caller closes), the config map, the bucket map, and the
-// stats map for assertions.
-func loadNatraColl(t *testing.T) (*ebpf.Collection, *ebpf.Map, *ebpf.Map, *ebpf.Map, *ebpf.Program) {
+// collection (caller closes), the config map, the bucket map, the
+// stats map, and both per-direction programs.
+func loadNatraColl(t *testing.T) (*ebpf.Collection, *ebpf.Map, *ebpf.Map, *ebpf.Map, *ebpf.Program, *ebpf.Program) {
 	t.Helper()
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -60,11 +96,15 @@ func loadNatraColl(t *testing.T) (*ebpf.Collection, *ebpf.Map, *ebpf.Map, *ebpf.
 	if !ok {
 		t.Fatalf("stats map missing")
 	}
-	prog, ok := coll.Programs["natra_ingress"]
+	progIngress, ok := coll.Programs["natra_ingress"]
 	if !ok {
-		t.Fatalf("program missing")
+		t.Fatalf("program natra_ingress missing")
 	}
-	return coll, cfgMap, bucketMap, statsMap, prog
+	progEgress, ok := coll.Programs["natra_egress"]
+	if !ok {
+		t.Fatalf("program natra_egress missing")
+	}
+	return coll, cfgMap, bucketMap, statsMap, progIngress, progEgress
 }
 
 func mapNames(m map[string]*ebpf.Map) []string {
@@ -106,56 +146,62 @@ func synthEthIPpkt() []byte {
 }
 
 func TestNatraNoConfigPasses(t *testing.T) {
-	_, _, _, statsMap, prog := loadNatraColl(t)
-	pkt := synthEthIPpkt()
-
-	ret, _, err := prog.Test(pkt)
-	if err != nil {
-		t.Fatalf("BPF_PROG_RUN: %v", err)
-	}
-	// rate_bps == 0 → fail-open path, packet passes.
-	if ret != 0 { // TC_ACT_OK
-		t.Errorf("ret = %d, want 0 (TC_ACT_OK)", ret)
-	}
-	if got := readPerCPUStat(t, statsMap, statPassed); got != 1 {
-		t.Errorf("STAT_PASSED = %d, want 1", got)
+	_, _, _, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			pkt := synthEthIPpkt()
+			ret, _, err := dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("BPF_PROG_RUN: %v", err)
+			}
+			// rate_bps == 0 → fail-open path, packet passes.
+			if ret != 0 { // TC_ACT_OK
+				t.Errorf("ret = %d, want 0 (TC_ACT_OK)", ret)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statPassed)); got == 0 {
+				t.Errorf("STAT_PASSED for %s = 0, want >= 1", dc.name)
+			}
+		})
 	}
 }
 
 func TestNatraTokenBucketUnderRate(t *testing.T) {
-	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			// 100 Mbps rate, large burst so a single 64-byte packet always fits.
+			cfg := natraConfig{
+				RateBps:     100_000_000 / 8, // 12.5 MB/s
+				BurstBytes:  1 << 20,         // 1 MB
+				HHThreshold: 0,               // not exercised here
+			}
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config update: %v", err)
+			}
+			tb := tokenBucket{Tokens: cfg.BurstBytes}
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket update: %v", err)
+			}
 
-	// 100 Mbps rate, large burst so a single 64-byte packet always fits.
-	cfg := natraConfig{
-		RateBps:     100_000_000 / 8, // 12.5 MB/s
-		BurstBytes:  1 << 20,         // 1 MB
-		HHThreshold: 0,               // not exercised here
-	}
-	zero := uint32(0)
-	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
-		t.Fatalf("config update: %v", err)
-	}
-	// Pre-fill bucket to burst so the first packet has tokens.
-	tb := tokenBucket{Tokens: cfg.BurstBytes}
-	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
-		t.Fatalf("bucket update: %v", err)
-	}
-
-	pkt := synthEthIPpkt()
-	for i := 0; i < 100; i++ {
-		ret, _, err := prog.Test(pkt)
-		if err != nil {
-			t.Fatalf("BPF_PROG_RUN i=%d: %v", i, err)
-		}
-		if ret != 0 {
-			t.Fatalf("packet %d throttled (ret=%d), expected to pass under burst capacity", i, ret)
-		}
-	}
-	if got := readPerCPUStat(t, statsMap, statPassed); got != 100 {
-		t.Errorf("STAT_PASSED = %d, want 100", got)
-	}
-	if got := readPerCPUStat(t, statsMap, statThrottled); got != 0 {
-		t.Errorf("STAT_THROTTLED = %d, want 0", got)
+			before := readPerCPUStat(t, statsMap, dc.statKey(statPassed))
+			pkt := synthEthIPpkt()
+			for i := 0; i < 100; i++ {
+				ret, _, err := dc.prog.Test(pkt)
+				if err != nil {
+					t.Fatalf("BPF_PROG_RUN i=%d: %v", i, err)
+				}
+				if ret != 0 {
+					t.Fatalf("packet %d throttled (ret=%d), expected to pass under burst capacity", i, ret)
+				}
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statPassed)) - before; got != 100 {
+				t.Errorf("STAT_PASSED delta = %d, want 100", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statThrottled)); got != 0 {
+				t.Errorf("STAT_THROTTLED = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -175,155 +221,241 @@ func synthEthIPpktFromFlow(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte 
 }
 
 func TestNatraCMSMiceFlowsBypassTokenBucket(t *testing.T) {
-	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
-
-	// Threshold = 100 means the first 100 packets of any single flow
-	// pass for free; only the 101st onward go through the token bucket.
-	cfg := natraConfig{
-		RateBps:     1, // crippled rate — if any mouse traffic hits the
-		BurstBytes:  1, // bucket, it would be throttled. None should.
-		HHThreshold: 100,
-	}
-	zero := uint32(0)
-	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
-		t.Fatalf("config: %v", err)
-	}
-	tb := tokenBucket{}
-	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
-		t.Fatalf("bucket: %v", err)
-	}
-
-	const flows = 50
-	const perFlow = 5 // far below the 100-packet threshold
-	for i := 0; i < flows; i++ {
-		pkt := synthEthIPpktFromFlow(0x0A000001+uint32(i), 0x0A000002, 12345, 5201)
-		for j := 0; j < perFlow; j++ {
-			ret, _, err := prog.Test(pkt)
-			if err != nil {
-				t.Fatalf("BPF_PROG_RUN flow=%d j=%d: %v", i, j, err)
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			// Threshold = 100 means the first 100 packets of any single flow
+			// pass for free; only the 101st onward go through the token bucket.
+			cfg := natraConfig{
+				RateBps:     1, // crippled rate — if any mouse traffic hits the
+				BurstBytes:  1, // bucket, it would be throttled. None should.
+				HHThreshold: 100,
 			}
-			if ret != 0 {
-				t.Fatalf("flow=%d j=%d throttled (ret=%d) — mouse flows must pass", i, j, ret)
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config: %v", err)
 			}
-		}
-	}
-	if got := readPerCPUStat(t, statsMap, statHHHits); got != 0 {
-		t.Errorf("STAT_HH_HITS = %d, want 0 — mice should never reach the bucket", got)
-	}
-	if got := readPerCPUStat(t, statsMap, statThrottled); got != 0 {
-		t.Errorf("STAT_THROTTLED = %d, want 0", got)
-	}
-	if got := readPerCPUStat(t, statsMap, statPassed); got != flows*perFlow {
-		t.Errorf("STAT_PASSED = %d, want %d", got, flows*perFlow)
+			tb := tokenBucket{}
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket: %v", err)
+			}
+
+			beforeHH := readPerCPUStat(t, statsMap, dc.statKey(statHHHits))
+			beforeThrottled := readPerCPUStat(t, statsMap, dc.statKey(statThrottled))
+			beforePassed := readPerCPUStat(t, statsMap, dc.statKey(statPassed))
+
+			const flows = 50
+			const perFlow = 5 // far below the 100-packet threshold
+			for i := 0; i < flows; i++ {
+				pkt := synthEthIPpktFromFlow(0x0A000001+uint32(i), 0x0A000002, 12345, 5201)
+				for j := 0; j < perFlow; j++ {
+					ret, _, err := dc.prog.Test(pkt)
+					if err != nil {
+						t.Fatalf("BPF_PROG_RUN flow=%d j=%d: %v", i, j, err)
+					}
+					if ret != 0 {
+						t.Fatalf("flow=%d j=%d throttled (ret=%d) — mouse flows must pass", i, j, ret)
+					}
+				}
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statHHHits)) - beforeHH; got != 0 {
+				t.Errorf("STAT_HH_HITS delta = %d, want 0 — mice should never reach the bucket", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statThrottled)) - beforeThrottled; got != 0 {
+				t.Errorf("STAT_THROTTLED delta = %d, want 0", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statPassed)) - beforePassed; got != flows*perFlow {
+				t.Errorf("STAT_PASSED delta = %d, want %d", got, flows*perFlow)
+			}
+		})
 	}
 }
 
 func TestNatraCMSElephantHitsBucket(t *testing.T) {
-	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			cfg := natraConfig{
+				RateBps:     1,
+				BurstBytes:  64, // exactly one packet's worth
+				HHThreshold: 10, // 11th packet onward is "heavy"
+			}
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config: %v", err)
+			}
+			tb := tokenBucket{Tokens: 64}
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket: %v", err)
+			}
 
-	cfg := natraConfig{
-		RateBps:     1,
-		BurstBytes:  64, // exactly one packet's worth
-		HHThreshold: 10, // 11th packet onward is "heavy"
-	}
-	zero := uint32(0)
-	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
-		t.Fatalf("config: %v", err)
-	}
-	tb := tokenBucket{Tokens: 64}
-	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
-		t.Fatalf("bucket: %v", err)
-	}
+			beforeHH := readPerCPUStat(t, statsMap, dc.statKey(statHHHits))
+			beforeThrottled := readPerCPUStat(t, statsMap, dc.statKey(statThrottled))
 
-	pkt := synthEthIPpktFromFlow(0x0A000001, 0x0A000002, 12345, 5201)
-	// First 10 packets: count goes 1..10, none > threshold(10) → mice.
-	for i := 0; i < 10; i++ {
-		ret, _, err := prog.Test(pkt)
-		if err != nil {
-			t.Fatalf("packet %d: %v", i, err)
-		}
-		if ret != 0 {
-			t.Fatalf("packet %d throttled at count<=threshold (ret=%d)", i, ret)
-		}
-	}
-	if got := readPerCPUStat(t, statsMap, statHHHits); got != 0 {
-		t.Errorf("after first 10 packets STAT_HH_HITS=%d, want 0", got)
-	}
+			pkt := synthEthIPpktFromFlow(0x0A000001, 0x0A000002, 12345, 5201)
+			// First 10 packets: count goes 1..10, none > threshold(10) → mice.
+			for i := 0; i < 10; i++ {
+				ret, _, err := dc.prog.Test(pkt)
+				if err != nil {
+					t.Fatalf("packet %d: %v", i, err)
+				}
+				if ret != 0 {
+					t.Fatalf("packet %d throttled at count<=threshold (ret=%d)", i, ret)
+				}
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statHHHits)) - beforeHH; got != 0 {
+				t.Errorf("after first 10 packets STAT_HH_HITS delta=%d, want 0", got)
+			}
 
-	// 11th packet (count=11 > 10): heavy. Burst=64 admits this packet,
-	// so it's logged as a heavy-hitter PASS.
-	ret, _, err := prog.Test(pkt)
-	if err != nil {
-		t.Fatalf("packet 11: %v", err)
-	}
-	if ret != 0 {
-		t.Errorf("11th packet ret=%d, want 0 (TC_ACT_OK; bucket has 64 tokens)", ret)
-	}
+			// 11th packet (count=11 > 10): heavy. Burst=64 admits this packet,
+			// so it's logged as a heavy-hitter PASS.
+			ret, _, err := dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("packet 11: %v", err)
+			}
+			if ret != 0 {
+				t.Errorf("11th packet ret=%d, want 0 (TC_ACT_OK; bucket has 64 tokens)", ret)
+			}
 
-	// 12th packet (count=12, still heavy): bucket empty (one packet
-	// drained it), rate is 1 byte/sec so micro-second elapsed adds
-	// nothing. Should throttle.
-	ret, _, err = prog.Test(pkt)
-	if err != nil {
-		t.Fatalf("packet 12: %v", err)
-	}
-	if ret != 2 {
-		t.Errorf("12th packet ret=%d, want 2 (TC_ACT_SHOT; bucket empty)", ret)
-	}
+			// 12th packet (count=12, still heavy): bucket empty (one packet
+			// drained it), rate is 1 byte/sec so micro-second elapsed adds
+			// nothing. Should throttle.
+			ret, _, err = dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("packet 12: %v", err)
+			}
+			if ret != 2 {
+				t.Errorf("12th packet ret=%d, want 2 (TC_ACT_SHOT; bucket empty)", ret)
+			}
 
-	if got := readPerCPUStat(t, statsMap, statHHHits); got != 2 {
-		t.Errorf("STAT_HH_HITS=%d, want 2 (packets 11 and 12)", got)
-	}
-	if got := readPerCPUStat(t, statsMap, statThrottled); got != 1 {
-		t.Errorf("STAT_THROTTLED=%d, want 1", got)
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statHHHits)) - beforeHH; got != 2 {
+				t.Errorf("STAT_HH_HITS delta=%d, want 2 (packets 11 and 12)", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statThrottled)) - beforeThrottled; got != 1 {
+				t.Errorf("STAT_THROTTLED delta=%d, want 1", got)
+			}
+		})
 	}
 }
 
 func TestNatraTokenBucketThrottlesOnceBurstSpent(t *testing.T) {
-	_, cfgMap, bucketMap, statsMap, prog := loadNatraColl(t)
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			// Tiny rate so back-to-back BPF_PROG_RUN calls don't refill
+			// meaningfully between iterations. Burst sized to admit exactly
+			// one packet, so the second call must be throttled.
+			cfg := natraConfig{
+				RateBps:    1,  // effectively zero refill in the test window
+				BurstBytes: 64, // exactly one synthetic packet
+			}
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config update: %v", err)
+			}
+			tb := tokenBucket{Tokens: 64}
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket update: %v", err)
+			}
 
-	// Tiny rate so back-to-back BPF_PROG_RUN calls don't refill
-	// meaningfully between iterations. Burst sized to admit exactly
-	// one packet, so the second call must be throttled.
-	cfg := natraConfig{
-		RateBps:    1,  // effectively zero refill in the test window
-		BurstBytes: 64, // exactly one synthetic packet
+			beforePassed := readPerCPUStat(t, statsMap, dc.statKey(statPassed))
+			beforeThrottled := readPerCPUStat(t, statsMap, dc.statKey(statThrottled))
+
+			pkt := synthEthIPpkt()
+
+			// First packet drains the bucket and updates last_update_ns to
+			// "now", anchoring the refill clock.
+			ret, _, err := dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("BPF_PROG_RUN #1: %v", err)
+			}
+			if ret != 0 {
+				t.Fatalf("first packet ret=%d, want 0 (TC_ACT_OK) — bucket should admit one full packet", ret)
+			}
+
+			// Second packet: bucket is empty, rate is 1 byte/sec, microseconds
+			// since the first call → no refill → must throttle.
+			ret, _, err = dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("BPF_PROG_RUN #2: %v", err)
+			}
+			if ret != 2 { // TC_ACT_SHOT
+				t.Errorf("second packet ret=%d, want 2 (TC_ACT_SHOT) — bucket should be empty", ret)
+			}
+
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statPassed)) - beforePassed; got != 1 {
+				t.Errorf("STAT_PASSED delta = %d, want 1", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statThrottled)) - beforeThrottled; got != 1 {
+				t.Errorf("STAT_THROTTLED delta = %d, want 1", got)
+			}
+		})
 	}
-	zero := uint32(0)
-	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
-		t.Fatalf("config update: %v", err)
+}
+
+// TestCrossDirectionIsolation pins the per-direction state contract:
+// configuring ingress to throttle and egress to pass-through means
+// packets through the ingress program drop while the same packets
+// through the egress program flow. Catches any accidental shared
+// state (one map slot, swapped keys, missing direction parameter)
+// that would let the two directions affect each other.
+func TestCrossDirectionIsolation(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+
+	// Ingress: tight bucket, low threshold. Will throttle quickly.
+	ingressKey := uint32(bpf.DirectionIngress)
+	if err := cfgMap.Update(&ingressKey,
+		&natraConfig{RateBps: 1, BurstBytes: 64, HHThreshold: 1},
+		ebpf.UpdateAny); err != nil {
+		t.Fatalf("ingress cfg: %v", err)
 	}
-	tb := tokenBucket{Tokens: 64}
-	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
-		t.Fatalf("bucket update: %v", err)
+	if err := bucketMap.Update(&ingressKey,
+		&tokenBucket{Tokens: 64},
+		ebpf.UpdateAny); err != nil {
+		t.Fatalf("ingress bucket: %v", err)
 	}
 
-	pkt := synthEthIPpkt()
-
-	// First packet drains the bucket and updates last_update_ns to
-	// "now", anchoring the refill clock.
-	ret, _, err := prog.Test(pkt)
-	if err != nil {
-		t.Fatalf("BPF_PROG_RUN #1: %v", err)
+	// Egress: high rate, infinite burst. Should never throttle.
+	egressKey := uint32(bpf.DirectionEgress)
+	if err := cfgMap.Update(&egressKey,
+		&natraConfig{RateBps: 1_000_000_000, BurstBytes: 1 << 30, HHThreshold: 1 << 30},
+		ebpf.UpdateAny); err != nil {
+		t.Fatalf("egress cfg: %v", err)
 	}
-	if ret != 0 {
-		t.Fatalf("first packet ret=%d, want 0 (TC_ACT_OK) — bucket should admit one full packet", ret)
-	}
-
-	// Second packet: bucket is empty, rate is 1 byte/sec, microseconds
-	// since the first call → no refill → must throttle.
-	ret, _, err = prog.Test(pkt)
-	if err != nil {
-		t.Fatalf("BPF_PROG_RUN #2: %v", err)
-	}
-	if ret != 2 { // TC_ACT_SHOT
-		t.Errorf("second packet ret=%d, want 2 (TC_ACT_SHOT) — bucket should be empty", ret)
+	if err := bucketMap.Update(&egressKey,
+		&tokenBucket{Tokens: 1 << 30},
+		ebpf.UpdateAny); err != nil {
+		t.Fatalf("egress bucket: %v", err)
 	}
 
-	if got := readPerCPUStat(t, statsMap, statPassed); got != 1 {
-		t.Errorf("STAT_PASSED = %d, want 1", got)
+	pkt := synthEthIPpktFromFlow(0x0A000001, 0x0A000002, 12345, 5201)
+
+	// Drive 20 packets through both programs. Ingress should drop
+	// after the bucket drains; egress should pass everything.
+	for i := 0; i < 20; i++ {
+		if _, _, err := progIngress.Test(pkt); err != nil {
+			t.Fatalf("ingress BPF_PROG_RUN i=%d: %v", i, err)
+		}
+		ret, _, err := progEgress.Test(pkt)
+		if err != nil {
+			t.Fatalf("egress BPF_PROG_RUN i=%d: %v", i, err)
+		}
+		if ret != 0 {
+			t.Errorf("egress packet %d ret=%d, want 0 — egress should pass under wide-open config", i, ret)
+		}
 	}
-	if got := readPerCPUStat(t, statsMap, statThrottled); got != 1 {
-		t.Errorf("STAT_THROTTLED = %d, want 1", got)
+
+	ingressThrottled := readPerCPUStat(t, statsMap, bpf.StatKey(bpf.DirectionIngress, statThrottled))
+	egressThrottled := readPerCPUStat(t, statsMap, bpf.StatKey(bpf.DirectionEgress, statThrottled))
+	egressPassed := readPerCPUStat(t, statsMap, bpf.StatKey(bpf.DirectionEgress, statPassed))
+
+	if ingressThrottled == 0 {
+		t.Errorf("ingress throttled = 0, expected > 0 — tight ingress config didn't drop anything")
+	}
+	if egressThrottled != 0 {
+		t.Errorf("egress throttled = %d, want 0 — egress config was wide open and shouldn't drop", egressThrottled)
+	}
+	if egressPassed < 20 {
+		t.Errorf("egress passed = %d, want >= 20 — every egress packet should pass", egressPassed)
 	}
 }

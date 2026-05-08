@@ -58,7 +58,7 @@ var _ = Describe("natra CNI chaos", func() {
 	})
 
 	Context("annotation injection attempts", func() {
-		DescribeTable("dangerous annotation values are rejected without panic",
+		DescribeTable("dangerous ingress annotation values are rejected without panic",
 			func(value string) {
 				ns, cleanup, err := newTestNetns()
 				Expect(err).NotTo(HaveOccurred())
@@ -78,6 +78,33 @@ var _ = Describe("natra CNI chaos", func() {
 			Entry("shell metacharacters", "10M;rm -rf /"),
 			Entry("command substitution", "$(echo pwned)"),
 			Entry("backticks", "`echo pwned`"),
+		)
+
+		// Same surface, but on the egress channel. The parser is
+		// direction-agnostic; doubling these proves the egress branch
+		// in resolveDirectionConfig also feeds into the same parser
+		// without an alternate path that could swallow a panic.
+		DescribeTable("dangerous egress annotation values are rejected without panic",
+			func(value string) {
+				ns, cleanup, err := newTestNetns()
+				Expect(err).NotTo(HaveOccurred())
+				defer cleanup()
+
+				encoded, err := json.Marshal(value)
+				Expect(err).NotTo(HaveOccurred())
+
+				stdin := []byte(`{"cniVersion":"1.0.0","name":"natra-test","type":"natra","runtimeConfig":{"podAnnotations":{"kubernetes.io/egress-bandwidth":` + string(encoded) + `}}}`)
+
+				_, stderr, runErr := runPlugin(natra, "ADD", "chaos-egress-injection", netnsPath(ns), "eth0", stdin)
+				_ = runErr
+				Expect(string(stderr)).NotTo(ContainSubstring("panic:"))
+			},
+			Entry("embedded newline", "10M\nrm -rf /"),
+			Entry("embedded NUL", "10M\x00"),
+			Entry("shell metacharacters", "10M;rm -rf /"),
+			Entry("command substitution", "$(echo pwned)"),
+			Entry("negative number", "-10M"),
+			Entry("decimal", "10.5M"),
 		)
 	})
 

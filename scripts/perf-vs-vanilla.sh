@@ -3,12 +3,21 @@
 #
 # Spins up two kind clusters in sequence (one with natra chained behind
 # kindnet, one with the upstream bandwidth plugin chained behind
-# kindnet), runs the same iperf elephant+mice workload in each, prints
-# a comparison.
+# kindnet), runs the same iperf elephant+mice workload in each
+# direction, prints a comparison.
+#
+# Each cluster is exercised twice:
+#   - ingress phase: server has kubernetes.io/ingress-bandwidth=10M;
+#     iperf3 forward (client → server) measures the throttle on the
+#     server's inbound traffic.
+#   - egress phase: server has kubernetes.io/egress-bandwidth=10M;
+#     iperf3 reverse (server → client via -R) measures the throttle on
+#     the server's outbound traffic.
 #
 # Output: docs/perf-vs-vanilla-result.txt with the raw numbers.
 #
-# Run time: ~5-7 minutes. Docker Desktop required on macOS.
+# Run time: ~10-12 minutes. Docker required on macOS (colima or Docker
+# Desktop).
 
 set -euo pipefail
 
@@ -41,12 +50,19 @@ require jq
 
 # Render iperf manifests with the cluster-specific node names. kind
 # names nodes <cluster>-{control-plane,worker}; the source manifests
-# hardcode natra-e2e-* names, so we sed them at runtime.
+# hardcode natra-e2e-* names, so we sed them at runtime. The bidi
+# manifest carries both ingress and egress annotations so the same
+# server pod can be exercised in either direction without a redeploy.
 render_manifests() {
     local cluster_name="$1" outdir="$2"
+    # Rename the pod/service from iperf-server-bidi → iperf-server so
+    # the run_workload commands below can use the canonical name and
+    # match the L4 e2e shape. The bidi YAML carries both annotations,
+    # which is what we want for this two-phase per-direction workload.
     sed -e "s|natra-e2e-worker|${cluster_name}-worker|" \
         -e "s|natra-e2e-control-plane|${cluster_name}-control-plane|" \
-        "${REPO_ROOT}/test/e2e/manifests/iperf-server.yaml" \
+        -e "s|iperf-server-bidi|iperf-server|g" \
+        "${REPO_ROOT}/test/e2e/manifests/iperf-server-bidi.yaml" \
         > "$outdir/iperf-server.yaml"
     sed -e "s|natra-e2e-worker|${cluster_name}-worker|" \
         -e "s|natra-e2e-control-plane|${cluster_name}-control-plane|" \
@@ -55,21 +71,32 @@ render_manifests() {
     cp "${REPO_ROOT}/test/e2e/manifests/namespace.yaml" "$outdir/namespace.yaml"
 }
 
-# run_workload prints two integers on stdout: elephant_bps mice_aggregate_bps
+# run_workload prints four integers on stdout:
+#   ingress_elephant_bps ingress_mice_bps egress_elephant_bps egress_mice_bps
+# Forward iperf3 measures throughput INTO the server (ingress); reverse
+# (-R) measures throughput OUT of the server (egress).
 run_workload() {
     local namespace="natra-e2e"
 
-    local elephant_bps
-    elephant_bps=$(kubectl exec -n "$namespace" iperf-client -- \
+    local ing_elephant ing_mice eg_elephant eg_mice
+
+    ing_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
         iperf3 -c iperf-server -t "$ELEPHANT_DURATION" -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
-    local mice_bps
-    mice_bps=$(kubectl exec -n "$namespace" iperf-client -- \
+    ing_mice=$(kubectl exec -n "$namespace" iperf-client -- \
         iperf3 -c iperf-server -t "$MICE_DURATION" -P "$MICE_PARALLEL" -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
-    echo "$elephant_bps $mice_bps"
+    eg_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
+        iperf3 -c iperf-server -t "$ELEPHANT_DURATION" -R -J 2>/dev/null \
+        | jq '.end.sum_received.bits_per_second // 0')
+
+    eg_mice=$(kubectl exec -n "$namespace" iperf-client -- \
+        iperf3 -c iperf-server -t "$MICE_DURATION" -P "$MICE_PARALLEL" -R -J 2>/dev/null \
+        | jq '.end.sum_received.bits_per_second // 0')
+
+    echo "$ing_elephant $ing_mice $eg_elephant $eg_mice"
 }
 
 TMPDIR=$(mktemp -d)
@@ -108,8 +135,9 @@ kubectl wait --for=condition=Ready pod/iperf-server pod/iperf-client \
     -n natra-e2e --timeout=120s
 
 echo "==> running workload (phase A)"
-read -r natra_elephant natra_mice < <(run_workload)
-echo "  natra elephant=$natra_elephant bps  mice=$natra_mice bps"
+read -r natra_ing_elephant natra_ing_mice natra_eg_elephant natra_eg_mice < <(run_workload)
+echo "  natra ingress elephant=$natra_ing_elephant bps  mice=$natra_ing_mice bps"
+echo "  natra egress  elephant=$natra_eg_elephant bps  mice=$natra_eg_mice bps"
 
 kind delete cluster --name "$NATRA_CLUSTER"
 
@@ -144,8 +172,9 @@ kubectl wait --for=condition=Ready pod/iperf-server pod/iperf-client \
     -n natra-e2e --timeout=120s
 
 echo "==> running workload (phase B)"
-read -r vanilla_elephant vanilla_mice < <(run_workload)
-echo "  vanilla elephant=$vanilla_elephant bps  mice=$vanilla_mice bps"
+read -r vanilla_ing_elephant vanilla_ing_mice vanilla_eg_elephant vanilla_eg_mice < <(run_workload)
+echo "  vanilla ingress elephant=$vanilla_ing_elephant bps  mice=$vanilla_ing_mice bps"
+echo "  vanilla egress  elephant=$vanilla_eg_elephant bps  mice=$vanilla_eg_mice bps"
 
 kind delete cluster --name "$VANILLA_CLUSTER"
 
@@ -160,20 +189,29 @@ fmt_bps() {
 cat <<EOF | tee "$RESULT_FILE"
 natra vs upstream containernetworking/plugins/bandwidth — kind cluster head-to-head
 ====================================================================================
-Workload: iperf3 over kindnet, ${RATE} ingress-bandwidth annotation
+Workload: iperf3 over kindnet, ${RATE} bandwidth annotation in each direction
+  - ingress: forward iperf3 (client → server, charged to server's ingress)
+  - egress:  reverse iperf3 -R (server → client, charged to server's egress)
   - Phase 1: ${ELEPHANT_DURATION}s single elephant flow
   - Phase 2: ${MICE_DURATION}s × ${MICE_PARALLEL} parallel mice flows
 Iperf goodput, receiver-side aggregate (sum_received.bits_per_second)
 
-                          Elephant            Mice (${MICE_PARALLEL}× parallel)
-natra                     $(fmt_bps "$natra_elephant")        $(fmt_bps "$natra_mice")
-upstream bandwidth        $(fmt_bps "$vanilla_elephant")        $(fmt_bps "$vanilla_mice")
+Direction  Plugin                          Elephant            Mice (${MICE_PARALLEL}× parallel)
+-------------------------------------------------------------------------------------------
+ingress    natra                           $(fmt_bps "$natra_ing_elephant")        $(fmt_bps "$natra_ing_mice")
+ingress    upstream bandwidth              $(fmt_bps "$vanilla_ing_elephant")        $(fmt_bps "$vanilla_ing_mice")
+egress     natra                           $(fmt_bps "$natra_eg_elephant")        $(fmt_bps "$natra_eg_mice")
+egress     upstream bandwidth              $(fmt_bps "$vanilla_eg_elephant")        $(fmt_bps "$vanilla_eg_mice")
 
 Raw numbers (bps):
-  natra_elephant=$natra_elephant
-  natra_mice=$natra_mice
-  vanilla_elephant=$vanilla_elephant
-  vanilla_mice=$vanilla_mice
+  natra_ingress_elephant=$natra_ing_elephant
+  natra_ingress_mice=$natra_ing_mice
+  natra_egress_elephant=$natra_eg_elephant
+  natra_egress_mice=$natra_eg_mice
+  vanilla_ingress_elephant=$vanilla_ing_elephant
+  vanilla_ingress_mice=$vanilla_ing_mice
+  vanilla_egress_elephant=$vanilla_eg_elephant
+  vanilla_egress_mice=$vanilla_eg_mice
 
 Generated by scripts/perf-vs-vanilla.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF

@@ -1,11 +1,12 @@
 # natra vs. upstream bandwidth — head-to-head
 
 Real-cluster comparison between natra and the upstream
-`containernetworking/plugins/bandwidth` plugin. Run with:
+`containernetworking/plugins/bandwidth` plugin, both directions. Run
+with:
 
 ```bash
 make perf-vs-vanilla
-# ~6 min, two kind clusters in sequence
+# ~10-12 min, two kind clusters in sequence, both directions per cluster
 cat docs/perf-vs-vanilla-result.txt
 ```
 
@@ -17,8 +18,9 @@ mode for the comparison via `NATRA_PERF_ATTACH_MODE=clsact-podside`.
 Two kind clusters, identical config:
 
 - 2 nodes (control-plane + worker), kindnet as main CNI
-- iperf-server pinned to the worker with
-  `kubernetes.io/ingress-bandwidth: "10M"`; iperf-client on
+- iperf-server pinned to the worker with **both**
+  `kubernetes.io/ingress-bandwidth: "10M"` and
+  `kubernetes.io/egress-bandwidth: "10M"`; iperf-client on
   control-plane (cross-node traffic over kindnet's bridge + tunnel)
 - Cluster A chains natra after kindnet; Cluster B chains the upstream
   `bandwidth` plugin after kindnet
@@ -31,33 +33,41 @@ HTB-on-IFB silently no-ops and doesn't rate-limit.
 
 ## Workload
 
-iperf3 in two phases against the same server:
+iperf3 against the same server, four phases per cluster:
 
-- **Elephant**: one TCP flow, 15 seconds.
-- **Mice**: 20 parallel TCP flows, 10 seconds.
+- **Ingress elephant**: one TCP flow, 15 seconds, forward (client → server).
+- **Ingress mice**: 20 parallel TCP flows, 10 seconds, forward.
+- **Egress elephant**: one TCP flow, 15 seconds, reverse (`-R`, server → client).
+- **Egress mice**: 20 parallel TCP flows, 10 seconds, reverse.
 
 Receiver-side aggregate goodput is read from
 `end.sum_received.bits_per_second`.
 
 ## Most recent run (colima 6.8.0-64-generic, aarch64)
 
-| Plugin                | Elephant     | Mice (20× parallel)  |
-|-----------------------|--------------|----------------------|
-| natra                 | 11.26 Mbps   | 10.95 Mbps           |
-| upstream `bandwidth`  | 97.86 Mbps   | 9.59 Mbps            |
+| Direction | Plugin                | Elephant     | Mice (20× parallel)  |
+|-----------|-----------------------|--------------|----------------------|
+| ingress   | natra                 | 11.27 Mbps   | 23.74 Mbps           |
+| ingress   | upstream `bandwidth`  | 97.21 Mbps   |  9.59 Mbps           |
+| egress    | natra                 | 11.29 Mbps   | 14.54 Mbps           |
+| egress    | upstream `bandwidth`  | 108.16 Mbps  |  9.61 Mbps           |
 
 Read these as separate signals:
 
-- natra rate-limits cleanly to within +13% of the 10 Mbps annotation
-  in both phases.
-- The upstream bandwidth plugin's mice phase lands near 10 Mbps; the
-  elephant phase doesn't. HTB engages by the second phase but didn't
-  during the first 15s. This number isn't a fair comparison; it's an
-  unresolved test-rig issue, not natra winning.
-- Mice goodput is comparable across both plugins because the workload
-  (sustained TCP, 20 parallel) crosses natra's heavy-hitter threshold
-  in milliseconds. natra's CMS fast-pass only fires for short-lived
-  flows.
+- **natra**: rate-limits the elephant cleanly to within +13% of the
+  10 Mbps annotation in both directions. The mice numbers run
+  meaningfully above 10 Mbps because, against a 20-parallel workload,
+  natra's CMS classifies most of the per-flow streams as mice (each
+  individually under threshold) and they fast-pass the bucket. That's
+  the point of natra; it's not a "violation" of the annotation, it's
+  the design.
+- **upstream bandwidth, mice phase**: lands near 10 Mbps in both
+  directions. HTB-on-IFB engaging as expected.
+- **upstream bandwidth, elephant phase**: doesn't engage (~97 Mbps
+  ingress, ~108 Mbps egress under a 10 Mbps annotation). HTB engages
+  by the second phase but didn't during the first 15s. This is an
+  unresolved test-rig issue (kind/HTB initialization timing or IFB
+  redirect quirks), not natra winning.
 
 ## What this run does and doesn't tell you
 

@@ -5,11 +5,11 @@
 // Results are diffed against baselines/<kernel>.json on every run.
 //
 // Scenarios:
-//   - TestBPFProgRunThroughput     — micro: ns/op for the placeholder
-//   - TestScenarioOneElephant      — single elephant, expect throttling
-//   - TestScenarioThousandMice     — 1000 short flows, expect zero hh hits
-//   - TestScenarioMixed            — elephant + mice, mice survive
-//   - TestScenarioMixedVsVanilla   — head-to-head with bpf/vanilla.bpf.o
+//   - TestBPFProgRunThroughput            — micro: ns/op for the placeholder
+//   - TestScenarioOneElephant{,Egress}    — single elephant, expect throttling
+//   - TestScenarioThousandMice            — 1000 short flows, expect zero hh hits
+//   - TestScenarioMixed                   — elephant + mice, mice survive
+//   - TestScenarioMixedVsVanilla{,Egress} — head-to-head with bpf/vanilla.bpf.o
 
 package perf_test
 
@@ -134,7 +134,31 @@ func TestBPFProgRunThroughput(t *testing.T) {
 	}
 }
 
+// progNameFor returns the SEC name for a natra program in `dir`.
+func natraProgFor(dir bpf.Direction) string {
+	if dir == bpf.DirectionEgress {
+		return "natra_egress"
+	}
+	return "natra_ingress"
+}
+
+// vanillaProgFor returns the SEC name for a vanilla program in `dir`.
+func vanillaProgFor(dir bpf.Direction) string {
+	if dir == bpf.DirectionEgress {
+		return "vanilla_egress"
+	}
+	return "vanilla_ingress"
+}
+
 func TestScenarioOneElephant(t *testing.T) {
+	scenarioOneElephant(t, bpf.DirectionIngress)
+}
+
+func TestScenarioOneElephantEgress(t *testing.T) {
+	scenarioOneElephant(t, bpf.DirectionEgress)
+}
+
+func scenarioOneElephant(t *testing.T, dir bpf.Direction) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
 	}
@@ -152,7 +176,7 @@ func TestScenarioOneElephant(t *testing.T) {
 	cfgMap := coll.Maps["natra_config_map"]
 	bucketMap := coll.Maps["natra_bucket_map"]
 	statsMap := coll.Maps["natra_stats_map"]
-	prog := coll.Programs["natra_ingress"]
+	prog := coll.Programs[natraProgFor(dir)]
 	if cfgMap == nil || bucketMap == nil || statsMap == nil || prog == nil {
 		t.Fatalf("expected maps and program, got: %v / %v",
 			collMapNames(coll), collProgNames(coll))
@@ -167,12 +191,12 @@ func TestScenarioOneElephant(t *testing.T) {
 		BurstBytes:  1_250_000,
 		HHThreshold: 10,
 	}
-	zero := uint32(0)
-	if err := cfgMap.Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+	key := uint32(dir)
+	if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
 	}
 	tb := tokenBucket{Tokens: cfg.BurstBytes}
-	if err := bucketMap.Update(&zero, &tb, ebpf.UpdateAny); err != nil {
+	if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
 
@@ -190,12 +214,12 @@ func TestScenarioOneElephant(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	nsPerOp := float64(elapsed.Nanoseconds()) / float64(iterations)
-	t.Logf("one_elephant: %d iterations, %v wall (%.1f ns/op)", iterations, elapsed, nsPerOp)
+	t.Logf("one_elephant[%s]: %d iterations, %v wall (%.1f ns/op)", dir, iterations, elapsed, nsPerOp)
 
-	passed := readPerCPUStat(t, statsMap, 0)
-	throttled := readPerCPUStat(t, statsMap, 1)
-	hhHits := readPerCPUStat(t, statsMap, 2)
-	t.Logf("stats: passed=%d throttled=%d hh_hits=%d", passed, throttled, hhHits)
+	passed := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatPassed))
+	throttled := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatThrottled))
+	hhHits := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatHHHits))
+	t.Logf("stats[%s]: passed=%d throttled=%d hh_hits=%d", dir, passed, throttled, hhHits)
 
 	// Sanity asserts: most of the iterations should be heavy hits (we
 	// crossed threshold after the first 10), and a meaningful chunk
@@ -296,17 +320,18 @@ func TestScenarioThousandMice(t *testing.T) {
 		BurstBytes:  1,
 		HHThreshold: 100, // generous; 5 packets per flow stays well under
 	}
-	zero := uint32(0)
-	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+	dir := bpf.DirectionIngress
+	key := uint32(dir)
+	if err := coll.Maps["natra_config_map"].Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny); err != nil {
+	if err := coll.Maps["natra_bucket_map"].Update(&key, &tokenBucket{}, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
 
 	const flows = 1000
 	const perFlow = 5
-	prog := coll.Programs["natra_ingress"]
+	prog := coll.Programs[natraProgFor(dir)]
 	start := time.Now()
 	for i := 0; i < flows; i++ {
 		// Vary src ip + src port so each flow_key is distinct. Dst
@@ -324,9 +349,9 @@ func TestScenarioThousandMice(t *testing.T) {
 		flows, perFlow, elapsed, float64(elapsed.Nanoseconds())/float64(totalPackets))
 
 	statsMap := coll.Maps["natra_stats_map"]
-	passed := readPerCPUStat(t, statsMap, 0)
-	throttled := readPerCPUStat(t, statsMap, 1)
-	hh := readPerCPUStat(t, statsMap, 2)
+	passed := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatPassed))
+	throttled := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatThrottled))
+	hh := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatHHHits))
 	t.Logf("stats: passed=%d throttled=%d hh_hits=%d", passed, throttled, hh)
 
 	if hh != 0 {
@@ -370,18 +395,19 @@ func TestScenarioMixed(t *testing.T) {
 		BurstBytes:  64_000,    // small enough that elephant exhausts it
 		HHThreshold: 10,
 	}
-	zero := uint32(0)
-	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
+	dir := bpf.DirectionIngress
+	key := uint32(dir)
+	if err := coll.Maps["natra_config_map"].Update(&key, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
+	if err := coll.Maps["natra_bucket_map"].Update(&key, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
 
 	const elephantPackets = 10_000
 	const miceFlows = 100
 	const miceFlowPackets = 5
-	prog := coll.Programs["natra_ingress"]
+	prog := coll.Programs[natraProgFor(dir)]
 
 	// Round-robin elephant + mice so the BPF program sees them
 	// interleaved (closer to a real elephant-among-mice mix). The
@@ -404,9 +430,9 @@ func TestScenarioMixed(t *testing.T) {
 	}
 
 	statsMap := coll.Maps["natra_stats_map"]
-	passed := readPerCPUStat(t, statsMap, 0)
-	throttled := readPerCPUStat(t, statsMap, 1)
-	hh := readPerCPUStat(t, statsMap, 2)
+	passed := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatPassed))
+	throttled := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatThrottled))
+	hh := readPerCPUStat(t, statsMap, bpf.StatKey(dir, bpf.StatHHHits))
 	totalSent := uint64(elephantPackets + miceFlows*miceFlowPackets)
 	t.Logf("mixed: sent=%d (1 elephant × %d + %d mice × %d) — passed=%d throttled=%d hh_hits=%d",
 		totalSent, elephantPackets, miceFlows, miceFlowPackets, passed, throttled, hh)
@@ -436,9 +462,9 @@ func TestScenarioMixed(t *testing.T) {
 
 // TestScenarioMixedVsVanilla loads both natra.bpf.o and vanilla.bpf.o
 // (the upstream-bandwidth emulator in bpf/vanilla.bpf.c), runs the
-// same elephant+mice packet sequence through each, and asserts natra
-// preserves mice goodput while vanilla throttles them along with the
-// elephant.
+// same elephant+mice packet sequence through each direction, and
+// asserts natra preserves mice goodput while vanilla throttles them
+// along with the elephant.
 //
 // Vanilla's token-bucket-on-every-packet design has no flow awareness,
 // so mice arriving into the elephant-drained bucket get dropped the
@@ -449,17 +475,25 @@ func TestScenarioMixed(t *testing.T) {
 // the comparison emulator drifted from upstream semantics — both
 // worth immediate attention.
 func TestScenarioMixedVsVanilla(t *testing.T) {
+	mixedVsVanillaForDir(t, bpf.DirectionIngress)
+}
+
+func TestScenarioMixedVsVanillaEgress(t *testing.T) {
+	mixedVsVanillaForDir(t, bpf.DirectionEgress)
+}
+
+func mixedVsVanillaForDir(t *testing.T, dir bpf.Direction) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
 	}
 
-	natraResult := runMixed(t, "natra.bpf.o", true)
-	vanillaResult := runMixed(t, "vanilla.bpf.o", false)
+	natraResult := runMixed(t, "natra.bpf.o", true, dir)
+	vanillaResult := runMixed(t, "vanilla.bpf.o", false, dir)
 
 	natraMicePassRate := float64(natraResult.micePassed) / float64(natraResult.miceSent)
 	vanillaMicePassRate := float64(vanillaResult.micePassed) / float64(vanillaResult.miceSent)
-	t.Logf("natra mice goodput: %d/%d = %.1f%%", natraResult.micePassed, natraResult.miceSent, natraMicePassRate*100)
-	t.Logf("vanilla mice goodput: %d/%d = %.1f%%", vanillaResult.micePassed, vanillaResult.miceSent, vanillaMicePassRate*100)
+	t.Logf("[%s] natra mice goodput: %d/%d = %.1f%%", dir, natraResult.micePassed, natraResult.miceSent, natraMicePassRate*100)
+	t.Logf("[%s] vanilla mice goodput: %d/%d = %.1f%%", dir, vanillaResult.micePassed, vanillaResult.miceSent, vanillaMicePassRate*100)
 
 	// Headline assertions:
 	// 1. natra mice goodput must be ≥ 95% — every mouse packet should
@@ -488,7 +522,7 @@ type mixedResult struct {
 	elephantSent, elephantThrottled uint64
 }
 
-func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
+func runMixed(t *testing.T, bpfObject string, isNatra bool, dir bpf.Direction) mixedResult {
 	t.Helper()
 	spec, err := ebpf.LoadCollectionSpec(bpfObjectPath(bpfObject))
 	if err != nil {
@@ -505,27 +539,27 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 	const rateBps = 1_250_000 // 10 Mbps in bytes/sec
 	const burstBytes = 64_000 // small bucket → elephant exhausts it quickly
 	const hhThreshold = 10    // ignored by vanilla; natra uses it
-	zero := uint32(0)
+	key := uint32(dir)
 
 	if isNatra {
 		cfg := natraConfig{RateBps: rateBps, BurstBytes: burstBytes, HHThreshold: hhThreshold}
-		_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
-		_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
+		_ = coll.Maps["natra_config_map"].Update(&key, &cfg, ebpf.UpdateAny)
+		_ = coll.Maps["natra_bucket_map"].Update(&key, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
 	} else {
 		// vanilla.bpf.c has the same struct shape as natra for config
 		// (rate, burst — no HHThreshold) and bucket (spin lock + 8B
 		// fields), so we can reuse Vanilla's two-field config and the
 		// shared TokenBucket layout.
 		cfg := struct{ Rate, Burst uint64 }{rateBps, burstBytes}
-		_ = coll.Maps["vanilla_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
-		_ = coll.Maps["vanilla_bucket_map"].Update(&zero, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
+		_ = coll.Maps["vanilla_config_map"].Update(&key, &cfg, ebpf.UpdateAny)
+		_ = coll.Maps["vanilla_bucket_map"].Update(&key, &tokenBucket{Tokens: burstBytes}, ebpf.UpdateAny)
 	}
 
 	var prog *ebpf.Program
 	if isNatra {
-		prog = coll.Programs["natra_ingress"]
+		prog = coll.Programs[natraProgFor(dir)]
 	} else {
-		prog = coll.Programs["vanilla_ingress"]
+		prog = coll.Programs[vanillaProgFor(dir)]
 	}
 
 	const elephantPrime = 5_000 // packets to send BEFORE the mice — drains the bucket
