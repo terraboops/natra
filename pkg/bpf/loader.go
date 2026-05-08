@@ -258,7 +258,12 @@ func (p *Program) AttachEgress(ifIndex int, mode AttachMode, pinPath string) err
 	}
 }
 
-func (p *Program) attachTCX(ifIndex int, prog *ebpf.Program, attach ebpf.AttachType, pinPath, label string) (link.Link, error) {
+func (p *Program) attachTCX(
+	ifIndex int,
+	prog *ebpf.Program,
+	attach ebpf.AttachType,
+	pinPath, label string,
+) (link.Link, error) {
 	l, err := link.AttachTCX(link.TCXOptions{
 		Interface: ifIndex,
 		Program:   prog,
