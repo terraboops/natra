@@ -130,13 +130,12 @@ Files under `test/perf/`:
   - `TestScenarioMixed` — elephant + mice, mice survive.
   - `TestScenarioMixedVsVanilla` — head-to-head vs `bpf/vanilla.bpf.o`.
 - `perf_stub_test.go` — non-Linux skip.
-- `baselines/{local,5.15,6.6,bpf-next}.json` — per-kernel ns/op
-  ceilings; the script compares the current run against the matching
-  file.
+- `baselines/local.json` — ns/op ceiling for the synthetic
+  BPF_PROG_RUN tests; the test fails on regression past the recorded
+  value.
 - `realworld/vanilla-installer.yaml` — DaemonSet that fetches the
   upstream `bandwidth` plugin and chains it after kindnet, used by
   `make perf-vs-vanilla`.
-- `scenarios/scenarios.go` — shared types; not currently exercised.
 
 Run:
 ```bash
