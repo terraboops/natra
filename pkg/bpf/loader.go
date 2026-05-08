@@ -261,42 +261,6 @@ func (p *Program) attachClsactPodside(ifIndex int) error {
 	return nil
 }
 
-// Stats holds the aggregate per-CPU counter values.
-type Stats struct {
-	Passed    uint64
-	Throttled uint64
-	HHHits    uint64
-}
-
-// Stats reads the per-CPU stats map and returns the aggregate. One
-// BPF_MAP_LOOKUP per slot returns all per-CPU values.
-func (p *Program) Stats() (Stats, error) {
-	var s Stats
-	if err := p.readStat(StatPassed, &s.Passed); err != nil {
-		return s, err
-	}
-	if err := p.readStat(StatThrottled, &s.Throttled); err != nil {
-		return s, err
-	}
-	if err := p.readStat(StatHHHits, &s.HHHits); err != nil {
-		return s, err
-	}
-	return s, nil
-}
-
-func (p *Program) readStat(idx uint32, sum *uint64) error {
-	var values []uint64
-	if err := p.statsMap.Lookup(&idx, &values); err != nil {
-		return fmt.Errorf("stats lookup idx=%d: %w", idx, err)
-	}
-	var total uint64
-	for _, v := range values {
-		total += v
-	}
-	*sum = total
-	return nil
-}
-
 // Close releases the userspace BPF references. For tcx, the kernel
 // keeps the program loaded and attached as long as the pinned link
 // exists, so packets keep flowing after Close. For clsact-podside the
@@ -311,10 +275,4 @@ func (p *Program) Close() error {
 		p.coll = nil
 	}
 	return nil
-}
-
-// Program returns the underlying *ebpf.Program. Exposed for test code
-// that wants to drive BPF_PROG_RUN directly without attaching.
-func (p *Program) Program() *ebpf.Program {
-	return p.prog
 }

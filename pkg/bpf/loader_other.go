@@ -35,12 +35,6 @@ const (
 	StatHHHits    uint32 = 2
 )
 
-type Stats struct {
-	Passed    uint64
-	Throttled uint64
-	HHHits    uint64
-}
-
 type Program struct{}
 
 var errNotLinux = errors.New("pkg/bpf: BPF requires Linux; the natra binary is Linux-only")
@@ -49,5 +43,4 @@ func Load() (*Program, error)                                { return nil, errNo
 func (*Program) Configure(Config) error                      { return errNotLinux }
 func (*Program) AttachIngress(int, AttachMode, string) error { return errNotLinux }
 func (*Program) PinMaps(string, string) error                { return errNotLinux }
-func (*Program) Stats() (Stats, error)                       { return Stats{}, errNotLinux }
 func (*Program) Close() error                                { return nil }
