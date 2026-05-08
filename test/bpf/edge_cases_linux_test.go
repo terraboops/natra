@@ -36,6 +36,13 @@ func edgeMkPkt(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte {
 // loadNatra returns a fresh natra collection ready for tests, with a
 // bucket pre-filled to burst and config set to typical 10 Mbps shape.
 // Each test gets its own collection so per-test state doesn't bleed.
+//
+// Edge cases exercise direction-agnostic logic (parse_flow, the
+// bucket math, CMS counter overflow), so this helper drives the
+// ingress program with the ingress map slot. The egress program runs
+// the same code; doubling each edge case across both directions adds
+// runtime, not coverage. Cross-direction independence is asserted in
+// TestCrossDirectionIsolation.
 func loadNatra(t *testing.T) (*ebpf.Collection, natraConfig, *ebpf.Program) {
 	t.Helper()
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -58,7 +65,7 @@ func loadNatra(t *testing.T) (*ebpf.Collection, natraConfig, *ebpf.Program) {
 	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
-	return coll, cfg, coll.Programs["natra_ratelimit"]
+	return coll, cfg, coll.Programs["natra_ingress"]
 }
 
 // TestEdgePacketBiggerThanBurst — when a single packet exceeds the

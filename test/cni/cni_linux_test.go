@@ -139,14 +139,14 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0"))
+			Expect(string(stderr)).To(ContainSubstring("attached to eth0 ingress"))
 			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
-			Expect(linkPinExists(containerID, "eth0")).To(BeTrue(),
+			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeTrue(),
 				"tcx attached but no link pin found")
 
 			_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
 			Expect(delErr).NotTo(HaveOccurred(), "stderr: %s", string(delStderr))
-			Expect(linkPinExists(containerID, "eth0")).To(BeFalse(),
+			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeFalse(),
 				"link pin should be gone after DEL")
 			Expect(remainingPinsFor(containerID)).To(BeEmpty(),
 				"all per-container pins should be cleaned up by DEL")
@@ -174,7 +174,7 @@ var _ = Describe("natra CNI binary", func() {
 			stdout, stderr, runErr := runPlugin(natra, "ADD", containerID, netnsPath(ns), "eth0", stdin)
 			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0"))
+			Expect(string(stderr)).To(ContainSubstring("attached to eth0 ingress"))
 			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
 
 			var result map[string]any
@@ -183,7 +183,7 @@ var _ = Describe("natra CNI binary", func() {
 
 			// No tcx link pin in this mode (the kernel holds the program
 			// reference via the qdisc tree until the veth is deleted).
-			Expect(linkPinExists(containerID, "eth0")).To(BeFalse(),
+			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeFalse(),
 				"clsact-podside mode should not produce a link pin")
 		})
 

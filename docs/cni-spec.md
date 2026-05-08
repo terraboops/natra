@@ -2,7 +2,8 @@
 
 natra is a chained CNI plugin. It runs after the main CNI (kindnet,
 calico, AWS VPC CNI, etc.) has set up Pod networking, attaches its BPF
-program to the Pod's veth ingress, and prints the upstream `prevResult`
+program to the Pod's veth in either or both directions (per the
+annotations present on the Pod), and prints the upstream `prevResult`
 unchanged so the chain continues working.
 
 Negotiated CNI version: 1.0.0 (with 0.3.0/0.3.1/0.4.0 also accepted).
@@ -12,45 +13,61 @@ Negotiated CNI version: 1.0.0 (with 0.3.0/0.3.1/0.4.0 also accepted).
 ### ADD
 
 1. Read NetConf from stdin.
-2. Resolve the bandwidth from `runtimeConfig.bandwidth.{ingressRate,
-   ingressBurst}` (kubelet populates this from
-   `kubernetes.io/ingress-bandwidth` when the conflist entry declares
-   `capabilities.bandwidth: true`). Fall back to
-   `runtimeConfig.podAnnotations["kubernetes.io/ingress-bandwidth"]`
-   if the bandwidth field is absent.
-3. If no rate, print `prevResult` and return.
+2. Resolve the bandwidth per direction:
+   - Ingress: `runtimeConfig.bandwidth.{ingressRate,ingressBurst}` first,
+     falling back to `runtimeConfig.podAnnotations["kubernetes.io/ingress-bandwidth"]`.
+   - Egress: `runtimeConfig.bandwidth.{egressRate,egressBurst}` first,
+     falling back to `runtimeConfig.podAnnotations["kubernetes.io/egress-bandwidth"]`.
+
+   Kubelet populates the runtimeConfig fields from the matching
+   annotations when the conflist entry declares
+   `capabilities.bandwidth: true`.
+3. If neither direction has a rate, print `prevResult` and return —
+   no BPF is loaded.
 4. Resolve attach mode from the top-level `attachMode` field
-   (`tcx` default, `clsact-podside` opt-in).
-5. Enter the pod netns, load the BPF object, configure rate/burst,
-   attach to the veth ingress.
+   (`tcx` default, `clsact-podside` opt-in). Both directions use the
+   same mode.
+5. Enter the pod netns, load the BPF object, and for each direction
+   that has a rate: configure that direction's slot, attach the
+   matching program (`natra_ingress` or `natra_egress`) to the
+   matching hook.
 6. Print `prevResult` and return.
+
+If one direction's attach succeeds and the other fails, the
+successful side is rolled back (link closed, pin removed) and the
+plugin falls through to passthrough.
 
 Past stdin parsing every error path is fail-open: log to stderr and
 to `/var/log/natra-cni.log`, return success. A Pod stuck in
-ContainerCreating because the rate limiter couldn't load is worse than
-a Pod running unrate-limited.
+ContainerCreating because the rate limiter couldn't load is worse
+than a Pod running unrate-limited.
 
 ### DEL
 
 Remove the per-container pins under `/sys/fs/bpf/natra/`:
 
-- `<containerID>-<ifName>-link` — the tcx-link pin (only present in
-  tcx mode; removing it detaches the program).
+- `<containerID>-<ifName>-ingress-link` — the ingress tcx-link pin
+  (only present when ingress was attached in tcx mode).
+- `<containerID>-<ifName>-egress-link` — the egress tcx-link pin
+  (only present when egress was attached in tcx mode).
 - `<containerID>-{config,bucket,stats,cms}-map` — the per-pod map
-  pins (used by `natra dump-stats`).
+  pins (used by `natra dump-stats`; one set shared across directions).
 
-For clsact-podside attachments there's no link pin. The kernel
-auto-detaches the filter when the next chained plugin's DEL deletes
+For clsact-podside attachments there are no link pins. The kernel
+auto-detaches the filters when the next chained plugin's DEL deletes
 the underlying veth.
 
-DEL is idempotent: missing pins are not errors.
+`cmdDel` walks the pin dir and removes everything with the
+`<containerID>-` prefix, so partial state from a half-applied ADD or
+from either direction being absent is cleaned up uniformly. DEL is
+idempotent: missing pins are not errors.
 
 ### CHECK
 
-No-op success. Re-entering the pod netns to verify the attachment
-would require listing tc filters or tcx links per ifindex, and
-kubelet uses CHECK as a liveness hint where a false positive isn't
-worse than the fail-open path elsewhere.
+No-op success. Re-entering the pod netns to verify each direction's
+attachment would require listing tc filters or tcx links per ifindex,
+and kubelet uses CHECK as a liveness hint where a false positive
+isn't worse than the fail-open path elsewhere.
 
 ### VERSION
 
@@ -70,47 +87,56 @@ with `version.All`).
   },
   "runtimeConfig": {
     "bandwidth": {            // populated by kubelet
-      "ingressRate": 10000000,
-      "ingressBurst": 20000000
+      "ingressRate":  10000000,
+      "ingressBurst": 20000000,
+      "egressRate":    5000000,
+      "egressBurst":  10000000
     }
   },
   "prevResult": { ... }       // upstream main-CNI result, passed through
 }
 ```
 
-`runtimeConfig.bandwidth.ingressRate` is in **bits per second**
-(matching kubelet's convention); natra divides by 8 to get bytes/sec
-for the BPF program. `ingressBurst` is clamped to 2× rate when
-unspecified or larger; without that clamp, the kubelet default of
-`MaxUint32` (~4 GB) would let any flow saturate the link for ~30s
-before the bucket caught up.
+Either direction's `Rate`/`Burst` may be absent — kubelet only
+includes a direction when the matching annotation is present.
+
+`runtimeConfig.bandwidth.{ingress,egress}Rate` is in **bits per
+second** (matching kubelet's convention); natra divides by 8 to get
+bytes/sec for the BPF program. Each direction's burst is clamped to
+2× that direction's rate when unspecified or larger; without that
+clamp, the kubelet default of `MaxUint32` (~4 GB) would let any flow
+saturate the link for ~30s before the bucket caught up.
 
 ## Annotation forms
 
-Simple (the standard form):
+Simple (the standard form), one or both directions:
 
 ```yaml
 metadata:
   annotations:
     kubernetes.io/ingress-bandwidth: "10M"
+    kubernetes.io/egress-bandwidth: "5M"
 ```
 
-Extended JSON, for overriding the heavy-hitter threshold:
+Extended JSON, for overriding the heavy-hitter threshold. The same
+fields and semantics apply on either annotation; each is parsed
+independently:
 
 ```yaml
 metadata:
   annotations:
     kubernetes.io/ingress-bandwidth: |
       {"rate":"10M","burst":"20M","heavyHitterThreshold":50}
+    kubernetes.io/egress-bandwidth: |
+      {"rate":"5M","heavyHitterThreshold":20}
 ```
 
-The default threshold is 10 (lowered from earlier project defaults to
-work under realistic GRO/GSO).
+The default threshold is 10 (lowered from earlier project defaults
+to work under realistic GRO/GSO).
 
 ## Chained conflist
 
-A typical kindnet + natra chain produced by
-`natra install-cni-chain`:
+A typical kindnet + natra chain produced by `natra install-cni-chain`:
 
 ```jsonc
 {
@@ -151,8 +177,9 @@ attachMode):
 }
 ```
 
-For everything else (BPF load failure, attach failure, kernel feature
-missing, malformed annotation), natra logs and prints `prevResult`.
+For everything else (BPF load failure, attach failure on either
+direction, kernel feature missing, malformed annotation), natra logs
+and prints `prevResult`.
 
 ## References
 

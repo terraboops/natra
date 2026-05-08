@@ -110,7 +110,7 @@ func TestMalformedPackets(t *testing.T) {
 	if err := coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny); err != nil {
 		t.Fatalf("bucket: %v", err)
 	}
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 
 	// Cases below are all >= 14 bytes (ETH_HLEN). Below that the
 	// BPF_PROG_RUN syscall itself returns EINVAL — kernel-side, not
@@ -203,7 +203,7 @@ func TestConcurrentMapUpdates(t *testing.T) {
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny)
 
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 	pkt := elephantPkt()
 
 	const goroutines = 8
@@ -281,7 +281,7 @@ func TestMapCapacityOOM(t *testing.T) {
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny)
 
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 	const flows = 8192 // 2× CMS capacity
 	for i := 0; i < flows; i++ {
 		pkt := mkUniqueFlowPkt(uint32(i))
@@ -330,10 +330,6 @@ func mkUniqueFlowPkt(idx uint32) []byte {
 	return pkt
 }
 
-func TestKernelFeatureFallback(t *testing.T) {
-	t.Skip("natra currently uses clsact uniformly (see pkg/bpf/loader.go AttachIngress for rationale); revisit if/when tcx-link pinning works in our deployment environments")
-}
-
 func TestDetachRace(t *testing.T) {
-	t.Skip("requires real veth + concurrent CNI ADD/DEL drivers; deferred until L4 chaos lands TestPodChurnDuringTraffic which exercises the same kernel state")
+	t.Skip("requires real veth + concurrent CNI ADD/DEL drivers; the L4 chaos suite exercises the same kernel state under TestPodChurnDuringTraffic")
 }

@@ -60,7 +60,7 @@ func loadNatraColl(t *testing.T) (*ebpf.Collection, *ebpf.Map, *ebpf.Map, *ebpf.
 	if !ok {
 		t.Fatalf("stats map missing")
 	}
-	prog, ok := coll.Programs["natra_ratelimit"]
+	prog, ok := coll.Programs["natra_ingress"]
 	if !ok {
 		t.Fatalf("program missing")
 	}

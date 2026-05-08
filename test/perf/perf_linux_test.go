@@ -152,7 +152,7 @@ func TestScenarioOneElephant(t *testing.T) {
 	cfgMap := coll.Maps["natra_config_map"]
 	bucketMap := coll.Maps["natra_bucket_map"]
 	statsMap := coll.Maps["natra_stats_map"]
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 	if cfgMap == nil || bucketMap == nil || statsMap == nil || prog == nil {
 		t.Fatalf("expected maps and program, got: %v / %v",
 			collMapNames(coll), collProgNames(coll))
@@ -306,7 +306,7 @@ func TestScenarioThousandMice(t *testing.T) {
 
 	const flows = 1000
 	const perFlow = 5
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 	start := time.Now()
 	for i := 0; i < flows; i++ {
 		// Vary src ip + src port so each flow_key is distinct. Dst
@@ -381,7 +381,7 @@ func TestScenarioMixed(t *testing.T) {
 	const elephantPackets = 10_000
 	const miceFlows = 100
 	const miceFlowPackets = 5
-	prog := coll.Programs["natra_ratelimit"]
+	prog := coll.Programs["natra_ingress"]
 
 	// Round-robin elephant + mice so the BPF program sees them
 	// interleaved (closer to a real elephant-among-mice mix). The
@@ -523,9 +523,9 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool) mixedResult {
 
 	var prog *ebpf.Program
 	if isNatra {
-		prog = coll.Programs["natra_ratelimit"]
+		prog = coll.Programs["natra_ingress"]
 	} else {
-		prog = coll.Programs["vanilla_ratelimit"]
+		prog = coll.Programs["vanilla_ingress"]
 	}
 
 	const elephantPrime = 5_000 // packets to send BEFORE the mice — drains the bucket

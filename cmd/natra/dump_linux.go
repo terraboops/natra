@@ -11,12 +11,15 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
+
+	"github.com/terraboops/natra/pkg/bpf"
 )
 
 // dumpStats reads the pinned natra maps for the given container and
-// prints stats / config / a CMS histogram summary. Useful for
-// post-mortem inspection — tells you whether traffic actually flowed
-// through the BPF program and how the CMS classified it.
+// prints stats / config / a CMS histogram summary, per direction.
+// Useful for post-mortem inspection — tells you whether traffic
+// actually flowed through the BPF program in either direction and how
+// the CMS classified it.
 //
 // Invoked from the natra binary via:
 //
@@ -47,36 +50,48 @@ func dumpStats(args []string) error {
 	}
 	defer func() { _ = statsMap.Close() }()
 
-	zero := uint32(0)
-	var rawCfg [24]byte
-	if err := cfgMap.Lookup(&zero, &rawCfg); err != nil {
-		return fmt.Errorf("lookup config: %w", err)
-	}
-	rate := binary.LittleEndian.Uint64(rawCfg[0:8])
-	burst := binary.LittleEndian.Uint64(rawCfg[8:16])
-	hh := binary.LittleEndian.Uint64(rawCfg[16:24])
-	fmt.Printf("config: rate=%d burst=%d hh_threshold=%d\n", rate, burst, hh)
-
-	for _, slot := range []struct {
-		name string
-		idx  uint32
-	}{
-		{"passed", 0},
-		{"throttled", 1},
-		{"hh_hits", 2},
-	} {
-		var values []uint64
-		if err := statsMap.Lookup(&slot.idx, &values); err != nil {
-			return fmt.Errorf("lookup stats[%s]: %w", slot.name, err)
+	for _, dir := range []bpf.Direction{bpf.DirectionIngress, bpf.DirectionEgress} {
+		key := uint32(dir)
+		var rawCfg [24]byte
+		if err := cfgMap.Lookup(&key, &rawCfg); err != nil {
+			return fmt.Errorf("lookup config[%s]: %w", dir, err)
 		}
-		var sum uint64
-		for _, v := range values {
-			sum += v
+		rate := binary.LittleEndian.Uint64(rawCfg[0:8])
+		burst := binary.LittleEndian.Uint64(rawCfg[8:16])
+		hh := binary.LittleEndian.Uint64(rawCfg[16:24])
+		if rate == 0 {
+			// Zero-rate slot means this direction wasn't attached for
+			// this container. Skip the section so the output isn't
+			// cluttered with empties.
+			continue
 		}
-		fmt.Printf("stats: %s=%d (per-cpu sum)\n", slot.name, sum)
+		fmt.Printf("[%s] config: rate=%d burst=%d hh_threshold=%d\n", dir, rate, burst, hh)
+
+		for _, slot := range []struct {
+			name string
+			idx  uint32
+		}{
+			{"passed", bpf.StatPassed},
+			{"throttled", bpf.StatThrottled},
+			{"hh_hits", bpf.StatHHHits},
+		} {
+			statKey := bpf.StatKey(dir, slot.idx)
+			var values []uint64
+			if err := statsMap.Lookup(&statKey, &values); err != nil {
+				return fmt.Errorf("lookup stats[%s/%s]: %w", dir, slot.name, err)
+			}
+			var sum uint64
+			for _, v := range values {
+				sum += v
+			}
+			fmt.Printf("[%s] stats: %s=%d (per-cpu sum)\n", dir, slot.name, sum)
+		}
 	}
 
-	// CMS map is optional (absent for the placeholder program).
+	// CMS map is optional (absent for the placeholder program). Print a
+	// single histogram summary across both halves; per-direction CMS
+	// breakdown isn't worth the verbosity in the dump output — go look
+	// at the stats counters if you want a per-direction signal.
 	cmsMap, err := open("cms")
 	if err == nil {
 		defer func() { _ = cmsMap.Close() }()

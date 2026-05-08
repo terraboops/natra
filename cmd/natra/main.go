@@ -26,17 +26,18 @@ import (
 const pinDir = "/sys/fs/bpf/natra"
 
 // pinPathFor is the bpffs path for the pinned tcx link of a given
-// container's interface. Two pods with the same name on different
-// nodes get different paths because containerID is unique per kubelet
-// pod sandbox.
+// container's interface in a given direction. Two pods with the same
+// name on different nodes get different paths because containerID is
+// unique per kubelet pod sandbox; ingress and egress get distinct pin
+// files within a pod.
 //
 // Bpffs forbids dots in pin file names (kernel/bpf/inode.c::bpf_lookup
 // returns EPERM on any name containing '.' when the parent dir has
 // any S_IALLUGO bits — those names are reserved for kernel-internal
 // special files created by populate_bpffs). So no `.link` extension;
 // we use a `-link` suffix instead.
-func pinPathFor(containerID, ifName string) string {
-	return filepath.Join(pinDir, containerID+"-"+ifName+"-link")
+func pinPathFor(containerID, ifName string, dir bpf.Direction) string {
+	return filepath.Join(pinDir, containerID+"-"+ifName+"-"+dir.String()+"-link")
 }
 
 var (
@@ -115,10 +116,11 @@ func main() {
 
 // cmdAdd handles a CNI ADD. Order:
 //  1. Parse stdin → NetConf.
-//  2. Resolve bandwidth from runtimeConfig; pass through if no rate.
-//  3. Load BPF object, configure rate/burst, attach to the pod-side
-//     veth ingress inside the pod netns.
-//  5. Print PrevResult so the next chained plugin (or kubelet) sees
+//  2. Resolve bandwidth per direction from runtimeConfig + annotations;
+//     pass through if neither direction has a rate.
+//  3. Load BPF object, configure each direction's rate/burst, attach
+//     each direction's program to the pod-side veth.
+//  4. Print PrevResult so the next chained plugin (or kubelet) sees
 //     what came in — natra doesn't modify networking, only adds rate
 //     limiting on top.
 //
@@ -144,20 +146,30 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("attachMode: %w", err)
 	}
 
-	cfg := resolveConfig(conf)
-	if cfg == nil || cfg.Rate <= 0 {
-		logf("no rate limit, passing through")
+	ingressCfg := resolveDirectionConfig(conf, bpf.DirectionIngress)
+	egressCfg := resolveDirectionConfig(conf, bpf.DirectionEgress)
+	if ingressCfg == nil && egressCfg == nil {
+		logf("no rate limit on either direction, passing through")
 		return passthrough(args, conf)
 	}
-	logf("config resolved: rate=%d burst=%d attachMode=%v", cfg.Rate, cfg.Burst, mode)
+	logf("config resolved: ingress=%v egress=%v attachMode=%v",
+		describeCfg(ingressCfg), describeCfg(egressCfg), mode)
 
-	if err := attachBPF(args, cfg, mode); err != nil {
+	if err := attachBPF(args, ingressCfg, egressCfg, mode); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
 	}
 
 	return passthrough(args, conf)
+}
+
+// describeCfg formats a Config for the trace log; "off" when nil.
+func describeCfg(cfg *config.Config) string {
+	if cfg == nil {
+		return "off"
+	}
+	return fmt.Sprintf("rate=%d burst=%d hh=%d", cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
 // logf appends a line to /var/log/natra-cni.log. Best effort — if the
@@ -242,8 +254,8 @@ func parseConfig(stdin []byte) (*NetConf, error) {
 	return conf, nil
 }
 
-// resolveConfig pulls the per-pod rate limit out of the parsed stdin.
-// Two channels, in order of preference:
+// resolveDirectionConfig pulls the per-direction rate limit out of the
+// parsed stdin. Two channels, in order of preference:
 //
 //  1. RuntimeConfig.Bandwidth, populated by kubelet when the conflist
 //     declares `capabilities.bandwidth: true`. Rate is in bits/sec
@@ -259,12 +271,30 @@ func parseConfig(stdin []byte) (*NetConf, error) {
 // flow saturate the link for ~30s before the bucket caught up. 2× rate
 // is a one-second burst window — same heuristic the upstream plugin uses.
 //
-// Returns nil if neither channel produces a usable rate.
-func resolveConfig(conf *NetConf) *config.Config {
-	if conf.RuntimeConfig.Bandwidth != nil && conf.RuntimeConfig.Bandwidth.IngressRate > 0 {
+// Returns nil if neither channel produces a usable rate for this
+// direction. Each direction is resolved independently so a pod with
+// only one annotation gets one program attached, not both.
+func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
+	annotationKey := "kubernetes.io/ingress-bandwidth"
+	var rateBits, burstBits int64
+	if conf.RuntimeConfig.Bandwidth != nil {
+		switch dir {
+		case bpf.DirectionIngress:
+			rateBits = conf.RuntimeConfig.Bandwidth.IngressRate
+			burstBits = conf.RuntimeConfig.Bandwidth.IngressBurst
+		case bpf.DirectionEgress:
+			rateBits = conf.RuntimeConfig.Bandwidth.EgressRate
+			burstBits = conf.RuntimeConfig.Bandwidth.EgressBurst
+		}
+	}
+	if dir == bpf.DirectionEgress {
+		annotationKey = "kubernetes.io/egress-bandwidth"
+	}
+
+	if rateBits > 0 {
 		out := config.DefaultConfig()
-		out.Rate = conf.RuntimeConfig.Bandwidth.IngressRate / 8 // bits → bytes
-		burst := conf.RuntimeConfig.Bandwidth.IngressBurst / 8
+		out.Rate = rateBits / 8 // bits → bytes
+		burst := burstBits / 8
 		if burst <= 0 || burst > out.Rate*2 {
 			burst = out.Rate * 2
 		}
@@ -272,13 +302,15 @@ func resolveConfig(conf *NetConf) *config.Config {
 		return out
 	}
 	if conf.RuntimeConfig.PodAnnotations != nil {
-		if bw, ok := conf.RuntimeConfig.PodAnnotations["kubernetes.io/ingress-bandwidth"]; ok && bw != "" {
+		if bw, ok := conf.RuntimeConfig.PodAnnotations[annotationKey]; ok && bw != "" {
 			parsed, err := config.ParseBandwidthAnnotation(bw)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "natra: bandwidth annotation %q invalid (%v)\n", bw, err)
+				fmt.Fprintf(os.Stderr, "natra: %s annotation %q invalid (%v)\n", annotationKey, bw, err)
 				return nil
 			}
-			return parsed
+			if parsed != nil && parsed.Rate > 0 {
+				return parsed
+			}
 		}
 	}
 	return nil
@@ -286,8 +318,9 @@ func resolveConfig(conf *NetConf) *config.Config {
 
 // attachBPF enters the pod's network namespace, finds the interface
 // kubelet asked us to operate on (CNI_IFNAME, typically "eth0"),
-// loads the BPF object, configures the bucket, and attaches the
-// program to the interface's ingress hook.
+// loads the BPF object, configures each direction that has a rate,
+// and attaches the matching BPF program. At least one of ingress or
+// egress is non-nil when this is called.
 //
 // We have to leave the calling OS thread in the same netns we entered
 // with. CNI's skel framework checks after the plugin returns and exits
@@ -295,12 +328,17 @@ func resolveConfig(conf *NetConf) *config.Config {
 // stdout said. The restore is deferred immediately after the switch
 // so any error path returns us to origin.
 //
-// We don't close prog on success. For tcx, the link is pinned to
-// bpffs and the kernel holds the program reference via the link until
-// the pin is removed (cmdDel). For clsact-podside, the kernel holds
-// the program reference via the qdisc tree until the underlying veth
-// is deleted (the chained CNI plugin's DEL).
-func attachBPF(args *skel.CmdArgs, cfg *config.Config, mode bpf.AttachMode) error {
+// We don't close prog on success. For tcx, each direction's link is
+// pinned to bpffs and the kernel holds the program reference via the
+// link until the pin is removed (cmdDel). For clsact-podside, the
+// kernel holds the program reference via the qdisc tree until the
+// underlying veth is deleted.
+//
+// If one direction's attach succeeds and the other fails, the
+// successful side is rolled back (link closed, pin removed) and the
+// whole call returns an error. The fail-open contract at the caller
+// level then lets traffic flow unrate-limited rather than half-applied.
+func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bpf.AttachMode) error {
 	// netns.Set switches the calling thread, so a goroutine migration
 	// mid-flow would leave us in a different namespace than we think.
 	// Lock the thread for the duration of the netns dance.
@@ -324,24 +362,71 @@ func attachBPF(args *skel.CmdArgs, cfg *config.Config, mode bpf.AttachMode) erro
 	}
 	// Note: we don't defer prog.Close() — see attachBPF docstring.
 
-	if err := prog.Configure(bpf.Config{
-		RateBps:     uint64(cfg.Rate),
-		BurstBytes:  uint64(cfg.Burst),
-		HHThreshold: uint64(cfg.HeavyHitterThreshold),
-	}); err != nil {
-		_ = prog.Close()
-		return fmt.Errorf("configure BPF: %w", err)
-	}
-
 	if err := os.MkdirAll(pinDir, 0o755); err != nil {
 		_ = prog.Close()
 		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
-	pinPath := pinPathFor(args.ContainerID, args.IfName)
-	if err := prog.AttachIngress(iface.Index, mode, pinPath); err != nil {
-		_ = prog.Close()
-		return fmt.Errorf("attach BPF to %s ingress: %w", args.IfName, err)
+
+	type attachStep struct {
+		name string
+		dir  bpf.Direction
+		cfg  *config.Config
+		do   func() error
 	}
+	var steps []attachStep
+	if ingressCfg != nil {
+		ingressPin := pinPathFor(args.ContainerID, args.IfName, bpf.DirectionIngress)
+		steps = append(steps, attachStep{
+			name: "ingress",
+			dir:  bpf.DirectionIngress,
+			cfg:  ingressCfg,
+			do: func() error {
+				return prog.AttachIngress(iface.Index, mode, ingressPin)
+			},
+		})
+	}
+	if egressCfg != nil {
+		egressPin := pinPathFor(args.ContainerID, args.IfName, bpf.DirectionEgress)
+		steps = append(steps, attachStep{
+			name: "egress",
+			dir:  bpf.DirectionEgress,
+			cfg:  egressCfg,
+			do: func() error {
+				return prog.AttachEgress(iface.Index, mode, egressPin)
+			},
+		})
+	}
+
+	// rollback removes pin files from previously-attached directions
+	// when a later step fails. The link itself gets closed by
+	// prog.Close(); this just keeps bpffs clean so the next ADD
+	// doesn't see stale pins.
+	rollback := func(upto int) {
+		for j := 0; j < upto; j++ {
+			path := pinPathFor(args.ContainerID, args.IfName, steps[j].dir)
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "natra: rollback remove %s: %v\n", path, err)
+			}
+		}
+	}
+
+	for i, step := range steps {
+		if err := prog.Configure(step.dir, bpf.Config{
+			RateBps:     uint64(step.cfg.Rate),
+			BurstBytes:  uint64(step.cfg.Burst),
+			HHThreshold: uint64(step.cfg.HeavyHitterThreshold),
+		}); err != nil {
+			rollback(i)
+			_ = prog.Close()
+			return fmt.Errorf("configure BPF (%s): %w", step.name, err)
+		}
+		if err := step.do(); err != nil {
+			rollback(i)
+			_ = prog.Close()
+			return fmt.Errorf("attach BPF %s on %s: %w", step.name, args.IfName, err)
+		}
+	}
+
 	// Pin the maps so `natra dump-stats <containerID>` can read live
 	// stats and CMS counters from a separate process. Best-effort —
 	// pinning failure (EPERM in some environments) doesn't tear down
@@ -350,19 +435,21 @@ func attachBPF(args *skel.CmdArgs, cfg *config.Config, mode bpf.AttachMode) erro
 		fmt.Fprintf(os.Stderr, "natra: map pin failed (%v) — continuing without debug pins\n", err)
 	}
 
-	announce(args, iface.Index, cfg)
+	for _, step := range steps {
+		announce(args, iface.Index, step.name, step.cfg)
+	}
 	return nil
 }
 
 // announce writes the "attached" line to stderr (kubelet captures it)
 // and to the natra log. Two destinations because each is read by a
 // different audience: kubelet on plugin error, the log file on every
-// invocation regardless.
-func announce(args *skel.CmdArgs, ifIndex int, cfg *config.Config) {
-	fmt.Fprintf(os.Stderr, "natra: attached to %s (ifindex=%d) rate=%d bps burst=%d bytes\n",
-		args.IfName, ifIndex, cfg.Rate, cfg.Burst)
-	logf("attached: ifname=%s ifindex=%d rate=%d burst=%d hh=%d",
-		args.IfName, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
+// invocation regardless. One announce per direction.
+func announce(args *skel.CmdArgs, ifIndex int, direction string, cfg *config.Config) {
+	fmt.Fprintf(os.Stderr, "natra: attached to %s %s (ifindex=%d) rate=%d bps burst=%d bytes\n",
+		args.IfName, direction, ifIndex, cfg.Rate, cfg.Burst)
+	logf("attached: ifname=%s direction=%s ifindex=%d rate=%d burst=%d hh=%d",
+		args.IfName, direction, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
 func passthrough(args *skel.CmdArgs, conf *NetConf) error {

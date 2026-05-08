@@ -7,10 +7,11 @@
 > **Status: experimental.** A few days old; no production users; tested
 > on kind + colima. See [Limitations](#limitations) before deploying.
 
-A chained CNI plugin that rate-limits ingress traffic to a Pod. Reads
-the standard `kubernetes.io/ingress-bandwidth` annotation, runs after
-an existing main CNI (kindnet, calico, etc.), attaches a BPF program
-to the Pod's veth ingress.
+A chained CNI plugin that rate-limits Pod traffic in either direction.
+Reads the standard `kubernetes.io/ingress-bandwidth` and
+`kubernetes.io/egress-bandwidth` annotations, runs after an existing
+main CNI (kindnet, calico, etc.), attaches a BPF program to the Pod's
+veth — one program per direction, only the directions you annotate.
 
 Two stages on the BPF dataplane: a Count-Min Sketch classifies each
 flow, then heavy flows pay against a per-Pod token bucket while flows
@@ -29,9 +30,9 @@ results.
 # Deploy
 kubectl apply -f deploy/cni-installer.yaml
 
-# Annotate a Pod
+# Annotate a Pod (one or both directions)
 kubectl run test --image=nginx \
-  --annotations="kubernetes.io/ingress-bandwidth=10M"
+  --annotations="kubernetes.io/ingress-bandwidth=10M,kubernetes.io/egress-bandwidth=10M"
 ```
 
 ## Build
@@ -69,11 +70,11 @@ make ci            # full matrix (lint, licenses, L1-L5)
   traffic in a kind cluster, but kind is not bare metal either.
 - IPv6 is not classified. `parse_flow` returns -1 for non-IPv4, so
   IPv6 flows pass through unrate-limited.
-- The CMS sketch is fixed at compile time at 1024 × 4 = 4096 cells.
-  Past saturation, every flow's estimate collides with at least one
-  other flow's; classification accuracy degrades silently. The chaos
-  test confirms the program survives the condition, not that the
-  classification stays meaningful.
+- The CMS sketch is fixed at compile time at 1024 × 4 = 4096 cells
+  per direction (8192 total). Past saturation, every flow's estimate
+  collides with at least one other flow's; classification accuracy
+  degrades silently. The chaos test confirms the program survives the
+  condition, not that the classification stays meaningful.
 
 ## Docs
 

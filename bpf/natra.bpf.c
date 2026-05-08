@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 //
 // natra dataplane — CMS-driven heavy-hitter detection plus a token
-// bucket on heavy traffic.
+// bucket on heavy traffic. Two directions.
 //
 // Stage 1 (Count-Min Sketch): every packet's 5-tuple flow key is
 // hashed CMS_DEPTH times, each into one column of CMS_WIDTH. The min
 // across rows is the per-flow count estimator. Constant memory
-// (CMS_WIDTH * CMS_DEPTH = 4096 u32 counters) regardless of how many
-// distinct flows the pod sees.
+// (CMS_WIDTH * CMS_DEPTH * DIR_MAX = 8192 u32 counters) regardless of
+// how many distinct flows the pod sees.
 //
 // Stage 2 (token bucket): only flows whose CMS estimate exceeds
 // `hh_threshold` go through the bucket. Mice flows take the fast
@@ -15,6 +15,13 @@
 // stat increment beyond passed). The upstream bandwidth plugin
 // rate-limits all traffic uniformly via HTB-on-IFB; we only
 // rate-limit the elephants.
+//
+// Direction split: ingress and egress have independent state across
+// every map. Asymmetric workloads make a flow heavy on one side and
+// mice (ACKs only) on the other, so a shared CMS would falsely
+// classify ACK streams as heavy. Two SEC("tc") entry points share
+// inlined logic via natra_classify(skb, dir) — userspace gets two
+// distinct *ebpf.Program handles and attaches each to its hook.
 //
 // Concurrency:
 //   - CMS counters use __sync_fetch_and_add (-mcpu=v3 atomic). Loose
@@ -39,10 +46,19 @@
 #include <bpf/bpf_endian.h>
 
 // CMS dimensions are compile-time constants because BPF map sizes are
-// fixed at load time. 1024 × 4 = 4096 u32 counters = 16 KiB; covers
-// any practical pod's flow cardinality with FP rate ~e/width = ~0.27%.
+// fixed at load time. 1024 × 4 = 4096 u32 counters per direction =
+// 16 KiB; covers any practical pod's flow cardinality with FP rate
+// ~e/width = ~0.27%.
 #define CMS_WIDTH 1024
 #define CMS_DEPTH 4
+
+// Direction enum. Userspace must use the same numeric values when
+// keying config_map / bucket_map and indexing stats_map / cms_map.
+enum direction {
+	DIR_INGRESS = 0,
+	DIR_EGRESS  = 1,
+	DIR_MAX     = 2,
+};
 
 // Per-row hash seeds. Distinct primes so rows are independent (in
 // expectation), which is what makes CMS's min estimator work.
@@ -63,7 +79,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, struct natra_config);
-	__uint(max_entries, 1);
+	__uint(max_entries, DIR_MAX);
 } natra_config_map SEC(".maps");
 
 struct token_bucket {
@@ -76,33 +92,37 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, struct token_bucket);
-	__uint(max_entries, 1);
+	__uint(max_entries, DIR_MAX);
 } natra_bucket_map SEC(".maps");
 
-// CMS as a flat array; index = row * CMS_WIDTH + col.
+// CMS as a flat array; index = dir * CMS_WIDTH * CMS_DEPTH +
+// row * CMS_WIDTH + col. Per-direction halves are independent.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
 	__type(value, __u32);
-	__uint(max_entries, CMS_WIDTH * CMS_DEPTH);
+	__uint(max_entries, CMS_WIDTH * CMS_DEPTH * DIR_MAX);
 } natra_cms_map SEC(".maps");
 
+// Stat slots per direction. Total slots = STAT_PER_DIR * DIR_MAX.
+// Userspace key = dir * STAT_PER_DIR + slot.
 enum {
 	STAT_PASSED    = 0,
 	STAT_THROTTLED = 1,
 	STAT_HH_HITS   = 2,
-	STAT_MAX,
+	STAT_PER_DIR,
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, __u32);
 	__type(value, __u64);
-	__uint(max_entries, STAT_MAX);
+	__uint(max_entries, STAT_PER_DIR * DIR_MAX);
 } natra_stats_map SEC(".maps");
 
-static __always_inline void bump_stat(__u32 idx)
+static __always_inline void bump_stat(__u32 dir, __u32 slot)
 {
+	__u32 idx = dir * STAT_PER_DIR + slot;
 	__u64 *v = bpf_map_lookup_elem(&natra_stats_map, &idx);
 	if (v)
 		(*v)++;
@@ -134,16 +154,17 @@ static __always_inline __u32 cms_hash(const struct flow_key *k, __u32 seed)
 	return h;
 }
 
-// Increment all CMS_DEPTH counters and return the post-increment min
-// across rows (CMS estimator).
-static __always_inline __u32 cms_update_and_min(const struct flow_key *k)
+// Increment all CMS_DEPTH counters in `dir`'s half of the array and
+// return the post-increment min across rows (CMS estimator).
+static __always_inline __u32 cms_update_and_min(__u32 dir, const struct flow_key *k)
 {
+	__u32 base = dir * (CMS_WIDTH * CMS_DEPTH);
 	__u32 mn = 0xffffffffu;
 	#pragma unroll
 	for (int row = 0; row < CMS_DEPTH; row++) {
 		__u32 h = cms_hash(k, cms_seeds[row]);
 		__u32 col = h % CMS_WIDTH;
-		__u32 idx = (__u32)row * CMS_WIDTH + col;
+		__u32 idx = base + (__u32)row * CMS_WIDTH + col;
 		__u32 *cell = bpf_map_lookup_elem(&natra_cms_map, &idx);
 		if (!cell)
 			return 0;
@@ -199,14 +220,13 @@ static __always_inline int parse_flow(struct __sk_buff *skb, struct flow_key *ou
 	return 0;
 }
 
-// consume_tokens charges `bytes` against the bucket. Returns 1 if the
-// charge succeeded (caller passes the packet), 0 if the bucket lacks
-// tokens (caller drops). Refill is computed lazily from elapsed time
-// so the lock is held for ~tens of ns per packet.
-static __always_inline int consume_tokens(__u64 bytes, __u64 rate_bps, __u64 burst, __u64 now)
+// consume_tokens charges `bytes` against `dir`'s bucket. Returns 1 if
+// the charge succeeded (caller passes the packet), 0 if the bucket
+// lacks tokens (caller drops). Refill is computed lazily from elapsed
+// time so the lock is held for ~tens of ns per packet.
+static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps, __u64 burst, __u64 now)
 {
-	__u32 zero = 0;
-	struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &zero);
+	struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &dir);
 	if (!tb)
 		return 1;
 
@@ -230,14 +250,13 @@ static __always_inline int consume_tokens(__u64 bytes, __u64 rate_bps, __u64 bur
 	return allowed;
 }
 
-SEC("tc")
-int natra_ratelimit(struct __sk_buff *skb)
+static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 {
-	__u32 zero = 0;
-	struct natra_config *cfg = bpf_map_lookup_elem(&natra_config_map, &zero);
+	struct natra_config *cfg = bpf_map_lookup_elem(&natra_config_map, &dir);
 	if (!cfg || cfg->rate_bps == 0) {
-		// No config → fail-open. Same path as before P1.5.
-		bump_stat(STAT_PASSED);
+		// No config for this direction → fail-open. Same path as
+		// before P1.5.
+		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
 
@@ -245,27 +264,39 @@ int natra_ratelimit(struct __sk_buff *skb)
 	if (parse_flow(skb, &k) < 0) {
 		// Non-IP / truncated. Pass through unaccounted; we only
 		// rate-limit IP traffic.
-		bump_stat(STAT_PASSED);
+		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
 
-	__u32 count = cms_update_and_min(&k);
+	__u32 count = cms_update_and_min(dir, &k);
 	if (count <= cfg->hh_threshold) {
 		// Mouse: fast pass with no lock. Low-volume traffic stays
 		// at line rate even when an elephant exists on the same pod.
-		bump_stat(STAT_PASSED);
+		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
 
 	// Heavy hitter — token bucket gate.
-	bump_stat(STAT_HH_HITS);
+	bump_stat(dir, STAT_HH_HITS);
 	__u64 now = bpf_ktime_get_ns();
-	if (consume_tokens(skb->len, cfg->rate_bps, cfg->burst_bytes, now)) {
-		bump_stat(STAT_PASSED);
+	if (consume_tokens(dir, skb->len, cfg->rate_bps, cfg->burst_bytes, now)) {
+		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
-	bump_stat(STAT_THROTTLED);
+	bump_stat(dir, STAT_THROTTLED);
 	return TC_ACT_SHOT;
+}
+
+SEC("tc")
+int natra_ingress(struct __sk_buff *skb)
+{
+	return natra_classify(skb, DIR_INGRESS);
+}
+
+SEC("tc")
+int natra_egress(struct __sk_buff *skb)
+{
+	return natra_classify(skb, DIR_EGRESS);
 }
 
 char __license[] SEC("license") = "GPL";

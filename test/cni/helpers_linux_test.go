@@ -194,15 +194,25 @@ func remainingPinsFor(containerID string) []string {
 	return out
 }
 
-// linkPinExists reports whether /sys/fs/bpf/natra/<containerID>-<ifName>-link
-// is present. Uses ReadDir + name match because bpffs returns EPERM
-// (not ENOENT) on stat of a non-existent file.
-func linkPinExists(containerID, ifName string) bool {
-	target := containerID + "-" + ifName + "-link"
+// linkPinExists reports whether the pin file for one direction is
+// present at /sys/fs/bpf/natra/<containerID>-<ifName>-<direction>-link.
+// `direction` is "ingress" or "egress" (matches bpf.Direction.String()).
+// Uses ReadDir + name match because bpffs returns EPERM (not ENOENT)
+// on stat of a non-existent file.
+func linkPinExists(containerID, ifName, direction string) bool {
+	target := containerID + "-" + ifName + "-" + direction + "-link"
 	for _, name := range remainingPinsFor(containerID) {
 		if name == target {
 			return true
 		}
 	}
 	return false
+}
+
+// anyLinkPinExists reports whether either direction's pin file is
+// present for this container. Useful for the "neither annotation"
+// negative test where we assert no BPF was attached at all.
+func anyLinkPinExists(containerID, ifName string) bool {
+	return linkPinExists(containerID, ifName, "ingress") ||
+		linkPinExists(containerID, ifName, "egress")
 }

@@ -6,15 +6,35 @@
 
 package bpf
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
-// AttachMode mirrors the Linux build's enum.
 type AttachMode int
 
 const (
 	AttachTCX AttachMode = iota
 	AttachClsactPodside
 )
+
+type Direction uint32
+
+const (
+	DirectionIngress Direction = 0
+	DirectionEgress  Direction = 1
+)
+
+func (d Direction) String() string {
+	switch d {
+	case DirectionIngress:
+		return "ingress"
+	case DirectionEgress:
+		return "egress"
+	default:
+		return fmt.Sprintf("direction(%d)", uint32(d))
+	}
+}
 
 type Config struct {
 	RateBps     uint64
@@ -33,14 +53,20 @@ const (
 	StatPassed    uint32 = 0
 	StatThrottled uint32 = 1
 	StatHHHits    uint32 = 2
+	StatPerDir    uint32 = 3
 )
+
+func StatKey(dir Direction, slot uint32) uint32 {
+	return uint32(dir)*StatPerDir + slot
+}
 
 type Program struct{}
 
 var errNotLinux = errors.New("pkg/bpf: BPF requires Linux; the natra binary is Linux-only")
 
 func Load() (*Program, error)                                { return nil, errNotLinux }
-func (*Program) Configure(Config) error                      { return errNotLinux }
+func (*Program) Configure(Direction, Config) error           { return errNotLinux }
 func (*Program) AttachIngress(int, AttachMode, string) error { return errNotLinux }
+func (*Program) AttachEgress(int, AttachMode, string) error  { return errNotLinux }
 func (*Program) PinMaps(string, string) error                { return errNotLinux }
 func (*Program) Close() error                                { return nil }

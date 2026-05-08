@@ -1,8 +1,13 @@
-// Package config parses the kubernetes.io/ingress-bandwidth pod
-// annotation. Two forms are accepted:
+// Package config parses the bandwidth pod annotations. Two forms are
+// accepted:
 //
 //   - Simple:   "10M"   →  Rate=10_000_000 Burst=20_000_000
 //   - Extended: {"rate":"10M","burst":"15M","heavyHitterThreshold":50}
+//
+// The parser is direction-agnostic — the caller picks the annotation
+// key (`kubernetes.io/ingress-bandwidth` or
+// `kubernetes.io/egress-bandwidth`) and passes the value through. Each
+// direction has its own annotation; they're parsed independently.
 //
 // Pure parsing, no BPF or kernel dependencies — also the target of
 // the Layer 1 fuzz suite.
@@ -43,10 +48,12 @@ func DefaultConfig() *Config {
 	}
 }
 
-// ParseBandwidthAnnotation parses the kubernetes.io/ingress-bandwidth
-// annotation. Empty input returns DefaultConfig. JSON shapes (any
-// leading whitespace then `{`) go through parseJSONConfig; everything
-// else is treated as a simple "10M"-style value.
+// ParseBandwidthAnnotation parses one bandwidth annotation value
+// (either kubernetes.io/ingress-bandwidth or
+// kubernetes.io/egress-bandwidth — same format both ways). Empty input
+// returns DefaultConfig. JSON shapes (any leading whitespace then `{`)
+// go through parseJSONConfig; everything else is treated as a simple
+// "10M"-style value.
 func ParseBandwidthAnnotation(annotation string) (*Config, error) {
 	if annotation == "" {
 		return DefaultConfig(), nil
