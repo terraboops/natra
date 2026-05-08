@@ -36,10 +36,7 @@ spec:
           # veths. Empty (default) → tcx, the recommended path on
           # kernel 6.6+ — composes via bpf_mprog with other pod-side
           # BPF (cilium-agent, aws-network-policy-agent). Set to
-          # "clsact-podside" for older kernels or environments where
-          # tcx-link pinning fails (some Docker Desktop / colima
-          # kernel builds return EPERM on BPF_OBJ_PIN of TCX links —
-          # see TODO_LINUX.md).
+          # "clsact-podside" for older kernels.
           env:
             - name: NATRA_ATTACH_MODE
               value: ""

@@ -29,8 +29,14 @@ const pinDir = "/sys/fs/bpf/natra"
 // container's interface. Two pods with the same name on different
 // nodes get different paths because containerID is unique per kubelet
 // pod sandbox.
+//
+// Bpffs forbids dots in pin file names (kernel/bpf/inode.c::bpf_lookup
+// returns EPERM on any name containing '.' when the parent dir has
+// any S_IALLUGO bits — those names are reserved for kernel-internal
+// special files created by populate_bpffs). So no `.link` extension;
+// we use a `-link` suffix instead.
 func pinPathFor(containerID, ifName string) string {
-	return filepath.Join(pinDir, containerID+"-"+ifName+".link")
+	return filepath.Join(pinDir, containerID+"-"+ifName+"-link")
 }
 
 var (
@@ -43,19 +49,10 @@ var (
 // types.NetConf for cniVersion / name / type / prevResult.
 //
 // RuntimeConfig.Bandwidth is what kubelet populates when the conflist
-// declares `capabilities.bandwidth: true` — kubelet reads the
-// kubernetes.io/{ingress,egress}-bandwidth annotations, parses them
-// into bytes/sec, and forwards them here. Rate=0 means no limit.
-//
-// PodAnnotations is the older path where the raw annotation string is
-// passed through under runtimeConfig. Some setups still use it; if
-// both channels are present we prefer Bandwidth because it's what
-// kubelet actually populates today.
-//
-// AttachMode is a top-level natra-specific field on the conflist
-// entry. Empty defaults to "tcx". The other accepted value is
-// "clsact-podside", an opt-in fallback for kernels that don't support
-// tcx — see pkg/bpf/loader.go for tradeoffs.
+// declares `capabilities.bandwidth: true`. PodAnnotations is the
+// older direct path; if both channels are present, Bandwidth wins.
+// AttachMode is the top-level natra-specific knob: empty (default)
+// → tcx; "clsact-podside" → opt-in fallback.
 type NetConf struct {
 	types.NetConf
 	AttachMode    string `json:"attachMode,omitempty"`
@@ -85,12 +82,11 @@ func resolveAttachMode(s string) (bpf.AttachMode, error) {
 }
 
 func main() {
-	// natra is normally invoked by kubelet via the CNI ABI (no CLI args,
-	// uses stdin + env vars). The exception is `install-cni-chain`,
-	// which the DaemonSet's install container calls to patch existing
-	// CNI conflists to include natra. Keeping it in-binary avoids a
-	// second image / extra dependencies (jq, awk, etc.) that have
-	// historically been fragile.
+	// natra is normally invoked by kubelet via the CNI ABI (no CLI
+	// args; stdin + env vars). The exceptions are subcommands the
+	// DaemonSet uses: `install-cni-chain` patches existing conflists
+	// to chain natra in, and `dump-stats` reads the pinned maps for
+	// a given containerID.
 	if len(os.Args) > 1 && os.Args[1] == "install-cni-chain" {
 		if err := installCNIChain(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -198,10 +194,10 @@ func logCaps() {
 // cmdDel cleans up the bpffs pins for this container. Two kinds of pins
 // can exist:
 //
-//   - The tcx-link pin (<containerID>-<ifName>.link). Removing it drops
+//   - The tcx-link pin (<containerID>-<ifName>-link). Removing it drops
 //     the kernel's last reference to the link, which detaches the BPF
 //     program from the pod-side veth. Only present in AttachTCX mode.
-//   - The per-container map pins (<containerID>-{config,bucket,stats,cms}.map).
+//   - The per-container map pins (<containerID>-{config,bucket,stats,cms}-map).
 //     Useful for the dump-stats subcommand. Both attach modes write these.
 //
 // Walks the pin dir once and removes everything with the container's

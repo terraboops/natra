@@ -194,11 +194,11 @@ func remainingPinsFor(containerID string) []string {
 	return out
 }
 
-// linkPinExists reports whether /sys/fs/bpf/natra/<containerID>-<ifName>.link
+// linkPinExists reports whether /sys/fs/bpf/natra/<containerID>-<ifName>-link
 // is present. Uses ReadDir + name match because bpffs returns EPERM
 // (not ENOENT) on stat of a non-existent file.
 func linkPinExists(containerID, ifName string) bool {
-	target := containerID + "-" + ifName + ".link"
+	target := containerID + "-" + ifName + "-link"
 	for _, name := range remainingPinsFor(containerID) {
 		if name == target {
 			return true

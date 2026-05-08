@@ -32,7 +32,7 @@ func dumpStats(args []string) error {
 	}
 
 	open := func(name string) (*ebpf.Map, error) {
-		path := filepath.Join(pinDir, containerID+"-"+name+".map")
+		path := filepath.Join(pinDir, containerID+"-"+name+"-map")
 		return ebpf.LoadPinnedMap(path, nil)
 	}
 

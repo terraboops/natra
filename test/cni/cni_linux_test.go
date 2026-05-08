@@ -14,7 +14,6 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
-	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -107,19 +106,15 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 		})
 
-		// tcx is the production default. On colima's 6.8 aarch64 kernel
-		// (and kind nodes running on it), BPF_OBJ_PIN of a TCX_INGRESS
-		// link returns EPERM despite full caps + bpffs mounted + no
-		// LSM. We haven't isolated the cause; programs and maps pin
-		// fine via the same path. On runners with a different kernel
-		// build (Github Actions ubuntu-latest, real EKS) tcx pin
-		// works. So this test asserts either branch:
-		//   - pin succeeds → full happy path, link pin appears, DEL
-		//     cleans up
-		//   - pin fails with EPERM → fail-open path engages (program
-		//     attaches but doesn't persist), and stderr says so.
-		// Tracked as a known issue in TODO_LINUX.md.
-		It("default mode tries tcx; either succeeds or fail-opens cleanly", func() {
+		// tcx is the production default. The pin filename uses a
+		// dotless suffix ("-link") because bpffs's bpf_lookup rejects
+		// any path component containing a '.' on user-mounted
+		// subdirectories (kernel/bpf/inode.c) — those names are
+		// reserved for populate_bpffs's internal special files. An
+		// earlier revision used `<id>-eth0.link` and got EPERM on
+		// every Pin call; same shape applies to map pins (`-map`
+		// suffix). Test asserts the happy path end-to-end.
+		It("default mode attaches via tcx and pins the link to bpffs", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
@@ -144,26 +139,17 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			GinkgoWriter.Printf("default-tcx test stderr:\n%s\n", string(stderr))
-			if strings.Contains(string(stderr), "attached to eth0") {
-				By("happy path: tcx pin worked, link pin should exist")
-				Expect(linkPinExists(containerID, "eth0")).To(BeTrue(),
-					"tcx attached but no link pin found")
+			Expect(string(stderr)).To(ContainSubstring("attached to eth0"))
+			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
+			Expect(linkPinExists(containerID, "eth0")).To(BeTrue(),
+				"tcx attached but no link pin found")
 
-				_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
-				Expect(delErr).NotTo(HaveOccurred(), "stderr: %s", string(delStderr))
-				Expect(linkPinExists(containerID, "eth0")).To(BeFalse(),
-					"link pin should be gone after DEL")
-				Expect(remainingPinsFor(containerID)).To(BeEmpty(),
-					"all per-container pins should be cleaned up by DEL")
-			} else {
-				By("colima kernel quirk: pin EPERM; fail-open engaged")
-				Expect(string(stderr)).To(ContainSubstring("BPF attach failed"))
-				Expect(string(stderr)).To(ContainSubstring("operation not permitted"))
-				Expect(string(stderr)).To(ContainSubstring("passing through unrate-limited"))
-				Expect(linkPinExists(containerID, "eth0")).To(BeFalse(),
-					"no link pin should exist when pin failed")
-			}
+			_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
+			Expect(delErr).NotTo(HaveOccurred(), "stderr: %s", string(delStderr))
+			Expect(linkPinExists(containerID, "eth0")).To(BeFalse(),
+				"link pin should be gone after DEL")
+			Expect(remainingPinsFor(containerID)).To(BeEmpty(),
+				"all per-container pins should be cleaned up by DEL")
 		})
 
 		It("attaches via clsact-podside fallback when explicitly requested", func() {
@@ -188,7 +174,6 @@ var _ = Describe("natra CNI binary", func() {
 			stdout, stderr, runErr := runPlugin(natra, "ADD", containerID, netnsPath(ns), "eth0", stdin)
 			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
 
-			GinkgoWriter.Printf("clsact-podside test stderr:\n%s\n", string(stderr))
 			Expect(string(stderr)).To(ContainSubstring("attached to eth0"))
 			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
 

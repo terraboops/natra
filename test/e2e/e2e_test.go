@@ -74,17 +74,10 @@ var _ = BeforeSuite(func() {
 
 	By("installing natra DaemonSet (with overridden image)")
 	// NATRA_E2E_ATTACH_MODE picks the attach path the test rig
-	// exercises. Default is "clsact-podside" because some
-	// Docker-Desktop / colima kernels return EPERM on BPF_OBJ_PIN of
-	// TCX_INGRESS links, which would make the L4 throughput assertion
-	// fail-open and the test useless. CI runners with a stock Ubuntu
-	// kernel can set NATRA_E2E_ATTACH_MODE=tcx to exercise the
-	// production default.
+	// exercises. Default is "tcx" (production default). Set
+	// "clsact-podside" to exercise the fallback explicitly.
 	attachMode := os.Getenv("NATRA_E2E_ATTACH_MODE")
-	if attachMode == "" {
-		attachMode = "clsact-podside"
-	}
-	if attachMode == "tcx" {
+	if attachMode == "" || attachMode == "tcx" {
 		attachMode = "" // empty in the manifest = tcx default
 	}
 	mustExec("bash", "-c",

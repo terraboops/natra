@@ -92,12 +92,9 @@ kind create cluster --name "$NATRA_CLUSTER" \
 kind load docker-image "$NATRA_IMAGE" --name "$NATRA_CLUSTER"
 
 kubectl apply -f "$TMPDIR/natra/namespace.yaml"
-# NATRA_ATTACH_MODE on the install init container picks the attach
-# path. Default empty (tcx) fails on colima 6.8 (BPF_OBJ_PIN of TCX
-# links returns EPERM); set to clsact-podside for the local rig so
-# natra actually rate-limits. Override with NATRA_PERF_ATTACH_MODE=tcx
-# on a runner where tcx pin works.
-ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-clsact-podside}"
+# NATRA_PERF_ATTACH_MODE picks the attach path. Default is tcx
+# (production default). Set clsact-podside to exercise the fallback.
+ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
 if [ "$ATTACH_MODE" = "tcx" ]; then ATTACH_MODE=""; fi
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \

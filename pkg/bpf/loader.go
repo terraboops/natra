@@ -151,8 +151,14 @@ func (p *Program) Configure(cfg Config) error {
 	return nil
 }
 
-// PinMaps pins the program's maps under `dir`/<containerID>-<map>.map so
-// `natra dump-stats` can read them out-of-band. Best-effort.
+// PinMaps pins the program's maps under `dir`/<containerID>-<name>-map
+// so `natra dump-stats` can read them out-of-band. Best-effort.
+//
+// No `.map` extension: bpffs forbids dots in pin file names —
+// kernel/bpf/inode.c::bpf_lookup returns EPERM on any path component
+// containing `.` when the parent dir has any S_IALLUGO bit set, since
+// those names are reserved for populate_bpffs's internal special
+// files.
 func (p *Program) PinMaps(dir, containerID string) error {
 	if dir == "" || containerID == "" {
 		return nil
@@ -166,7 +172,7 @@ func (p *Program) PinMaps(dir, containerID string) error {
 		if m == nil {
 			continue
 		}
-		path := dir + "/" + containerID + "-" + name + ".map"
+		path := dir + "/" + containerID + "-" + name + "-map"
 		if err := m.Pin(path); err != nil {
 			return fmt.Errorf("pin %s: %w", path, err)
 		}
