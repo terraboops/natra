@@ -210,7 +210,7 @@ spec:
           effect: NoSchedule
       containers:
         - name: goldpinger
-          image: docker.io/bloomberg/goldpinger:v3.10.1
+          image: docker.io/bloomberg/goldpinger:3.11.2
           env:
             - name: HOST
               value: "0.0.0.0"
@@ -238,7 +238,14 @@ spec:
     - port: 80
       targetPort: 80
 EOF
-    kubectl -n default rollout status daemonset/goldpinger --timeout=120s
+    # Best-effort: if goldpinger doesn't come up in time (slow image
+    # pull, k3s networking quirks on this host), continue anyway —
+    # the soak loop's primary signals are iperf/hey numbers, not the
+    # goldpinger scrape. Failed scrapes just record 0 in the
+    # gp_* metrics columns.
+    if ! kubectl -n default rollout status daemonset/goldpinger --timeout=180s; then
+        log_event "bootstrap: goldpinger rollout timed out; continuing best-effort"
+    fi
 
     kubectl create namespace "$NS"
 
