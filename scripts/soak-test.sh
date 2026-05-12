@@ -501,8 +501,24 @@ snapshot_loop() {
         # Single-shot natra profile: -interval longer than we wait
         # so it only writes one snapshot, then we kill it.
         docker exec "$worker" mkdir -p /var/log/natra-soak 2>/dev/null || true
+        # natra binary path differs by CNI base. The installer writes
+        # to /opt/cni/bin on kind/EKS-shaped clusters, but k3s puts
+        # its CNI plugins under /var/lib/rancher/k3s/data/cni. Probe
+        # for whichever exists on this worker before invoking
+        # natra profile.
+        local natra_bin
+        natra_bin=$(docker exec "$worker" sh -c '
+            for p in /opt/cni/bin/natra /var/lib/rancher/k3s/data/cni/natra; do
+                if [ -x "$p" ]; then echo "$p"; exit 0; fi
+            done
+            exit 1
+        ' 2>/dev/null || echo "")
+        if [ -z "$natra_bin" ]; then
+            log_event "snapshot[$idx]: natra binary not found on $worker, skipping"
+            continue
+        fi
         docker exec "$worker" sh -c "
-            setsid nohup /opt/cni/bin/natra profile \
+            setsid nohup ${natra_bin} profile \
                 -interval 10s \
                 -output /var/log/natra-soak/snapshots-${idx}.jsonl \
                 -heap-dir /var/log/natra-soak/heap-${idx} \
