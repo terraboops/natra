@@ -93,6 +93,7 @@ func profileCmd(args []string) error {
 	output := fs.String("output", "", "JSONL output file (default stdout)")
 	heapDir := fs.String("heap-dir", "", "if set, write a heap pprof of this process per tick")
 	pinPath := fs.String("pin-dir", pinDir, "bpffs directory where natra pins maps")
+	once := fs.Bool("once", false, "take a single snapshot and exit (foreground use; soak rig)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -138,6 +139,10 @@ func profileCmd(args []string) error {
 			writeHeapProfile(*heapDir, tickNum)
 		}
 		tickNum++
+
+		if *once {
+			return nil
+		}
 
 		select {
 		case <-ctx.Done():

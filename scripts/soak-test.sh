@@ -504,8 +504,7 @@ snapshot_loop() {
         # natra binary path differs by CNI base. The installer writes
         # to /opt/cni/bin on kind/EKS-shaped clusters, but k3s puts
         # its CNI plugins under /var/lib/rancher/k3s/data/cni. Probe
-        # for whichever exists on this worker before invoking
-        # natra profile.
+        # for whichever exists on this worker.
         local natra_bin
         natra_bin=$(docker exec "$worker" sh -c '
             for p in /opt/cni/bin/natra /var/lib/rancher/k3s/data/cni/natra; do
@@ -517,23 +516,25 @@ snapshot_loop() {
             log_event "snapshot[$idx]: natra binary not found on $worker, skipping"
             continue
         fi
-        docker exec "$worker" sh -c "
-            setsid nohup ${natra_bin} profile \
-                -interval 10s \
-                -output /var/log/natra-soak/snapshots-${idx}.jsonl \
-                -heap-dir /var/log/natra-soak/heap-${idx} \
-                </dev/null >/dev/null 2>&1 &
-            echo \$! > /var/log/natra-soak/profile.pid
-        " || true
-        sleep 12  # let it write one snapshot
-        docker exec "$worker" sh -c '
-            kill $(cat /var/log/natra-soak/profile.pid) 2>/dev/null || true
-        ' || true
-        # Copy out the snapshot and the heap dir contents.
+        # `natra profile -once` takes a single snapshot and exits —
+        # avoids needing setsid/nohup/background-with-pid-file
+        # orchestration. k3d node containers are minimal alpine and
+        # don't have setsid; the prior background+SIGTERM dance
+        # silently failed and left no artifacts. Foreground run
+        # blocks until the snapshot is on disk, then docker cp
+        # always finds the file.
+        docker exec "$worker" "$natra_bin" profile \
+            -once \
+            -output "/var/log/natra-soak/snapshots-${idx}.jsonl" \
+            -heap-dir "/var/log/natra-soak/heap-${idx}" \
+            2>>"$OUTPUT_DIR/events.log" || \
+            log_event "snapshot[$idx]: natra profile -once failed on $worker"
         docker cp "$worker:/var/log/natra-soak/snapshots-${idx}.jsonl" \
-            "$OUTPUT_DIR/bpf/" 2>/dev/null || true
+            "$OUTPUT_DIR/bpf/" 2>/dev/null || \
+            log_event "snapshot[$idx]: docker cp snapshots failed"
         docker cp "$worker:/var/log/natra-soak/heap-${idx}" \
-            "$OUTPUT_DIR/heap/" 2>/dev/null || true
+            "$OUTPUT_DIR/heap/" 2>/dev/null || \
+            log_event "snapshot[$idx]: docker cp heap failed"
     done
 }
 
