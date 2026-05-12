@@ -6,8 +6,9 @@
 // Stage 1 (Count-Min Sketch): every packet's 5-tuple flow key is
 // hashed CMS_DEPTH times, each into one column of CMS_WIDTH. The min
 // across rows is the per-flow count estimator. Constant memory
-// (CMS_WIDTH * CMS_DEPTH * DIR_MAX = 8192 u32 counters) regardless of
-// how many distinct flows the pod sees.
+// (CMS_WIDTH * CMS_DEPTH * DIR_MAX = 32768 cells = 256 KiB per pod
+// at the 8-byte cell layout) regardless of how many distinct flows
+// the pod sees.
 //
 // Stage 2 (token bucket): only flows whose CMS estimate exceeds
 // `hh_threshold` go through the bucket. Mice flows take the fast
@@ -46,10 +47,23 @@
 #include <bpf/bpf_endian.h>
 
 // CMS dimensions are compile-time constants because BPF map sizes are
-// fixed at load time. 1024 × 4 = 4096 u32 counters per direction =
-// 16 KiB; covers any practical pod's flow cardinality with FP rate
-// ~e/width = ~0.27%.
-#define CMS_WIDTH 1024
+// fixed at load time. 4096 × 4 = 16384 cells per direction; covers
+// 30K-flow workloads (an iperf3 --bidir + 1000 hey RPS over 30s
+// generates ~30K distinct 5-tuples) without saturating, where the
+// previous 1024 × 4 saturated within seconds and started false-
+// positive-classifying mice as heavy from hash-collision residue.
+//
+// Profile data from the perf-vs-vanilla mixed workload showed every
+// cell of the old 4096-cell layout was nonzero by end-of-test, and
+// natra's iperf throughput sat at ~8 Mbps (under the 10 Mbps cap)
+// because hey traffic was hitting the bucket instead of fast-passing.
+// 4× wider drops the collision rate ~4× and lets the fast pass do
+// its job under realistic load.
+//
+// Cost: 4× CMS memory. Cell is 8 bytes (count + last_decay_idx),
+// so per pod: 4096 × 4 × 2 × 8 = 256 KiB. At 100 pods/node that's
+// 25 MiB — negligible.
+#define CMS_WIDTH 4096
 #define CMS_DEPTH 4
 
 // Direction enum. Userspace must use the same numeric values when

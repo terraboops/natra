@@ -56,6 +56,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# preserve_artifacts copies the profile-natra/ directory out of TMPDIR
+# to NATRA_PERF_ARTIFACT_DIR (if set) before the trap nukes TMPDIR.
+# Useful for iterative analysis where you want pprof / JSONL to outlive
+# the script.
+preserve_artifacts() {
+    if [ -n "${NATRA_PERF_ARTIFACT_DIR:-}" ] && [ -d "$TMPDIR/profile-natra" ]; then
+        mkdir -p "$NATRA_PERF_ARTIFACT_DIR"
+        cp -a "$TMPDIR/profile-natra" "$NATRA_PERF_ARTIFACT_DIR/profile-natra-$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "==> preserved profile artifacts to $NATRA_PERF_ARTIFACT_DIR" >&2
+    fi
+}
+
 require() {
     command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }
 }
@@ -347,6 +359,7 @@ stop_profile_collector() {
         "$profile_dir/profile.log" || true
     echo "==> profile artifacts: $profile_dir" >&2
     summarize_profile "$profile_dir/snapshots.jsonl"
+    preserve_artifacts
 }
 
 # summarize_profile prints first/last snapshot deltas — most useful
@@ -364,8 +377,11 @@ summarize_profile() {
     n=$(wc -l < "$jsonl" | tr -d ' ')
     echo "==> profile: $n snapshots" >&2
     jq -s '
+        # Strip nanosecond fraction before parsing — fromdateiso8601
+        # only handles ISO 8601 without fractional seconds.
+        def parse_t: sub("\\.[0-9]+Z"; "Z") | fromdateiso8601;
         {
-            duration_s: ((.[-1].time | fromdateiso8601) - (.[0].time | fromdateiso8601)),
+            duration_s: ((.[-1].time | parse_t) - (.[0].time | parse_t)),
             programs: (
                 [.[0].programs[], .[-1].programs[]]
                 | group_by(.id)
