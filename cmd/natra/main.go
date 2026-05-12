@@ -367,7 +367,7 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 				// didn't (heuristically: value matches the library's
 				// compiled-in default). Explicit per-pod values win.
 				if conf.Defaults != nil {
-					if conf.Defaults.HHThreshold > 0 && parsed.HeavyHitterThreshold == 10 {
+					if conf.Defaults.HHThreshold > 0 && parsed.HeavyHitterThreshold == config.DefaultConfig().HeavyHitterThreshold {
 						parsed.HeavyHitterThreshold = conf.Defaults.HHThreshold
 					}
 					if conf.Defaults.BurstRatio > 0 && parsed.Burst == parsed.Rate*2 {

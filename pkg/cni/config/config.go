@@ -37,14 +37,30 @@ type Config struct {
 // DefaultConfig returns the zero-rate baseline. Callers overwrite
 // Rate (and optionally Burst) from the parsed annotation.
 //
-// HeavyHitterThreshold defaults to 10 because GRO superpackets at the
-// BPF layer can be 30+ TCP segments each, so a 1000-packet threshold
-// lets ~27 MB through per flow before throttling kicks in. 10 catches
-// real elephants within a few skbs while leaving mice (DNS, brief
-// HTTP) untouched.
+// HeavyHitterThreshold defaults to 50. The threshold has to clear
+// not just a single flow's packet count but the noise floor of CMS
+// hash collisions — every cell accumulates fragments of every
+// flow that hashes to it. Profile data from realistic mixed-workload
+// traffic (~45K distinct flows in 30s) showed nonzero cells settling
+// at a mean of ~20 increments each; with threshold 10, most cells
+// trigger "heavy" by mid-test, and mice get false-positive classified
+// as heavy on their first packet.
+//
+// 50 stays above the typical collision-noise floor while remaining
+// well below what a real elephant flow accumulates (~5000 cell-hits
+// in the same workload). GRO superpackets at the BPF layer can be
+// 5-30 TCP segments each, so 50 skbs corresponds to 250-1500 actual
+// packets — about 3ms of line-rate traffic at 1Gbps. Real elephants
+// cross that in their first burst; mice (a few skbs per HTTP
+// request) stay well under.
+//
+// Tunable per-pod via the extended JSON annotation form's
+// `heavyHitterThreshold` field, or cluster-wide via the conflist
+// `defaults.hhThreshold` written by the installer from
+// NATRA_DEFAULT_HH_THRESHOLD.
 func DefaultConfig() *Config {
 	return &Config{
-		HeavyHitterThreshold: 10,
+		HeavyHitterThreshold: 50,
 	}
 }
 
