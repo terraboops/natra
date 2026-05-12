@@ -1,0 +1,14 @@
+# Perf-test client: iperf3 (elephant generator) + hey (HTTP mice generator)
+# in one image. Used only by scripts/perf-vs-vanilla.sh to drive the
+# mixed-workload phase that exercises natra's CMS fast-pass against
+# vanilla HTB's flow-agnostic bucket.
+#
+# Multi-stage so the final image stays small and contains no Go
+# toolchain — just the two static binaries plus iperf3 from alpine.
+FROM golang:1.25-alpine AS build
+RUN go install github.com/rakyll/hey@latest
+
+FROM alpine:3.19
+RUN apk add --no-cache iperf3
+COPY --from=build /go/bin/hey /usr/local/bin/hey
+CMD ["sleep", "infinity"]

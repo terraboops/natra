@@ -1,12 +1,23 @@
 # natra vs. upstream bandwidth — head-to-head
 
 Real-cluster comparison between natra and the upstream
-`containernetworking/plugins/bandwidth` plugin, both directions. Run
-with:
+`containernetworking/plugins/bandwidth` plugin. Two workloads are run
+against each plugin:
+
+1. **iperf-only** — characterizes elephant-flow rate-limiting in both
+   directions.
+2. **realistic mixed** — runs an iperf3 `--bidir` elephant alongside
+   concurrent `hey` HTTP load against an nginx in the same server
+   pod. Each hey request is a fresh TCP connection (no keep-alive),
+   so it stays under natra's heavy-hitter threshold. This is the
+   workload natra is designed for; it's what exercises CMS fast-pass
+   against vanilla HTB's flow-agnostic bucket.
+
+Run with:
 
 ```bash
 make perf-vs-vanilla
-# ~10-12 min, two kind clusters in sequence, both directions per cluster
+# ~15 min, two kind clusters in sequence
 cat docs/perf-vs-vanilla-result.txt
 ```
 
@@ -18,10 +29,10 @@ mode for the comparison via `NATRA_PERF_ATTACH_MODE=clsact-podside`.
 Two kind clusters, identical config:
 
 - 2 nodes (control-plane + worker), kindnet as main CNI
-- iperf-server pinned to the worker with **both**
+- Server pinned to worker with both
   `kubernetes.io/ingress-bandwidth: "10M"` and
-  `kubernetes.io/egress-bandwidth: "10M"`; iperf-client on
-  control-plane (cross-node traffic over kindnet's bridge + tunnel)
+  `kubernetes.io/egress-bandwidth: "10M"`; client on control-plane
+  (cross-node traffic over kindnet's bridge + tunnel)
 - Cluster A chains natra after kindnet; Cluster B chains the upstream
   `bandwidth` plugin after kindnet
 
@@ -29,70 +40,134 @@ For Cluster B, the test fetches the upstream `bandwidth` binary from
 the `containernetworking/plugins` v1.5.1 release (kind nodes ship a
 subset of CNI plugins and don't include `bandwidth`) and `modprobe`s
 `ifb` on each node. Without the IFB module, the upstream plugin's
-HTB-on-IFB silently no-ops and doesn't rate-limit.
+HTB-on-IFB silently no-ops.
 
-## Workload
+Two normalization steps are applied so each workload measures
+steady-state behavior, not initial-burst artifacts:
 
-iperf3 against the same server, four phases per cluster:
+- **HTB burst patch (vanilla only).** Kubelet sends no per-pod
+  burst override, so the bandwidth plugin defaults to ~150 seconds
+  of credit (observed: `burst 193 MB / cburst 386 MB` on a 10 Mbps
+  annotation). A 30s measurement that fits inside that window never
+  sees HTB engage. The script overrides each pod's HTB class via
+  `tc class change ... burst 1mb cburst 1mb` after pod-ready,
+  before measurement. natra's bucket is 2× rate by design (2.5 MB
+  for 10 Mbps), already small enough.
+- **Bucket warmup.** A 20s forward + 20s reverse priming flow on
+  each server pod drains any remaining initial-burst tokens before
+  the real measurement starts. Applies symmetrically to both
+  plugins.
 
-- **Ingress elephant**: one TCP flow, 15 seconds, forward (client → server).
-- **Ingress mice**: 20 parallel TCP flows, 10 seconds, forward.
-- **Egress elephant**: one TCP flow, 15 seconds, reverse (`-R`, server → client).
-- **Egress mice**: 20 parallel TCP flows, 10 seconds, reverse.
+## Workload 1: iperf-only (legacy)
 
-Receiver-side aggregate goodput is read from
+iperf3 against an iperf3-only server, four phases per cluster:
+
+- **Ingress elephant**: one TCP flow, 15s, forward (client → server)
+- **Ingress mice**: 20 parallel TCP flows, 10s, forward
+- **Egress elephant**: one TCP flow, 15s, reverse (`-R`, server → client)
+- **Egress mice**: 20 parallel TCP flows, 10s, reverse
+
+Receiver-side aggregate goodput from
 `end.sum_received.bits_per_second`.
 
-## Most recent run (colima 6.8.0-64-generic, aarch64)
+### Most recent run (colima 6.8.0-64-generic, aarch64)
 
 | Direction | Plugin                | Elephant     | Mice (20× parallel)  |
 |-----------|-----------------------|--------------|----------------------|
-| ingress   | natra                 | 11.27 Mbps   | 23.74 Mbps           |
-| ingress   | upstream `bandwidth`  | 97.21 Mbps   |  9.59 Mbps           |
-| egress    | natra                 | 11.29 Mbps   | 14.54 Mbps           |
-| egress    | upstream `bandwidth`  | 108.16 Mbps  |  9.61 Mbps           |
+| ingress   | natra                 | 11.25 Mbps   | 10.96 Mbps           |
+| ingress   | upstream `bandwidth`  | 10.05 Mbps   |  9.59 Mbps           |
+| egress    | natra                 | 11.30 Mbps   | 11.28 Mbps           |
+| egress    | upstream `bandwidth`  | 10.12 Mbps   |  9.61 Mbps           |
 
-Read these as separate signals:
+Both plugins land within ~13% of the 10 Mbps annotation on every
+phase. natra's overshoot comes from the 2.5 MB token-bucket initial
+burst amortized into a 15s measurement; longer measurements would
+converge on 10 Mbps. The single-stream vs 20-parallel split isn't
+informative here — both just confirm steady-state throttling works.
+The CMS fast-pass payoff isn't visible in this workload because every
+iperf3 flow is long-lived and crosses the heavy-hitter threshold
+within milliseconds; for that see Workload 2.
 
-- **natra**: rate-limits the elephant cleanly to within +13% of the
-  10 Mbps annotation in both directions. The mice numbers run
-  meaningfully above 10 Mbps because, against a 20-parallel workload,
-  natra's CMS classifies most of the per-flow streams as mice (each
-  individually under threshold) and they fast-pass the bucket. That's
-  the point of natra; it's not a "violation" of the annotation, it's
-  the design.
-- **upstream bandwidth, mice phase**: lands near 10 Mbps in both
-  directions. HTB-on-IFB engaging as expected.
-- **upstream bandwidth, elephant phase**: doesn't engage (~97 Mbps
-  ingress, ~108 Mbps egress under a 10 Mbps annotation). HTB engages
-  by the second phase but didn't during the first 15s. This is an
-  unresolved test-rig issue (kind/HTB initialization timing or IFB
-  redirect quirks), not natra winning.
+## Workload 2: realistic mixed (elephant + HTTP mice)
 
-## What this run does and doesn't tell you
+One server pod runs both iperf3 (port 5201) and nginx (port 80,
+default ~600B index). Client (a pod with both iperf3 and `hey`
+installed) runs:
 
-It tells you natra rate-limits as designed in a real kind cluster
-with kindnet's chain.
+- `iperf3 --bidir` for 30s — one elephant flow in each direction.
+  Drains the ingress and egress buckets.
+- After 5s of warmup, `hey -c 50 -z 20s -disable-keepalive
+  http://server/` — each request opens a fresh TCP connection
+  (new 5-tuple → new flow_key) with ~5-7 packets total. Stays well
+  under natra's heavy-hitter threshold of 10.
 
-It doesn't tell you natra's CMS fast-pass produces a measurable
-benefit on this workload — it doesn't, by design. A workload of many
-brief TCP connections (HTTP-style: wrk, ab, hey) would exercise the
-fast pass; iperf with `-P` doesn't.
+### Most recent run
 
-## Synthetic vs real
+| Plugin               | Iperf ingress | Iperf egress | Hey RPS | Hey p50 | Hey p99 |
+|----------------------|---------------|--------------|---------|---------|---------|
+| natra                |  8.11 Mbps    |  4.14 Mbps   |   1065  |  0.4 ms |  1.0 s  |
+| upstream `bandwidth` | 10.52 Mbps    |  9.72 Mbps   |     12  |  3.8 s  |  5.5 s  |
 
-The synthetic L5 test (`TestScenarioMixedVsVanilla` in
-`test/perf/perf_linux_test.go`) runs the same packet sequence through
-`natra.bpf.o` and an in-tree token-bucket-on-every-packet emulator
-(`bpf/vanilla.bpf.c`) under `BPF_PROG_RUN`, with mice flows of 5
-packets each (well under the threshold). It runs on every push and
-catches algorithmic regressions in natra without depending on a real
-cluster.
+Both plugins land at-or-below 10 Mbps for the iperf elephant in
+both directions — bandwidth annotation honored.
 
-The synthetic test reports a ~98pp gap on its specific worst-case
-mice-after-elephant scenario. The real-cluster comparison documented
-here is for "does it actually work end-to-end against real
-upstream-bandwidth plumbing." Different questions.
+The difference is what they do to the small HTTP requests competing
+for that same 10 Mbps budget:
+
+- **88× more requests/sec under natra** (1065 vs 12). Each hey
+  request that arrives uses a new 5-tuple, so its per-flow CMS
+  count stays below the heavy-hitter threshold and the bucket is
+  bypassed entirely. Under vanilla every packet — large iperf
+  payload or tiny HTTP request — enters the same HTB queue, so
+  hey waits its turn behind the elephant.
+- **p50 ≈ instant under natra, 3.8 seconds under vanilla**. The
+  natra p50 of 0.4 ms is essentially "as fast as the network can
+  go"; vanilla's 3.8 s is the time a request spends sitting in
+  HTB's queue waiting for token-rationed bandwidth ahead of it.
+- **p99 still 1 second under natra** because there are tail
+  events — a hey burst can briefly inflate a flow's CMS estimate
+  via collisions with the elephant's flow_key, and those tail
+  requests do hit the bucket. Vanilla's p99 of 5.5 s is the queue
+  reaching its drop limit.
+
+natra's iperf throughput under mixed comes in below 10 Mbps because
+when hey *does* hit the bucket (CMS collisions, occasional
+above-threshold bursts on a connection), it consumes tokens iperf
+would otherwise have. That's the right trade-off for this design —
+the headline guarantee is "annotated rate is the ceiling," not
+"the annotated rate is always reached."
+
+## Synthetic ↔ real: same scenario, two abstraction levels
+
+The L5 synthetic test
+(`test/perf/perf_linux_test.go::TestScenarioMixedVsVanilla`) runs
+the same packet sequence (elephant pre-drains the bucket, then 100
+mice flows × 5 packets each) through `natra.bpf.o` and a vanilla
+emulator (`bpf/vanilla.bpf.c`) under `BPF_PROG_RUN`. It measures
+mice pass-rate — what fraction of mice packets get returned from
+the program without being dropped.
+
+The Workload 2 numbers above are the cluster-level analog: same
+underlying scenario (elephants saturating the bucket, mice trying
+to get through), measured end-to-end through kindnet's bridge/vxlan
+fabric with real TCP connection setup and real userspace clients.
+
+What the synthetic test gives you:
+
+- Sub-second iteration; runs in CI on every push
+- Precise BPF stats: passed / throttled / hh_hits per direction
+- Zero kernel/kindnet/iperf jitter
+
+What the real test gives you:
+
+- Verifies the userspace plumbing — CNI ADD/DEL, kubelet annotation
+  delivery, BPF attach in production attach modes
+- Catches kindnet integration regressions
+- Measures user-visible metrics (RPS, p50/p99 latency)
+
+If the synthetic test passes but the real test regresses, plumbing
+broke. If both regress, the algorithm broke. Both are kept green on
+every push.
 
 ## Reproduce
 

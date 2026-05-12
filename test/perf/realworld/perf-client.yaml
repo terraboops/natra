@@ -1,0 +1,24 @@
+# Mixed-workload client: one pod with both iperf3 and hey installed so
+# the two generators run concurrently from the same source IP, against
+# the same server pod. Pinned to control-plane so traffic crosses the
+# inter-node fabric (kindnet bridge/vxlan) and hits the server's veth
+# as remote-origin packets — the production-shaped scenario.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: perf-client
+  namespace: natra-e2e
+  labels:
+    app: perf-client
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: PERF_CONTROL_NODE
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: tools
+      image: ghcr.io/terraboops/natra-perfclient:vsperf
+      imagePullPolicy: Never
+      command: ["sleep", "infinity"]

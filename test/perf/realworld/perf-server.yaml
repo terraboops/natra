@@ -1,0 +1,47 @@
+# Mixed-workload server: iperf3 (elephant target) + nginx (HTTP mice
+# target) in a single pod so both workloads cross the same veth and
+# attach to the same natra/vanilla BPF program.
+#
+# Both bandwidth annotations are set so a single iperf3 --bidir run
+# exercises ingress and egress simultaneously, and hey HTTP traffic
+# (request: client→server ingress; response: server→client egress)
+# touches both directions per request.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: perf-server
+  namespace: natra-e2e
+  annotations:
+    kubernetes.io/ingress-bandwidth: "10M"
+    kubernetes.io/egress-bandwidth: "10M"
+  labels:
+    app: perf-server
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: PERF_WORKER_NODE
+  containers:
+    - name: iperf
+      image: networkstatic/iperf3:latest
+      args: ["-s"]
+      ports:
+        - containerPort: 5201
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: perf-server
+  namespace: natra-e2e
+spec:
+  selector:
+    app: perf-server
+  ports:
+    - name: iperf
+      port: 5201
+      targetPort: 5201
+    - name: http
+      port: 80
+      targetPort: 80
