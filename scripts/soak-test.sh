@@ -394,7 +394,11 @@ measure() {
     iperf_ing=$(jq '.end.streams[0].sender.bits_per_second // 0' "$iperf_log" 2>/dev/null || echo 0)
     iperf_eg=$(jq '.end.streams[1].sender.bits_per_second // 0' "$iperf_log" 2>/dev/null || echo 0)
     local rps p50 p99
-    rps=$(awk -F: '/Requests\/sec:/ {gsub(/^ */, "", $2); print $2; exit}' "$hey_log")
+    # hey emits "Requests/sec:\t<value>" with a TAB between the label
+    # and the number, not a space — so -F: leaves the leading tab in
+    # $2, which then leaks into the TSV and shifts every subsequent
+    # column by one. Strip both spaces AND tabs from $2.
+    rps=$(awk -F: '/Requests\/sec:/ {gsub(/^[ \t]*/, "", $2); print $2; exit}' "$hey_log")
     p50=$(awk '/50%% in/ {print $3; exit}' "$hey_log")
     p99=$(awk '/99%% in/ {print $3; exit}' "$hey_log")
     : "${rps:=0}"; : "${p50:=0}"; : "${p99:=0}"
