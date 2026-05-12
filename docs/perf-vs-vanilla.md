@@ -74,19 +74,27 @@ Receiver-side aggregate goodput from
 
 | Direction | Plugin                | Elephant     | Mice (20× parallel)  |
 |-----------|-----------------------|--------------|----------------------|
-| ingress   | natra                 | 11.25 Mbps   | 10.96 Mbps           |
-| ingress   | upstream `bandwidth`  | 10.05 Mbps   |  9.59 Mbps           |
-| egress    | natra                 | 11.30 Mbps   | 11.28 Mbps           |
+| ingress   | natra                 | 12.14 Mbps   | 36.79 Mbps           |
+| ingress   | upstream `bandwidth`  | 10.04 Mbps   |  9.59 Mbps           |
+| egress    | natra                 | 12.16 Mbps   | 38.99 Mbps           |
 | egress    | upstream `bandwidth`  | 10.12 Mbps   |  9.61 Mbps           |
 
-Both plugins land within ~13% of the 10 Mbps annotation on every
-phase. natra's overshoot comes from the 2.5 MB token-bucket initial
-burst amortized into a 15s measurement; longer measurements would
-converge on 10 Mbps. The single-stream vs 20-parallel split isn't
-informative here — both just confirm steady-state throttling works.
-The CMS fast-pass payoff isn't visible in this workload because every
-iperf3 flow is long-lived and crosses the heavy-hitter threshold
-within milliseconds; for that see Workload 2.
+The single-stream elephant lands within ~21% of the 10 Mbps cap
+under natra and exactly at cap under vanilla.
+
+The 20-parallel "mice" column is where natra reads 3.5× over cap.
+That's the intentional consequence of natra's heavy-hitter
+threshold (default 50): each parallel iperf3 stream gets ~50 GRO-
+coalesced super-packets of fast-pass before its CMS count crosses
+classification, and 20 streams × 50-packet budget × 1Gbps line
+rate dominates a 10s measurement. With single-stream flows the
+elephant fully consumes its budget in milliseconds and steady-state
+throttling takes over for the rest of the test, hence the ~12 Mbps
+reading. The threshold is what makes the mixed workload (Workload
+2 below) work — without it, every HTTP request would false-positive-
+classify as heavy and hit the bucket. Twenty parallel iperf streams
+is neither real mice nor a real elephant; this column is a synthetic
+in-between case kept around to document the threshold trade-off.
 
 ## Workload 2: realistic mixed (elephant + HTTP mice)
 
@@ -105,8 +113,10 @@ installed) runs:
 
 | Plugin               | Iperf ingress | Iperf egress | Hey RPS | Hey p50 | Hey p99 |
 |----------------------|---------------|--------------|---------|---------|---------|
-| natra                |  8.11 Mbps    |  4.14 Mbps   |   1065  |  0.4 ms |  1.0 s  |
-| upstream `bandwidth` | 10.52 Mbps    |  9.72 Mbps   |     12  |  3.8 s  |  5.5 s  |
+| natra                |  9.23 Mbps    |  5.13 Mbps   | **4426**|  1.1 ms |  208 ms |
+| upstream `bandwidth` | 10.59 Mbps    |  8.32 Mbps   |     12  |  4.8 s  |  5.0 s  |
+
+**Hey RPS 369× higher under natra, p99 24× lower, p50 4400× lower.**
 
 Both plugins land at-or-below 10 Mbps for the iperf elephant in
 both directions — bandwidth annotation honored.
