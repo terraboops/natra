@@ -243,7 +243,7 @@ func collectPodSnapshots(pinPath string) []podSnapshot {
 		byContainer[containerID][suffix] = filepath.Join(pinPath, name)
 	}
 
-	var snaps []podSnapshot
+	snaps := make([]podSnapshot, 0, len(byContainer))
 	for cid, paths := range byContainer {
 		snaps = append(snaps, readPodMaps(cid, paths))
 	}
