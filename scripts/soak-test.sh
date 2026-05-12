@@ -140,19 +140,43 @@ trap cleanup EXIT
 
 # ---------- bootstrap ----------
 bootstrap_cluster() {
+    # Pre-pull all workload images on the HOST first, then `k3d image
+    # import` them into the cluster. Repeated cluster-tear-up cycles
+    # would otherwise burn through Docker Hub's anonymous rate limit
+    # (~100 pulls per 6h per IP). Pulling from mirror.gcr.io
+    # (Google's pull-through cache for Docker Hub) sidesteps the
+    # limit entirely; pulling from ghcr.io is unaffected to begin with.
+    local images=(
+        "mirror.gcr.io/networkstatic/iperf3:latest"
+        "mirror.gcr.io/library/nginx:1.27-alpine"
+        "mirror.gcr.io/bloomberg/goldpinger:3.11.2"
+        "ghcr.io/terraboops/natra-perfclient:vsperf"
+    )
+    for img in "${images[@]}"; do
+        if ! docker image inspect "$img" >/dev/null 2>&1; then
+            log_event "bootstrap: pulling $img"
+            docker pull "$img" 2>&1 | tail -1 || log_event "bootstrap: warn — pull $img failed (Docker Hub rate limit?)"
+        fi
+    done
+
     log_event "bootstrap: creating k3d cluster $CLUSTER with $INITIAL_NODES workers"
     # --no-lb: skip the load balancer container; soak doesn't need
     # a service LB. --k3s-arg ... --disable=traefik,servicelb: drop
     # addons we don't use. Default k3s networking (flannel) is left
     # in place — Calico-eBPF as a separate base for NPA-style BPF
-    # coexistence is on the TODO list as a follow-up; the soak rig
-    # works fine with vanilla k3s for measuring natra's long-term
-    # behavior under load.
+    # coexistence is on the TODO list as a follow-up.
     k3d cluster create "$CLUSTER" \
         --agents "$INITIAL_NODES" \
         --no-lb \
         --k3s-arg "--disable=traefik,servicelb@server:0" \
         --wait
+
+    log_event "bootstrap: importing pre-pulled images into $CLUSTER"
+    for img in "${images[@]}"; do
+        if docker image inspect "$img" >/dev/null 2>&1; then
+            k3d image import "$img" -c "$CLUSTER" 2>&1 | tail -1 || true
+        fi
+    done
 
     log_event "bootstrap: installing goldpinger"
     # Minimal goldpinger manifest. Upstream ships Helm charts, not
@@ -210,7 +234,8 @@ spec:
           effect: NoSchedule
       containers:
         - name: goldpinger
-          image: docker.io/bloomberg/goldpinger:3.11.2
+          image: mirror.gcr.io/bloomberg/goldpinger:3.11.2
+          imagePullPolicy: IfNotPresent
           env:
             - name: HOST
               value: "0.0.0.0"
@@ -296,12 +321,14 @@ metadata:
 spec:
   containers:
     - name: iperf
-      image: networkstatic/iperf3:latest
+      image: mirror.gcr.io/networkstatic/iperf3:latest
+      imagePullPolicy: IfNotPresent
       args: ["-s"]
       ports:
         - containerPort: 5201
     - name: nginx
-      image: nginx:1.27-alpine
+      image: mirror.gcr.io/library/nginx:1.27-alpine
+      imagePullPolicy: IfNotPresent
       ports:
         - containerPort: 80
 ---
