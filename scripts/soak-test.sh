@@ -329,6 +329,88 @@ measure() {
         >> "$OUTPUT_DIR/metrics.tsv"
 }
 
+# ---------- node churn ----------
+# Alternates add / remove a worker every NODE_CHURN_INTERVAL_S. The
+# k3d node CRUD operations are the whole reason this rig uses k3d
+# instead of kind. Set --node-churn-interval=0 to disable.
+churn_loop() {
+    [ "$NODE_CHURN_INTERVAL_S" -eq 0 ] && { log_event "churn: disabled"; return; }
+    local op
+    op="remove" # start by removing (we have INITIAL_NODES already)
+    while [ "$(date +%s)" -lt "$END_TS" ]; do
+        sleep "$NODE_CHURN_INTERVAL_S"
+        [ "$(date +%s)" -ge "$END_TS" ] && break
+        if [ "$op" = "remove" ]; then
+            # Remove an arbitrary agent node. k3d node list returns
+            # one per line; pick the last agent.
+            local victim
+            victim=$(k3d node list --no-headers 2>/dev/null \
+                | awk '$3 == "agent" {print $1}' | tail -1)
+            if [ -n "$victim" ]; then
+                log_event "churn: removing node $victim"
+                k3d node delete "$victim" 2>>"$OUTPUT_DIR/events.log" || \
+                    log_event "churn: delete $victim failed"
+            else
+                log_event "churn: no agent to remove"
+            fi
+            op="add"
+        else
+            local new_name="soak-churn-$(date +%s)"
+            log_event "churn: adding node $new_name"
+            k3d node create "$new_name" --cluster "$CLUSTER" --role agent \
+                2>>"$OUTPUT_DIR/events.log" || \
+                log_event "churn: create $new_name failed"
+            op="remove"
+        fi
+    done
+}
+
+# ---------- deep snapshots ----------
+# Every DEEP_INTERVAL_S take a heap pprof of a one-off
+# `natra profile` invocation (single-tick) and a BPF prog stats
+# snapshot. Bounded ring buffer: keep only RETAIN_HEAP / RETAIN_BPF
+# files so a 4h+ run doesn't fill disk.
+snapshot_loop() {
+    [ "$DEEP_INTERVAL_S" -eq 0 ] && { log_event "snapshot: disabled"; return; }
+    [ "$MODE" != "natra" ] && { log_event "snapshot: only meaningful in natra mode, skipping"; return; }
+    local n=0
+    while [ "$(date +%s)" -lt "$END_TS" ]; do
+        sleep "$DEEP_INTERVAL_S"
+        [ "$(date +%s)" -ge "$END_TS" ] && break
+        n=$((n + 1))
+        local worker
+        worker=$(k3d node list --no-headers 2>/dev/null \
+            | awk '$3 == "agent" {print $1}' | head -1)
+        if [ -z "$worker" ]; then
+            log_event "snapshot: no agent found, skipping tick $n"
+            continue
+        fi
+        local idx
+        idx=$(printf '%03d' $((n % RETAIN_BPF)))
+        log_event "snapshot[$idx]: running natra profile on $worker"
+        # Single-shot natra profile: -interval longer than we wait
+        # so it only writes one snapshot, then we kill it.
+        docker exec "$worker" mkdir -p /var/log/natra-soak 2>/dev/null || true
+        docker exec "$worker" bash -c "
+            setsid nohup /opt/cni/bin/natra profile \
+                -interval 10s \
+                -output /var/log/natra-soak/snapshots-${idx}.jsonl \
+                -heap-dir /var/log/natra-soak/heap-${idx} \
+                </dev/null >/dev/null 2>&1 &
+            echo \$! > /var/log/natra-soak/profile.pid
+        " || true
+        sleep 12  # let it write one snapshot
+        docker exec "$worker" bash -c '
+            kill $(cat /var/log/natra-soak/profile.pid) 2>/dev/null || true
+        ' || true
+        # Copy out the snapshot and the heap dir contents.
+        docker cp "$worker:/var/log/natra-soak/snapshots-${idx}.jsonl" \
+            "$OUTPUT_DIR/bpf/" 2>/dev/null || true
+        docker cp "$worker:/var/log/natra-soak/heap-${idx}" \
+            "$OUTPUT_DIR/heap/" 2>/dev/null || true
+    done
+}
+
 # ---------- main ----------
 echo "starting soak-test"
 echo "  mode:             $MODE"
@@ -343,6 +425,21 @@ printf 'timestamp_unix\tiperf_ing_bps\tiperf_eg_bps\they_rps\they_p50_s\they_p99
 bootstrap_cluster
 deploy_workload
 
+# Background loops: node churn + deep snapshots. The measurement
+# loop runs in the foreground; when it exits we kill the background
+# loops via the EXIT trap (their k3d / docker commands are
+# idempotent enough that interruption mid-call is benign).
+churn_loop &
+CHURN_PID=$!
+snapshot_loop &
+SNAPSHOT_PID=$!
+
+cleanup_background() {
+    kill "$CHURN_PID" "$SNAPSHOT_PID" 2>/dev/null || true
+    wait "$CHURN_PID" "$SNAPSHOT_PID" 2>/dev/null || true
+}
+trap 'cleanup_background; cleanup' EXIT
+
 log_event "soak: entering measurement loop (until $(date -r "$END_TS"))"
 while [ "$(date +%s)" -lt "$END_TS" ]; do
     measure
@@ -353,3 +450,5 @@ log_event "soak: complete"
 echo
 echo "results in $OUTPUT_DIR"
 echo "rows: $(wc -l < "$OUTPUT_DIR/metrics.tsv" | tr -d ' ')"
+echo "heap snapshots: $(ls "$OUTPUT_DIR/heap" 2>/dev/null | wc -l | tr -d ' ')"
+echo "bpf snapshots: $(ls "$OUTPUT_DIR/bpf" 2>/dev/null | wc -l | tr -d ' ')"
