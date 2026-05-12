@@ -292,8 +292,14 @@ EOF
             # locations. The container-side mount paths stay
             # /host/opt/cni/bin and /host/etc/cni/net.d because
             # those are referenced by the install-container script.
+            # NOT rewriting imagePullPolicy globally: that would also
+            # break the `pause` main container, whose registry.k8s.io
+            # image is never imported and needs a real pull. The
+            # natra init container's image IS imported, so we only
+            # need to make sure the manifest's natra-image line
+            # matches the imported tag — kubelet's default
+            # IfNotPresent then uses the imported copy.
             sed -e "s|ghcr.io/terraboops/natra:latest|${natra_image}|" \
-                -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
                 -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
                 -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
                 "${REPO_ROOT}/deploy/cni-installer.yaml" | kubectl apply -f -
