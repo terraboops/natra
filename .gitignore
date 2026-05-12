@@ -38,3 +38,9 @@ dist/
 *.tar.gz
 *.zip
 .claude/
+
+# Profiling / soak / measurement data — never check in
+results/
+*.pprof
+heap-*
+snapshots-*.jsonl

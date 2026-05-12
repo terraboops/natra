@@ -52,7 +52,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Defaults — override via flags.
 MODE="natra"
 DURATION="4h"
-OUTPUT_DIR="${REPO_ROOT}/results/soak-$(date -u +%Y%m%dT%H%M%SZ)"
+OUTPUT_DIR="/tmp/natra-soak-$(date -u +%Y%m%dT%H%M%SZ)"
 INITIAL_NODES=3
 NODE_CHURN_INTERVAL_S=600    # add/remove a worker every 10 min
 SAMPLE_INTERVAL_S=60         # light measurement cadence
@@ -66,7 +66,7 @@ Usage: soak-test.sh [flags]
 
   --mode {natra,vanilla,baseline}    Which rate-limiting layer to chain. Default: natra.
   --duration <go-duration>           How long to run (e.g. 4h, 30m, 5m). Default: 4h.
-  --output <dir>                     Result directory. Default: results/soak-<ts>/
+  --output <dir>                     Result directory. Default: /tmp/natra-soak-<ts>/
   --initial-nodes <N>                Workers at startup. Default: 3.
   --node-churn-interval <seconds>    0 disables churn. Default: 600.
   --sample-interval <seconds>        Light measurement cadence. Default: 60.
