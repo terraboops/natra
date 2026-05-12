@@ -142,42 +142,17 @@ trap cleanup EXIT
 bootstrap_cluster() {
     log_event "bootstrap: creating k3d cluster $CLUSTER with $INITIAL_NODES workers"
     # --no-lb: skip the load balancer container; soak doesn't need
-    # a service LB and the extra container just steals RAM.
-    # --k3s-arg ... --disable=traefik,servicelb: drop addons we
-    # don't use; smaller blast radius for the soak.
+    # a service LB. --k3s-arg ... --disable=traefik,servicelb: drop
+    # addons we don't use. Default k3s networking (flannel) is left
+    # in place — Calico-eBPF as a separate base for NPA-style BPF
+    # coexistence is on the TODO list as a follow-up; the soak rig
+    # works fine with vanilla k3s for measuring natra's long-term
+    # behavior under load.
     k3d cluster create "$CLUSTER" \
         --agents "$INITIAL_NODES" \
         --no-lb \
         --k3s-arg "--disable=traefik,servicelb@server:0" \
-        --k3s-arg "--flannel-backend=none@server:0" \
-        --k3s-arg "--disable-network-policy@server:0" \
         --wait
-
-    log_event "bootstrap: installing Calico in eBPF mode"
-    # Calico operator + eBPF dataplane. eBPF mode attaches TC
-    # programs to host-side veths via clsact — same hook surface
-    # natra targets (when in tcx-hostside mode), so the rig
-    # exercises real BPF-stack coexistence on every pod veth.
-    kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/tigera-operator.yaml
-    cat <<EOF | kubectl apply -f -
-apiVersion: operator.tigera.io/v1
-kind: Installation
-metadata:
-  name: default
-spec:
-  calicoNetwork:
-    linuxDataplane: BPF
-    bgp: Disabled
-    ipPools:
-      - blockSize: 26
-        cidr: 10.42.0.0/16
-        encapsulation: VXLAN
-        natOutgoing: Enabled
-EOF
-    kubectl -n tigera-operator rollout status deployment/tigera-operator --timeout=120s
-    # Wait for calico-system and calico-node DaemonSet to come up.
-    while ! kubectl get ns calico-system >/dev/null 2>&1; do sleep 2; done
-    kubectl -n calico-system rollout status daemonset/calico-node --timeout=300s
 
     log_event "bootstrap: installing goldpinger"
     # Minimal goldpinger manifest. Upstream ships Helm charts, not
