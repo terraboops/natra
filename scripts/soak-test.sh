@@ -488,53 +488,66 @@ snapshot_loop() {
         sleep "$DEEP_INTERVAL_S"
         [ "$(date +%s)" -ge "$END_TS" ] && break
         n=$((n + 1))
-        local worker
-        worker=$(k3d node list --no-headers 2>/dev/null \
-            | awk '$2 == "agent" {print $1}' | head -1)
-        if [ -z "$worker" ]; then
-            log_event "snapshot: no agent found, skipping tick $n"
+        # Snapshot every agent — natra pins are per-node, and the
+        # workload pod might be on any of them. Picking one
+        # arbitrary worker would only see that worker's pins
+        # (often empty if the pod landed elsewhere).
+        local workers
+        workers=$(k3d node list --no-headers 2>/dev/null \
+            | awk '$2 == "agent" {print $1}')
+        if [ -z "$workers" ]; then
+            log_event "snapshot: no agents found, skipping tick $n"
             continue
         fi
+        local worker_count=0
+        local worker
+        for worker in $workers; do
+            worker_count=$((worker_count + 1))
+        done
+
         local idx
         idx=$(printf '%03d' $((n % RETAIN_BPF)))
-        log_event "snapshot[$idx]: running natra profile on $worker"
+        log_event "snapshot[$idx]: running natra profile on $worker_count agent(s)"
         # Single-shot natra profile: -interval longer than we wait
         # so it only writes one snapshot, then we kill it.
-        docker exec "$worker" mkdir -p /var/log/natra-soak 2>/dev/null || true
-        # natra binary path differs by CNI base. The installer writes
-        # to /opt/cni/bin on kind/EKS-shaped clusters, but k3s puts
-        # its CNI plugins under /var/lib/rancher/k3s/data/cni. Probe
-        # for whichever exists on this worker.
-        local natra_bin
-        natra_bin=$(docker exec "$worker" sh -c '
-            for p in /opt/cni/bin/natra /var/lib/rancher/k3s/data/cni/natra; do
-                if [ -x "$p" ]; then echo "$p"; exit 0; fi
-            done
-            exit 1
-        ' 2>/dev/null || echo "")
-        if [ -z "$natra_bin" ]; then
-            log_event "snapshot[$idx]: natra binary not found on $worker, skipping"
-            continue
-        fi
-        # `natra profile -once` takes a single snapshot and exits —
-        # avoids needing setsid/nohup/background-with-pid-file
-        # orchestration. k3d node containers are minimal alpine and
-        # don't have setsid; the prior background+SIGTERM dance
-        # silently failed and left no artifacts. Foreground run
-        # blocks until the snapshot is on disk, then docker cp
-        # always finds the file.
-        docker exec "$worker" "$natra_bin" profile \
-            -once \
-            -output "/var/log/natra-soak/snapshots-${idx}.jsonl" \
-            -heap-dir "/var/log/natra-soak/heap-${idx}" \
-            2>>"$OUTPUT_DIR/events.log" || \
-            log_event "snapshot[$idx]: natra profile -once failed on $worker"
-        docker cp "$worker:/var/log/natra-soak/snapshots-${idx}.jsonl" \
-            "$OUTPUT_DIR/bpf/" 2>/dev/null || \
-            log_event "snapshot[$idx]: docker cp snapshots failed"
-        docker cp "$worker:/var/log/natra-soak/heap-${idx}" \
-            "$OUTPUT_DIR/heap/" 2>/dev/null || \
-            log_event "snapshot[$idx]: docker cp heap failed"
+        for worker in $workers; do
+            docker exec "$worker" mkdir -p /var/log/natra-soak 2>/dev/null || true
+            # natra binary path differs by CNI base. The installer
+            # writes to /opt/cni/bin on kind/EKS-shaped clusters, but
+            # k3s puts its CNI plugins under
+            # /var/lib/rancher/k3s/data/cni. Probe for whichever
+            # exists on this worker.
+            local natra_bin
+            natra_bin=$(docker exec "$worker" sh -c '
+                for p in /opt/cni/bin/natra /var/lib/rancher/k3s/data/cni/natra; do
+                    if [ -x "$p" ]; then echo "$p"; exit 0; fi
+                done
+                exit 1
+            ' 2>/dev/null || echo "")
+            if [ -z "$natra_bin" ]; then
+                log_event "snapshot[$idx]: natra not on $worker, skipping"
+                continue
+            fi
+            # `natra profile -once` takes a single snapshot and exits.
+            # k3d node containers are minimal alpine (no setsid); the
+            # prior background+SIGTERM dance silently failed.
+            # Foreground run blocks until the snapshot is on disk,
+            # then docker cp always finds the file.
+            local short
+            short="${worker##*-}" # last hyphen-delimited segment, e.g. "agent-0"
+            docker exec "$worker" "$natra_bin" profile \
+                -once \
+                -output "/var/log/natra-soak/snapshots-${idx}-${short}.jsonl" \
+                -heap-dir "/var/log/natra-soak/heap-${idx}-${short}" \
+                2>>"$OUTPUT_DIR/events.log" || \
+                log_event "snapshot[$idx]: profile failed on $worker"
+            docker cp "$worker:/var/log/natra-soak/snapshots-${idx}-${short}.jsonl" \
+                "$OUTPUT_DIR/bpf/" 2>/dev/null || \
+                log_event "snapshot[$idx]: cp snapshots failed for $worker"
+            docker cp "$worker:/var/log/natra-soak/heap-${idx}-${short}" \
+                "$OUTPUT_DIR/heap/" 2>/dev/null || \
+                log_event "snapshot[$idx]: cp heap failed for $worker"
+        done
     done
 }
 
