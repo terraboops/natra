@@ -44,6 +44,7 @@ ALLOWLIST=(
 	"Makefile"                                 # false-positive: Makefile comments mention libbpf/GPL deps.
 	"scripts/license-scan.sh"                  # false-positive: this script literally lists GPL/AGPL/SSPL names to detect them.
 	".github/workflows/license.yml"            # false-positive: workflow that runs this script.
+	"README.md"                                # false-positive: prose mentions the Apache-2.0 badge URL plus phrases scancode fuzzy-matches to LGPL.
 )
 
 is_allowed() {
