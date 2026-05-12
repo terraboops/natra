@@ -452,7 +452,7 @@ churn_loop() {
             # one per line; pick the last agent.
             local victim
             victim=$(k3d node list --no-headers 2>/dev/null \
-                | awk '$3 == "agent" {print $1}' | tail -1)
+                | awk '$2 == "agent" {print $1}' | tail -1)
             if [ -n "$victim" ]; then
                 log_event "churn: removing node $victim"
                 k3d node delete "$victim" 2>>"$OUTPUT_DIR/events.log" || \
@@ -487,7 +487,7 @@ snapshot_loop() {
         n=$((n + 1))
         local worker
         worker=$(k3d node list --no-headers 2>/dev/null \
-            | awk '$3 == "agent" {print $1}' | head -1)
+            | awk '$2 == "agent" {print $1}' | head -1)
         if [ -z "$worker" ]; then
             log_event "snapshot: no agent found, skipping tick $n"
             continue
