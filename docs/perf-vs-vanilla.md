@@ -124,21 +124,21 @@ both directions — bandwidth annotation honored.
 The difference is what they do to the small HTTP requests competing
 for that same 10 Mbps budget:
 
-- **88× more requests/sec under natra** (1065 vs 12). Each hey
+- **369× more requests/sec under natra** (4426 vs 12). Each hey
   request that arrives uses a new 5-tuple, so its per-flow CMS
   count stays below the heavy-hitter threshold and the bucket is
   bypassed entirely. Under vanilla every packet — large iperf
   payload or tiny HTTP request — enters the same HTB queue, so
   hey waits its turn behind the elephant.
-- **p50 ≈ instant under natra, 3.8 seconds under vanilla**. The
-  natra p50 of 0.4 ms is essentially "as fast as the network can
-  go"; vanilla's 3.8 s is the time a request spends sitting in
+- **p50 ≈ instant under natra, 4.8 seconds under vanilla**. The
+  natra p50 of 1.1 ms is essentially "as fast as the network can
+  go"; vanilla's 4.8 s is the time a request spends sitting in
   HTB's queue waiting for token-rationed bandwidth ahead of it.
-- **p99 still 1 second under natra** because there are tail
-  events — a hey burst can briefly inflate a flow's CMS estimate
-  via collisions with the elephant's flow_key, and those tail
-  requests do hit the bucket. Vanilla's p99 of 5.5 s is the queue
-  reaching its drop limit.
+- **p99 ~208 ms under natra** because there are tail events — a
+  hey burst can briefly inflate a flow's CMS estimate via
+  collisions with the elephant's flow_key, and those tail requests
+  do hit the bucket. Vanilla's p99 of 5.0 s is the queue reaching
+  its drop limit.
 
 natra's iperf throughput under mixed comes in below 10 Mbps because
 when hey *does* hit the bucket (CMS collisions, occasional
