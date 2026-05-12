@@ -137,46 +137,17 @@ would otherwise have. That's the right trade-off for this design —
 the headline guarantee is "annotated rate is the ceiling," not
 "the annotated rate is always reached."
 
-## Synthetic ↔ real: same scenario, two abstraction levels
-
-The L5 synthetic test
-(`test/perf/perf_linux_test.go::TestScenarioMixedVsVanilla`) runs
-the same packet sequence (elephant pre-drains the bucket, then 100
-mice flows × 5 packets each) through `natra.bpf.o` and a vanilla
-emulator (`bpf/vanilla.bpf.c`) under `BPF_PROG_RUN`. It measures
-mice pass-rate — what fraction of mice packets get returned from
-the program without being dropped.
-
-The Workload 2 numbers above are the cluster-level analog: same
-underlying scenario (elephants saturating the bucket, mice trying
-to get through), measured end-to-end through kindnet's bridge/vxlan
-fabric with real TCP connection setup and real userspace clients.
-
-What the synthetic test gives you:
-
-- Sub-second iteration; runs in CI on every push
-- Precise BPF stats: passed / throttled / hh_hits per direction
-- Zero kernel/kindnet/iperf jitter
-
-What the real test gives you:
-
-- Verifies the userspace plumbing — CNI ADD/DEL, kubelet annotation
-  delivery, BPF attach in production attach modes
-- Catches kindnet integration regressions
-- Measures user-visible metrics (RPS, p50/p99 latency)
-
-If the synthetic test passes but the real test regresses, plumbing
-broke. If both regress, the algorithm broke. Both are kept green on
-every push.
-
 ## Reproduce
 
 ```bash
 make perf-vs-vanilla
 ```
 
-To compare with `clsact-podside` instead of the default `tcx`:
+natra's attach mode defaults to `tcx-hostside`. To exercise a
+different mode in the comparison:
 
 ```bash
+NATRA_PERF_ATTACH_MODE=tcx-podside    make perf-vs-vanilla
+NATRA_PERF_ATTACH_MODE=clsact-hostside make perf-vs-vanilla
 NATRA_PERF_ATTACH_MODE=clsact-podside make perf-vs-vanilla
 ```
