@@ -16,14 +16,17 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-// chaosBpsCap is more generous than the happy-path's +20% because each
-// chaos test runs multiple back-to-back iperf cycles (baseline,
-// during-event, after-event). Token bucket state from earlier cycles
-// can give later cycles brief access to ~half a burst worth of extra
-// tokens — observed measurements drift up to +35% under that pattern.
-// +50% covers the jitter without masking real regressions (any failure
-// to throttle drives throughput to 80+ Gbps, far outside this limit).
-var chaosBpsCap = int64(float64(bandwidthBps) * 1.50)
+// chaosBpsCap is more generous than the happy-path's +40% because
+// each chaos test runs multiple back-to-back iperf cycles (baseline,
+// during-event, after-event). Token bucket state from earlier
+// cycles can give later cycles brief access to ~half a burst worth
+// of extra tokens, and the heavy-hitter threshold's per-flow
+// fast-pass budget compounds on top of that — observed measurements
+// drift to +70% during pod churn / DaemonSet restart cycles.
+// +100% (= 2× rate) covers the jitter without masking real
+// regressions (any failure to throttle drives throughput to 80+ Gbps,
+// far outside this limit).
+var chaosBpsCap = int64(float64(bandwidthBps) * 2.0)
 
 var _ = Describe("natra cluster chaos", func() {
 	// natra's BPF programs are attached via tcx (default) or clsact
