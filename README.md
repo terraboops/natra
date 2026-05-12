@@ -35,6 +35,10 @@ kubectl run test --image=nginx \
   --annotations="kubernetes.io/ingress-bandwidth=10M,kubernetes.io/egress-bandwidth=10M"
 ```
 
+The DaemonSet is one of three supported install paths — see
+[docs/install.md](docs/install.md) if you'd rather bake natra into
+your node image or install manually.
+
 ## Build
 
 ```bash
