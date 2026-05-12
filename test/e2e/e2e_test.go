@@ -52,60 +52,72 @@ const (
 	namespace    = "natra-e2e"
 	natraImage   = "ghcr.io/terraboops/natra:e2e"
 	bandwidthBps = 10_000_000 // 10 Mbps annotation under test
-	// throttledCapRatio is the slack against the configured rate.
-	// 1.40 (40%) accommodates two compounding overshoot sources:
-	//
-	//   - The 2.5 MB initial token bucket (burst = 2× rate) amortizes
-	//     into ~+13% over a 15s measurement. natra's first-second
-	//     window goes at line rate before steady-state throttling
-	//     kicks in.
-	//
-	//   - The CMS heavy-hitter threshold (default 50) lets each flow
-	//     fast-pass its first ~50 GRO-coalesced super-packets — on
-	//     kindnet that's enough for an iperf3 stream to push a
-	//     couple of MB before classification crosses to heavy. Over
-	//     a 15s measurement this adds another ~10-15%. The threshold
-	//     was tuned for realistic mice (HTTP requests at <10 packets
-	//     each, well below the threshold); single-stream elephants
-	//     pay slightly more overshoot in exchange for mice fast-pass
-	//     working as designed.
-	//
-	// 1.40 leaves headroom above both effects without masking real
-	// regressions (any failure to throttle drives throughput >80x
-	// over cap, far outside 1.40).
-	throttledCapRatio       = 1.40
-	throttledCap      int64 = int64(float64(bandwidthBps) * throttledCapRatio)
-	// unthrottledFloor is the lower bound for a pod that is NOT
-	// supposed to be throttled. Conservative — kind cross-node TCP
-	// over kindnet on a CI runner sustains > 1 Gbps without natra,
-	// and natra-the-no-op should not change that meaningfully.
-	unthrottledFloor int64 = 100_000_000 // 100 Mbps
 	// burstSeconds is how many seconds of free traffic a freshly-full
-	// bucket grants. Set by natra's clamp at burst = 2 × rate, which
-	// in time terms is 2 seconds at the configured rate.
+	// bucket grants. natra clamps burst = 2 × rate; in time terms
+	// that's 2 seconds at the configured rate.
 	burstSeconds = 2.0
-	// throttleDurationFloor / Ceiling clamp the calibrated duration so
-	// pathological calibrations can't make tests trivially short or
-	// runaway-slow.
+	// throttleDurationFloor / Ceiling clamp the calibrated duration
+	// so pathological calibrations can't make tests trivially short
+	// or runaway-slow.
 	throttleDurationFloor   = 10
 	throttleDurationCeiling = 30
+	// throttleCapFloorRatio is a floor on the dynamic cap: even if
+	// calibration measures an unusually-tight steady-state, we don't
+	// let the cap drop below 1.20× rate. Without this a low-jitter
+	// runner could end up with a brittle 1.05× cap that catches
+	// nothing.
+	throttleCapFloorRatio = 1.20
+	// throttleCapMargin is added on top of measured mean + 2σ as a
+	// final safety pad. 5% covers minor between-test noise that the
+	// 3-sample calibration window won't see.
+	throttleCapMargin = 0.05
+	// chaosCapMultiplier is the extra slack chaos tests get on top
+	// of throttledCap. Chaos runs back-to-back iperf cycles (baseline,
+	// during-event, after-event) and bucket state from earlier
+	// cycles compounds with the threshold fast-pass budget. 1.5×
+	// covers it.
+	chaosCapMultiplier = 1.5
 )
 
 // throttleDuration is the iperf3 -t value the per-direction throttle
-// assertions use. Set by calibrateThrottleDuration in BeforeSuite based
-// on measured kindnet jitter; falls back to 15 if calibration fails.
+// assertions use. Set by calibrateRig in BeforeSuite based on measured
+// kindnet jitter; falls back to 15 if calibration fails.
 //
 // The bucket-saturation math: starting from a full bucket, an iperf3
 // run of d seconds averages rate × (1 + burstSeconds/d). To keep that
-// below throttledCap × rate even under jitter j (relative stddev), we
-// need:
+// below the cap even under jitter j (relative stddev):
 //
-//	(1 + burstSeconds/d) × (1 + 2j) < throttledCapRatio
-//	d > burstSeconds / (throttledCapRatio / (1 + 2j) - 1)
+//	(1 + burstSeconds/d) × (1 + 2j) < (cap / rate)
+//	d > burstSeconds / ((cap/rate) / (1 + 2j) - 1)
 //
-// At j=2% this gives d≈13s; at j=5% it gives d≈22s. The runner kernel
-// influences j heavily, so we measure rather than guess.
+// At j=2% this gives d≈13s; at j=5% it gives d≈22s.
 var throttleDuration = 15
+
+// throttledCap and chaosBpsCap are derived from calibration: the rig
+// measures mean μ and stddev σ of a throttled stream on the actual
+// runner, then sets throttledCap = μ + 2σ + margin (with a floor at
+// 1.20× rate). chaosBpsCap = throttledCap × chaosCapMultiplier. Both
+// fall back to safe wide defaults if calibration fails so tests can
+// still run.
+//
+// Why dynamic: natra's effective steady-state depends on the
+// heavy-hitter threshold, the burst-to-rate ratio, the GRO settings
+// on the runner kernel, and TCP-connection establishment timing. A
+// hardcoded cap-ratio has to guess all four; measuring them in
+// BeforeSuite means the same test adapts to whatever runner /
+// configuration combination it lands on.
+var (
+	throttledCap = int64(float64(bandwidthBps) * 1.40)
+	chaosBpsCap  = int64(float64(bandwidthBps) * 2.00)
+)
+
+// unthrottledFloor is the lower bound for a pod that is NOT supposed
+// to be throttled. Conservative — kind cross-node TCP over kindnet
+// on a CI runner sustains > 1 Gbps without natra, and natra-the-no-op
+// should not change that meaningfully. Not jitter-derived because the
+// floor is 10× below typical unthrottled throughput; runner jitter
+// doesn't approach this gap.
+var unthrottledFloor int64 = 100_000_000 // 100 Mbps
 
 func repoFile(parts ...string) string {
 	_, thisFile, _, _ := runtime.Caller(0)
@@ -183,8 +195,8 @@ var _ = BeforeSuite(func() {
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
 
-	By("calibrating throttle duration against measured jitter")
-	calibrateThrottleDuration()
+	By("calibrating throttle duration and caps against measured jitter")
+	calibrateRig()
 })
 
 var _ = AfterSuite(func() {
@@ -268,26 +280,38 @@ func waitForServiceEndpoints(svcName string) {
 	GinkgoWriter.Printf("WARN: %s endpoints did not populate within 30s\n", svcName)
 }
 
-// calibrateThrottleDuration measures kindnet/iperf3 jitter on this
-// runner and picks the shortest iperf3 duration that keeps the
-// bucket-saturation effect comfortably below throttledCapRatio under
-// the observed jitter. Sets the package-level throttleDuration; on
-// any error keeps the safe fallback.
+// calibrateRig measures kindnet/iperf3 jitter under natra throttling on
+// this runner. Outputs:
+//   - throttleDuration: how long each per-direction iperf3 run should
+//     be so bucket-saturation amortizes below the dynamic cap.
+//   - throttledCap: μ + 2σ + margin, with a floor at
+//     throttleCapFloorRatio × rate. Used by every happy-path
+//     throttle assertion.
+//   - chaosBpsCap: throttledCap × chaosCapMultiplier. Used by every
+//     chaos assertion.
+//
+// On any error keeps safe fallback values. Calibration on iperf-server
+// (annotated 10M ingress) leaves its bucket drained — that's fine,
+// it's what makes Topology A's enforcement assertion robust.
 //
 // Procedure:
 //  1. Drain iperf-server's bucket with a long iperf3 so subsequent
 //     short measurements aren't bucket-saturation-inflated.
-//  2. Run 3 short measurements back-to-back (each starts at near-empty
-//     bucket → measured rate ≈ configured rate, variance ≈ jitter).
-//  3. Compute relative stddev j = σ/μ.
-//  4. Solve: throttleDuration > burstSeconds / (cap/(1+2j) - 1).
+//  2. Run 3 short measurements back-to-back (each starts near empty
+//     bucket → measured rate ≈ steady-state, variance ≈ jitter).
+//  3. Compute mean μ, stddev σ, relative jitter j = σ/μ.
+//  4. throttledCap = μ × (1 + 2j + margin), floored at
+//     rate × throttleCapFloorRatio.
+//  5. throttleDuration solves
+//     (1 + burstSeconds/d) × (1+2j) < (cap / rate), clamped to
+//     [throttleDurationFloor, throttleDurationCeiling].
 //
-// Calibration on iperf-server (annotated 10M ingress) leaves its
-// bucket drained — that's fine, it's what makes Topology A's
-// enforcement assertion robust.
-func calibrateThrottleDuration() {
+// The 2σ band is the symmetric noise budget; the +margin handles
+// minor between-test variance the 3-sample window won't see.
+func calibrateRig() {
 	defer func() {
-		GinkgoWriter.Printf("throttleDuration = %ds\n", throttleDuration)
+		GinkgoWriter.Printf("throttleDuration = %ds, throttledCap = %.2f Mbps, chaosBpsCap = %.2f Mbps\n",
+			throttleDuration, float64(throttledCap)/1e6, float64(chaosBpsCap)/1e6)
 	}()
 
 	const drainSeconds = 10
@@ -296,7 +320,7 @@ func calibrateThrottleDuration() {
 
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	if _, err := runIperfWithError(drainCtx, iperfOpts{Target: "iperf-server", Duration: drainSeconds}); err != nil {
-		GinkgoWriter.Printf("calibration drain failed (%v); keeping fallback duration\n", err)
+		GinkgoWriter.Printf("calibration drain failed (%v); keeping fallback caps + duration\n", err)
 		drainCancel()
 		return
 	}
@@ -308,7 +332,7 @@ func calibrateThrottleDuration() {
 		bps, err := runIperfWithError(ctx, iperfOpts{Target: "iperf-server", Duration: calibSeconds})
 		cancel()
 		if err != nil || bps == 0 {
-			GinkgoWriter.Printf("calibration sample %d/%d failed (err=%v bps=%d); keeping fallback duration\n",
+			GinkgoWriter.Printf("calibration sample %d/%d failed (err=%v bps=%d); keeping fallbacks\n",
 				i+1, calibSamples, err, bps)
 			return
 		}
@@ -321,7 +345,7 @@ func calibrateThrottleDuration() {
 	}
 	mean := sum / float64(len(samples))
 	if mean <= 0 {
-		GinkgoWriter.Printf("calibration mean=0; keeping fallback duration\n")
+		GinkgoWriter.Printf("calibration mean=0; keeping fallbacks\n")
 		return
 	}
 	var sumSq float64
@@ -332,15 +356,27 @@ func calibrateThrottleDuration() {
 	stddev := math.Sqrt(sumSq / float64(len(samples)))
 	jitter := stddev / mean
 
+	// Dynamic cap: μ + 2σ + margin, floored at rate × floorRatio so
+	// a freakishly-tight calibration doesn't produce a brittle cap.
+	capFromMean := mean * (1.0 + 2.0*jitter + throttleCapMargin)
+	capFloor := float64(bandwidthBps) * throttleCapFloorRatio
+	if capFromMean < capFloor {
+		capFromMean = capFloor
+	}
+	throttledCap = int64(capFromMean)
+	chaosBpsCap = int64(capFromMean * chaosCapMultiplier)
+
+	// Duration: same math as before but reads the cap from the
+	// just-derived dynamic value instead of a hardcoded ratio.
+	dynCapRatio := capFromMean / float64(bandwidthBps)
 	safe := 1.0 + 2.0*jitter
-	if throttledCapRatio <= safe+0.005 {
-		// Jitter so high that no reasonable duration helps; clamp.
+	if dynCapRatio <= safe+0.005 {
 		throttleDuration = throttleDurationCeiling
-		GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% — high jitter, clamping to %ds\n",
+		GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% — high jitter, clamping duration to %ds\n",
 			mean/1e6, stddev/1e6, jitter*100, throttleDuration)
 		return
 	}
-	optimal := math.Ceil(burstSeconds / (throttledCapRatio/safe - 1.0))
+	optimal := math.Ceil(burstSeconds / (dynCapRatio/safe - 1.0))
 	d := int(optimal)
 	if d < throttleDurationFloor {
 		d = throttleDurationFloor
