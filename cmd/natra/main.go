@@ -26,18 +26,18 @@ import (
 const pinDir = "/sys/fs/bpf/natra"
 
 // pinPathFor is the bpffs path for the pinned tcx link of a given
-// container's interface in a given direction. Two pods with the same
-// name on different nodes get different paths because containerID is
-// unique per kubelet pod sandbox; ingress and egress get distinct pin
-// files within a pod.
+// container's veth in a given (side, direction). Side is embedded
+// instead of the interface name — pod-side eth0 is uniform across
+// pods but host-side veth names are random per pod, so encoding the
+// side makes ls output legible regardless.
 //
 // Bpffs forbids dots in pin file names (kernel/bpf/inode.c::bpf_lookup
 // returns EPERM on any name containing '.' when the parent dir has
 // any S_IALLUGO bits — those names are reserved for kernel-internal
 // special files created by populate_bpffs). So no `.link` extension;
 // we use a `-link` suffix instead.
-func pinPathFor(containerID, ifName string, dir bpf.Direction) string {
-	return filepath.Join(pinDir, containerID+"-"+ifName+"-"+dir.String()+"-link")
+func pinPathFor(containerID string, side bpf.Side, dir bpf.Direction) string {
+	return filepath.Join(pinDir, containerID+"-"+side.String()+"-"+dir.String()+"-link")
 }
 
 var (
@@ -52,8 +52,9 @@ var (
 // RuntimeConfig.Bandwidth is what kubelet populates when the conflist
 // declares `capabilities.bandwidth: true`. PodAnnotations is the
 // older direct path; if both channels are present, Bandwidth wins.
-// AttachMode is the top-level natra-specific knob: empty (default)
-// → tcx; "clsact-podside" → opt-in fallback.
+// AttachMode is the top-level natra-specific knob — one of
+// "tcx-hostside" (default), "tcx-podside", "clsact-hostside",
+// "clsact-podside".
 type NetConf struct {
 	types.NetConf
 	AttachMode    string `json:"attachMode,omitempty"`
@@ -68,17 +69,26 @@ type NetConf struct {
 	} `json:"runtimeConfig,omitempty"`
 }
 
-// resolveAttachMode parses NetConf.AttachMode into the bpf package's
-// enum. Empty string and "tcx" both resolve to the default; any other
-// value is rejected.
-func resolveAttachMode(s string) (bpf.AttachMode, error) {
+// resolveAttachMode parses NetConf.AttachMode into a (hook, side)
+// pair. Empty string defaults to tcx-hostside — same attach surface
+// Cilium and the AWS network-policy-agent use, which is the most
+// portable choice for coexistence with other BPF stacks on EKS-style
+// nodes.
+func resolveAttachMode(s string) (bpf.Hook, bpf.Side, error) {
 	switch s {
-	case "", "tcx":
-		return bpf.AttachTCX, nil
+	case "", "tcx-hostside":
+		return bpf.HookTCX, bpf.SideHost, nil
+	case "tcx-podside":
+		return bpf.HookTCX, bpf.SidePod, nil
+	case "clsact-hostside":
+		return bpf.HookClsact, bpf.SideHost, nil
 	case "clsact-podside":
-		return bpf.AttachClsactPodside, nil
+		return bpf.HookClsact, bpf.SidePod, nil
 	default:
-		return 0, fmt.Errorf("unknown attachMode %q (want \"tcx\" or \"clsact-podside\")", s)
+		return 0, 0, fmt.Errorf(
+			"unknown attachMode %q (want one of: %s)",
+			s, "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside",
+		)
 	}
 }
 
@@ -119,7 +129,7 @@ func main() {
 //  2. Resolve bandwidth per direction from runtimeConfig + annotations;
 //     pass through if neither direction has a rate.
 //  3. Load BPF object, configure each direction's rate/burst, attach
-//     each direction's program to the pod-side veth.
+//     each direction's program to the chosen veth side.
 //  4. Print PrevResult so the next chained plugin (or kubelet) sees
 //     what came in — natra doesn't modify networking, only adds rate
 //     limiting on top.
@@ -141,7 +151,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	mode, err := resolveAttachMode(conf.AttachMode)
+	hook, side, err := resolveAttachMode(conf.AttachMode)
 	if err != nil {
 		return fmt.Errorf("attachMode: %w", err)
 	}
@@ -152,10 +162,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logf("no rate limit on either direction, passing through")
 		return passthrough(args, conf)
 	}
-	logf("config resolved: ingress=%v egress=%v attachMode=%v",
-		describeCfg(ingressCfg), describeCfg(egressCfg), mode)
+	logf("config resolved: ingress=%v egress=%v hook=%s side=%s",
+		describeCfg(ingressCfg), describeCfg(egressCfg), hook, side)
 
-	if err := attachBPF(args, ingressCfg, egressCfg, mode); err != nil {
+	if err := attachBPF(args, ingressCfg, egressCfg, hook, side); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
@@ -206,11 +216,11 @@ func logCaps() {
 // cmdDel cleans up the bpffs pins for this container. Two kinds of pins
 // can exist:
 //
-//   - The tcx-link pin (<containerID>-<ifName>-link). Removing it drops
-//     the kernel's last reference to the link, which detaches the BPF
-//     program from the pod-side veth. Only present in AttachTCX mode.
+//   - The tcx-link pin (<containerID>-<side>-<direction>-link).
+//     Removing it drops the kernel's last reference to the link, which
+//     detaches the BPF program. Only present in HookTCX modes.
 //   - The per-container map pins (<containerID>-{config,bucket,stats,cms}-map).
-//     Useful for the dump-stats subcommand. Both attach modes write these.
+//     Useful for the dump-stats subcommand. Both hook modes write these.
 //
 // Walks the pin dir once and removes everything with the container's
 // prefix. CNI DEL is idempotent — missing files are not errors. We
@@ -316,45 +326,45 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 	return nil
 }
 
-// attachBPF enters the pod's network namespace, finds the interface
-// kubelet asked us to operate on (CNI_IFNAME, typically "eth0"),
-// loads the BPF object, configures each direction that has a rate,
-// and attaches the matching BPF program. At least one of ingress or
-// egress is non-nil when this is called.
+// attachBPF resolves the chosen veth-side's ifindex, loads the BPF
+// object, configures each direction that has a rate, and attaches.
+// At least one of ingress or egress is non-nil when this is called.
+//
+// The ifindex resolution depends on side:
+//   - SidePod: enter the pod netns, look up args.IfName (typically
+//     "eth0"), attach inside the netns. Cleanup is automatic when
+//     the pod terminates and the netns is destroyed.
+//   - SideHost: visit the pod netns just long enough to read eth0's
+//     veth peer ifindex via netlink, exit the netns, attach in the
+//     host netns. Cleanup relies on cmdDel removing the pin files.
 //
 // We have to leave the calling OS thread in the same netns we entered
-// with. CNI's skel framework checks after the plugin returns and exits
-// "code 8" if the plugin's netns matches CNI_NETNS, regardless of what
-// stdout said. The restore is deferred immediately after the switch
-// so any error path returns us to origin.
+// with. CNI's skel framework checks after the plugin returns and
+// exits "code 8" if the plugin's netns matches CNI_NETNS, regardless
+// of what stdout said. The restore is deferred immediately after the
+// switch so any error path returns us to origin.
 //
-// We don't close prog on success. For tcx, each direction's link is
-// pinned to bpffs and the kernel holds the program reference via the
-// link until the pin is removed (cmdDel). For clsact-podside, the
-// kernel holds the program reference via the qdisc tree until the
-// underlying veth is deleted.
+// We don't close prog on success. For HookTCX, each direction's link
+// is pinned to bpffs and the kernel holds the program reference via
+// the link until the pin is removed (cmdDel). For HookClsact, the
+// kernel holds the program reference via the qdisc tree.
 //
 // If one direction's attach succeeds and the other fails, the
 // successful side is rolled back (link closed, pin removed) and the
 // whole call returns an error. The fail-open contract at the caller
 // level then lets traffic flow unrate-limited rather than half-applied.
-func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bpf.AttachMode) error {
+func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bpf.Hook, side bpf.Side) error {
 	// netns.Set switches the calling thread, so a goroutine migration
 	// mid-flow would leave us in a different namespace than we think.
 	// Lock the thread for the duration of the netns dance.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	restore, err := enterNetns(args.Netns)
+	ifIndex, restore, err := resolveIfIndex(args.Netns, args.IfName, side)
 	if err != nil {
-		return fmt.Errorf("enter pod netns %s: %w", args.Netns, err)
+		return err
 	}
 	defer restore()
-
-	iface, err := net.InterfaceByName(args.IfName)
-	if err != nil {
-		return fmt.Errorf("interface %q in pod netns: %w", args.IfName, err)
-	}
 
 	prog, err := bpf.Load()
 	if err != nil {
@@ -368,33 +378,15 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bp
 	}
 
 	type attachStep struct {
-		name string
-		dir  bpf.Direction
-		cfg  *config.Config
-		do   func() error
+		dir bpf.Direction
+		cfg *config.Config
 	}
 	var steps []attachStep
 	if ingressCfg != nil {
-		ingressPin := pinPathFor(args.ContainerID, args.IfName, bpf.DirectionIngress)
-		steps = append(steps, attachStep{
-			name: "ingress",
-			dir:  bpf.DirectionIngress,
-			cfg:  ingressCfg,
-			do: func() error {
-				return prog.AttachIngress(iface.Index, mode, ingressPin)
-			},
-		})
+		steps = append(steps, attachStep{bpf.DirectionIngress, ingressCfg})
 	}
 	if egressCfg != nil {
-		egressPin := pinPathFor(args.ContainerID, args.IfName, bpf.DirectionEgress)
-		steps = append(steps, attachStep{
-			name: "egress",
-			dir:  bpf.DirectionEgress,
-			cfg:  egressCfg,
-			do: func() error {
-				return prog.AttachEgress(iface.Index, mode, egressPin)
-			},
-		})
+		steps = append(steps, attachStep{bpf.DirectionEgress, egressCfg})
 	}
 
 	// rollback removes pin files from previously-attached directions
@@ -403,7 +395,7 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bp
 	// doesn't see stale pins.
 	rollback := func(upto int) {
 		for j := 0; j < upto; j++ {
-			path := pinPathFor(args.ContainerID, args.IfName, steps[j].dir)
+			path := pinPathFor(args.ContainerID, side, steps[j].dir)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "natra: rollback remove %s: %v\n", path, err)
 			}
@@ -418,12 +410,19 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bp
 		}); err != nil {
 			rollback(i)
 			_ = prog.Close()
-			return fmt.Errorf("configure BPF (%s): %w", step.name, err)
+			return fmt.Errorf("configure BPF (%s): %w", step.dir, err)
 		}
-		if err := step.do(); err != nil {
+		opts := bpf.AttachOptions{
+			Direction: step.dir,
+			Side:      side,
+			Hook:      hook,
+			IfIndex:   ifIndex,
+			PinPath:   pinPathFor(args.ContainerID, side, step.dir),
+		}
+		if err := prog.Attach(opts); err != nil {
 			rollback(i)
 			_ = prog.Close()
-			return fmt.Errorf("attach BPF %s on %s: %w", step.name, args.IfName, err)
+			return fmt.Errorf("attach BPF %s: %w", step.dir, err)
 		}
 	}
 
@@ -436,20 +435,54 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, mode bp
 	}
 
 	for _, step := range steps {
-		announce(args, iface.Index, step.name, step.cfg)
+		announce(ifIndex, side, step.dir, step.cfg)
 	}
 	return nil
+}
+
+// resolveIfIndex finds the kernel ifindex to attach to based on the
+// chosen side, and returns a restore function that cleans up any
+// netns state (the caller defers it).
+//
+// For SidePod: enter the pod netns, look up the named interface,
+// stay in the netns (caller's attach happens here).
+//
+// For SideHost: briefly enter the pod netns to find the host-side
+// peer's ifindex via VethPeerIndex, then return to the host netns.
+// The restore is a no-op because we exit the netns inline.
+func resolveIfIndex(netnsPath, ifName string, side bpf.Side) (int, func(), error) {
+	switch side {
+	case bpf.SidePod:
+		restore, err := enterNetns(netnsPath)
+		if err != nil {
+			return 0, func() {}, fmt.Errorf("enter pod netns %s: %w", netnsPath, err)
+		}
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			restore()
+			return 0, func() {}, fmt.Errorf("interface %q in pod netns: %w", ifName, err)
+		}
+		return iface.Index, restore, nil
+	case bpf.SideHost:
+		idx, err := hostsidePeerIfIndex(netnsPath, ifName)
+		if err != nil {
+			return 0, func() {}, err
+		}
+		return idx, func() {}, nil
+	default:
+		return 0, func() {}, fmt.Errorf("unknown bpf.Side %v", side)
+	}
 }
 
 // announce writes the "attached" line to stderr (kubelet captures it)
 // and to the natra log. Two destinations because each is read by a
 // different audience: kubelet on plugin error, the log file on every
 // invocation regardless. One announce per direction.
-func announce(args *skel.CmdArgs, ifIndex int, direction string, cfg *config.Config) {
-	fmt.Fprintf(os.Stderr, "natra: attached to %s %s (ifindex=%d) rate=%d bps burst=%d bytes\n",
-		args.IfName, direction, ifIndex, cfg.Rate, cfg.Burst)
-	logf("attached: ifname=%s direction=%s ifindex=%d rate=%d burst=%d hh=%d",
-		args.IfName, direction, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
+func announce(ifIndex int, side bpf.Side, dir bpf.Direction, cfg *config.Config) {
+	fmt.Fprintf(os.Stderr, "natra: attached %s/%s on ifindex=%d rate=%d bps burst=%d bytes\n",
+		side, dir, ifIndex, cfg.Rate, cfg.Burst)
+	logf("attached: side=%s direction=%s ifindex=%d rate=%d burst=%d hh=%d",
+		side, dir, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
 func passthrough(args *skel.CmdArgs, conf *NetConf) error {

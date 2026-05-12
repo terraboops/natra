@@ -24,9 +24,10 @@ on-demand via `make perf-vs-vanilla`, not part of `make ci`.
 ## Layer 2 — CNI protocol
 
 Files under `test/cni/`:
-- `cni_linux_test.go` — happy-path ADD/DEL/CHECK + the two attach
-  modes (tcx, clsact-podside) + per-direction specs (ingress only,
-  egress only, both, neither).
+- `cni_linux_test.go` — happy-path ADD/DEL/CHECK + the four attach
+  modes (tcx-hostside default, tcx-podside, clsact-hostside,
+  clsact-podside) + per-direction specs (ingress only, egress only,
+  both, neither).
 - `chaos_linux_test.go` — malformed stdin, annotation injection on
   both ingress and egress channels, bad CNI env vars.
 - `helpers_linux_test.go` — netns lifecycle, exec, env-var
@@ -129,7 +130,9 @@ Topologies asserted:
 
 Run:
 ```bash
-make test-e2e                                 # default tcx
+make test-e2e                                 # default tcx-hostside
+NATRA_E2E_ATTACH_MODE=tcx-podside make test-e2e
+NATRA_E2E_ATTACH_MODE=clsact-hostside make test-e2e
 NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e
 ```
 
@@ -176,16 +179,26 @@ and trivially pass under both implementations.
 
 ## Attach modes for tests
 
-natra's default is `tcx` (kernel 6.6+). The opt-in fallback
-`clsact-podside` is for older kernels. Selected via the conflist
-`attachMode` field at the plugin level, or via `NATRA_ATTACH_MODE`
-on the install init container, or via `NATRA_E2E_ATTACH_MODE` /
-`NATRA_PERF_ATTACH_MODE` on the test rig.
+natra picks one of four attach modes, an orthogonal cross of
+`{tcx, clsact}` × `{hostside, podside}`:
+
+| Mode             | Hook    | Veth half      | Notes                                  |
+|------------------|---------|----------------|----------------------------------------|
+| `tcx-hostside`   | TCX     | host           | Default. Same shape as Cilium / NPA.   |
+| `tcx-podside`    | TCX     | pod (eth0)     | Lives inside the pod netns.            |
+| `clsact-hostside`| clsact  | host           | TC filter on the host-side veth.       |
+| `clsact-podside` | clsact  | pod (eth0)     | Fallback for kernels < 6.6 / no bpffs. |
+
+Selected via the conflist `attachMode` field at the plugin level, or
+via `NATRA_ATTACH_MODE` on the install init container, or via
+`NATRA_E2E_ATTACH_MODE` / `NATRA_PERF_ATTACH_MODE` on the test rig.
 
 Each annotated direction adds one tcx link per pod (or one clsact
 filter on the matching `HANDLE_MIN_*` parent). A bidi-annotated pod
 in tcx mode therefore has two link pins under
-`/sys/fs/bpf/natra/<containerID>-<ifName>-{ingress,egress}-link`.
+`/sys/fs/bpf/natra/<containerID>-<side>-{ingress,egress}-link`.
+The `<side>` field is `hostside` or `podside` matching the attach
+mode the pod was started with.
 
 Bpffs forbids `.` in pin path components — `kernel/bpf/inode.c::bpf_lookup`
 returns EPERM on any name containing a dot when the parent has any

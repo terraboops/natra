@@ -283,10 +283,11 @@ kind create cluster --name "$NATRA_CLUSTER" \
 kind load docker-image "$NATRA_IMAGE" "$PERFCLIENT_IMAGE" --name "$NATRA_CLUSTER"
 
 kubectl apply -f "$TMPDIR/natra/namespace.yaml"
-# NATRA_PERF_ATTACH_MODE picks the attach path. Default is tcx
-# (production default). Set clsact-podside to exercise the fallback.
+# NATRA_PERF_ATTACH_MODE picks the attach path. Default is
+# tcx-hostside (production default); other options are tcx-podside,
+# clsact-hostside, clsact-podside.
 ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
-if [ "$ATTACH_MODE" = "tcx" ]; then ATTACH_MODE=""; fi
+if [ "$ATTACH_MODE" = "tcx-hostside" ]; then ATTACH_MODE=""; fi
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
     -e "s|value: \"\"$|value: \"${ATTACH_MODE}\"|" \

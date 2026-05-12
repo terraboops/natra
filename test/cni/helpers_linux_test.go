@@ -194,13 +194,14 @@ func remainingPinsFor(containerID string) []string {
 	return out
 }
 
-// linkPinExists reports whether the pin file for one direction is
-// present at /sys/fs/bpf/natra/<containerID>-<ifName>-<direction>-link.
-// `direction` is "ingress" or "egress" (matches bpf.Direction.String()).
-// Uses ReadDir + name match because bpffs returns EPERM (not ENOENT)
-// on stat of a non-existent file.
-func linkPinExists(containerID, ifName, direction string) bool {
-	target := containerID + "-" + ifName + "-" + direction + "-link"
+// linkPinExists reports whether the pin file for one (side, direction)
+// is present at /sys/fs/bpf/natra/<containerID>-<side>-<direction>-link.
+// `side` is "hostside" or "podside"; `direction` is "ingress" or
+// "egress" (matches bpf.Side.String() and bpf.Direction.String()). Uses
+// ReadDir + name match because bpffs returns EPERM (not ENOENT) on
+// stat of a non-existent file.
+func linkPinExists(containerID, side, direction string) bool {
+	target := containerID + "-" + side + "-" + direction + "-link"
 	for _, name := range remainingPinsFor(containerID) {
 		if name == target {
 			return true
@@ -209,10 +210,15 @@ func linkPinExists(containerID, ifName, direction string) bool {
 	return false
 }
 
-// anyLinkPinExists reports whether either direction's pin file is
-// present for this container. Useful for the "neither annotation"
-// negative test where we assert no BPF was attached at all.
-func anyLinkPinExists(containerID, ifName string) bool {
-	return linkPinExists(containerID, ifName, "ingress") ||
-		linkPinExists(containerID, ifName, "egress")
+// anyLinkPinExists reports whether any direction's pin file is
+// present for this container across either side. Useful for the
+// "neither annotation" negative test where we assert no BPF was
+// attached at all.
+func anyLinkPinExists(containerID string) bool {
+	for _, side := range []string{"hostside", "podside"} {
+		if linkPinExists(containerID, side, "ingress") || linkPinExists(containerID, side, "egress") {
+			return true
+		}
+	}
+	return false
 }

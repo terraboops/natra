@@ -26,15 +26,14 @@ import (
 var chaosBpsCap = int64(float64(bandwidthBps) * 1.50)
 
 var _ = Describe("natra cluster chaos", func() {
-	// natra's BPF programs are attached via tcx (default) or clsact +
-	// tc filter (opt-in fallback). For tcx, the kernel keeps each
-	// program loaded as long as its bpffs link pin exists; for
-	// clsact-podside, the kernel holds the program via the qdisc tree
-	// until the veth is deleted. Either way the attachment outlives
-	// the natra-installer process. Kubelet kills the installer pod,
-	// the kernel keeps the rate-limit alive, and the new installer
-	// pod re-applies the conflist patch without disturbing existing
-	// flows.
+	// natra's BPF programs are attached via tcx (default) or clsact
+	// (opt-in fallback). For tcx, the kernel keeps each program
+	// loaded as long as its bpffs link pin exists; for clsact, the
+	// kernel holds the program via the qdisc tree until the veth is
+	// deleted. Either way the attachment outlives the natra-installer
+	// process. Kubelet kills the installer pod, the kernel keeps the
+	// rate-limit alive, and the new installer pod re-applies the
+	// conflist patch without disturbing existing flows.
 	//
 	// This test pins that property so a regression (e.g., switching to
 	// a host-process-pinned attachment) can't silently break it.
@@ -105,11 +104,11 @@ var _ = Describe("natra cluster chaos", func() {
 	})
 
 	// Pod churn stresses two natra paths simultaneously:
-	//   - CNI ADD on each new pod (loads BPF, configures, attaches via tcx
-	//     in default mode or clsact in fallback mode)
-	//   - CNI DEL on each pod teardown (cmdDel removes per-direction link
-	//     pins from bpffs; for clsact-podside the kernel auto-detaches
-	//     the program when the veth disappears)
+	//   - CNI ADD on each new pod (loads BPF, configures, attaches via
+	//     tcx in default mode or clsact in fallback mode)
+	//   - CNI DEL on each pod teardown (cmdDel removes per-direction
+	//     link pins from bpffs; for clsact the kernel auto-detaches the
+	//     program when the veth disappears)
 	//
 	// The check isn't byte-exact — at this volume some pods may still
 	// be in ContainerCreating when the test ends and that's fine — but

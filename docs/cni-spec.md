@@ -24,14 +24,18 @@ Negotiated CNI version: 1.0.0 (with 0.3.0/0.3.1/0.4.0 also accepted).
    `capabilities.bandwidth: true`.
 3. If neither direction has a rate, print `prevResult` and return —
    no BPF is loaded.
-4. Resolve attach mode from the top-level `attachMode` field
-   (`tcx` default, `clsact-podside` opt-in). Both directions use the
-   same mode.
-5. Enter the pod netns, load the BPF object, and for each direction
-   that has a rate: configure that direction's slot, attach the
-   matching program (`natra_ingress` or `natra_egress`) to the
-   matching hook.
-6. Print `prevResult` and return.
+4. Resolve attach mode from the top-level `attachMode` field. One of
+   `tcx-hostside` (default), `tcx-podside`, `clsact-hostside`,
+   `clsact-podside`. Both directions use the same mode.
+5. Resolve the target ifindex for the chosen side — pod-side enters
+   the pod netns and reads eth0; host-side enters briefly to read
+   eth0's veth peer ifindex, then attaches in the host netns.
+6. Load the BPF object, and for each direction that has a rate:
+   configure that direction's slot, attach the matching program
+   (`natra_ingress` or `natra_egress`) to the matching hook. The
+   loader flips hook-direction to opposite the pod-direction on
+   host-side attach.
+7. Print `prevResult` and return.
 
 If one direction's attach succeeds and the other fails, the
 successful side is rolled back (link closed, pin removed) and the
@@ -46,14 +50,15 @@ than a Pod running unrate-limited.
 
 Remove the per-container pins under `/sys/fs/bpf/natra/`:
 
-- `<containerID>-<ifName>-ingress-link` — the ingress tcx-link pin
-  (only present when ingress was attached in tcx mode).
-- `<containerID>-<ifName>-egress-link` — the egress tcx-link pin
-  (only present when egress was attached in tcx mode).
+- `<containerID>-<side>-ingress-link` — the ingress tcx-link pin
+  (only present in tcx modes; `<side>` is `hostside` or `podside`).
+- `<containerID>-<side>-egress-link` — the egress tcx-link pin
+  (only present in tcx modes).
 - `<containerID>-{config,bucket,stats,cms}-map` — the per-pod map
-  pins (used by `natra dump-stats`; one set shared across directions).
+  pins (used by `natra dump-stats`; one set shared across
+  directions, written for both tcx and clsact modes).
 
-For clsact-podside attachments there are no link pins. The kernel
+For clsact-* attachments there are no link pins. The kernel
 auto-detaches the filters when the next chained plugin's DEL deletes
 the underlying veth.
 
@@ -81,7 +86,7 @@ with `version.All`).
   "cniVersion": "1.0.0",
   "name": "kindnet",          // matches the upstream conflist
   "type": "natra",
-  "attachMode": "tcx",        // optional; "tcx" (default) or "clsact-podside"
+  "attachMode": "tcx-hostside", // optional; one of: tcx-hostside (default), tcx-podside, clsact-hostside, clsact-podside
   "capabilities": {
     "bandwidth": true         // tells kubelet to populate runtimeConfig.bandwidth
   },

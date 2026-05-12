@@ -123,11 +123,12 @@ half-applied state.
 
 CNI DEL removes the per-container pins:
 
-- For tcx mode: per-direction link pins
-  (`<containerID>-<ifName>-{ingress,egress}-link`).
-- For clsact-podside: no link pins; the kernel auto-detaches the
+- For tcx modes: per-direction link pins
+  (`<containerID>-<side>-{ingress,egress}-link`, where `<side>` is
+  `hostside` or `podside`).
+- For clsact modes: no link pins; the kernel auto-detaches the
   filters when the chained CNI's DEL deletes the underlying veth.
-- For both modes: per-container map pins
+- For all modes: per-container map pins
   (`<containerID>-{config,bucket,stats,cms}-map`).
 
 `cmdDel` walks the pin dir and removes everything with the
@@ -183,54 +184,75 @@ the egress annotation.
 
 ## Kernel requirements
 
-- Default tcx mode: kernel 6.6+ (uses `bpf_mprog`).
-- Fallback `clsact-podside` mode: kernel 5.x+.
+- tcx-* modes: kernel 6.6+ (uses `bpf_mprog`).
+- clsact-* modes: kernel 5.x+.
 - EKS: AL2023 or recent Bottlerocket for the `cap_bpf` ambient cap.
 
 ## Attachment
 
-natra supports two attach modes per direction, controlled by the
-`attachMode` field on the conflist entry (or the `NATRA_ATTACH_MODE`
-env var passed to the install init container). Both directions use
-the same mode; the choice is a deployment-wide knob.
+natra picks an attach mode along two orthogonal axes — the kernel
+hook surface (TCX or clsact) and the veth half (host-side or
+pod-side). Four modes total: `tcx-hostside` (default), `tcx-podside`,
+`clsact-hostside`, `clsact-podside`. Selected via the `attachMode`
+field on the conflist entry or the `NATRA_ATTACH_MODE` env on the
+install init container. Both directions use the same mode; the
+choice is deployment-wide.
 
-### `tcx` (default)
+The natra BPF program is symmetric per direction: `natra_ingress`
+processes packets in the pod-ingress direction regardless of which
+veth-half it sits on. The loader handles the hook-direction flip
+internally — on the host-side a pod-ingress packet arrives at the
+host veth's egress hook, and vice versa.
 
-`pkg/bpf/loader.go::AttachIngress` and `AttachEgress` each call
-`link.AttachTCX(...)` against the matching hook
-(`ebpf.AttachTCXIngress` / `ebpf.AttachTCXEgress`) and pin the
+### Hook: TCX (kernel 6.6+)
+
+`pkg/bpf/loader.go::Attach` with `Hook: HookTCX` calls
+`link.AttachTCX(...)` against the matching kernel hook
+(`ebpf.AttachTCXIngress` / `ebpf.AttachTCXEgress`) and pins the
 returned link to bpffs at
-`/sys/fs/bpf/natra/<containerID>-<ifName>-<direction>-link`. The
+`/sys/fs/bpf/natra/<containerID>-<side>-<direction>-link`. The
 kernel holds each program reference via its link until `cmdDel`
 removes the pin. Composes via `bpf_mprog` with anything else
-attaching at the same hook (cilium-agent, aws-network-policy-agent).
+attaching at the same hook.
 
-Prerequisites:
+### Hook: clsact (kernel 5.x+)
 
-- Kernel 6.6+ (when tcx attachment was added).
+`pkg/bpf/loader.go::Attach` with `Hook: HookClsact` adds a `clsact`
+qdisc (idempotent — the second direction's call is a no-op via
+EEXIST) and calls `netlink.FilterReplace` to install the program on
+the matching parent (`HANDLE_MIN_INGRESS` or `HANDLE_MIN_EGRESS`)
+with `DirectAction: true`. The kernel's qdisc tree holds the
+program references for the lifetime of the veth. Collides with
+anything else attaching clsact on the same hook; whoever attached
+last wins.
+
+### Side: hostside (default)
+
+`cmd/natra/main.go::resolveIfIndex` briefly enters the pod netns to
+read the pod-eth0's veth peer ifindex via netlink, then returns to
+the host netns for the actual attach. Same approach Cilium's
+`generic-veth` chaining mode uses. Survives pod-side restrictions on
+network admin caps, and is the default attach point Cilium and the
+AWS network-policy-agent target — natra coexists with them on the
+opposite veth half regardless.
+
+### Side: podside
+
+`resolveIfIndex` enters the pod netns and attaches inline against
+`eth0` (typically). Kernel auto-cleans on netns teardown when the
+pod terminates, with no host-side bpffs state to GC. Useful when the
+host netns is locked down or already crowded with another BPF stack.
+
+### Common prerequisites
+
 - bpffs mounted at `/sys/fs/bpf` before natra runs. The DaemonSet's
   install init container handles this with
-  `mountPropagation: Bidirectional` so kubelet's later CNI invocations
-  see the mount.
-- File caps: `setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep`
-  on `/opt/cni/bin/natra`. Kubelet doesn't pass these through ambient,
-  so the binary needs them via file caps.
-
-### `clsact-podside` (opt-in)
-
-`pkg/bpf/loader.go::attachClsactPodside` adds a `clsact` qdisc
-(idempotent — the second direction's call is a no-op via EEXIST) and
-calls `netlink.FilterReplace` to install the program on the matching
-parent (`HANDLE_MIN_INGRESS` or `HANDLE_MIN_EGRESS`) with
-`DirectAction: true`. Because `attachBPF` enters the pod netns before
-calling, this attaches to the pod-side end of the veth pair —
-host-side AWS VPC CNI clsact filters live in the host netns and don't
-see this. The kernel's qdisc tree holds the program references for
-the lifetime of the veth.
-
-Tradeoffs vs tcx: collides with anything else attaching clsact in the
-same pod's netns. Doesn't compose; whoever attached last wins. Useful
-only on kernels that lack tcx (< 6.6).
+  `mountPropagation: Bidirectional` so kubelet's later CNI
+  invocations see the mount.
+- File caps:
+  `setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep`
+  on `/opt/cni/bin/natra`. Kubelet doesn't pass these through
+  ambient, so the binary needs them via file caps.
 
 ## Open ends
 

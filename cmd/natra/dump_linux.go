@@ -16,7 +16,12 @@ import (
 )
 
 // dumpStats reads the pinned natra maps for the given container and
-// prints stats / config / a CMS histogram summary, per direction.
+// prints stats / config / a CMS histogram summary, per direction. The
+// pinned files use the same containerID-rooted naming convention as
+// cmd/natra/main.go writes; link pins ("-<side>-<direction>-link")
+// are listed but their contents aren't dumped — the kernel exposes
+// link state via bpftool, not via map reads.
+//
 // Useful for post-mortem inspection — tells you whether traffic
 // actually flowed through the BPF program in either direction and how
 // the CMS classified it.

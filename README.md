@@ -46,8 +46,8 @@ make ci            # full matrix (lint, licenses, L1-L5)
 
 ## Requirements
 
-- Linux kernel 6.6+ for the default tcx attach mode; 5.x+ for the
-  opt-in `clsact-podside` fallback.
+- Linux kernel 6.6+ for tcx attach modes; 5.x+ for the clsact
+  fallback modes.
 - Go 1.25+ (matches `go.mod`).
 - LLVM clang with the `bpf` target. Apple clang lacks it; on macOS
   `brew install llvm` and the Makefile picks it up.
@@ -59,8 +59,10 @@ make ci            # full matrix (lint, licenses, L1-L5)
 - No production users. The code is days old.
 - Tested on kind + colima. Not yet exercised on EKS, GKE, AKS, or a
   real bare-metal cluster.
-- Default attach mode is tcx (kernel 6.6+); `clsact-podside` is an
-  opt-in fallback for older kernels.
+- Default attach mode is `tcx-hostside` (kernel 6.6+, same hook
+  surface as Cilium and the AWS network-policy-agent). Alternates
+  are `tcx-podside`, `clsact-hostside`, `clsact-podside`; pick via
+  the conflist `attachMode` field or `NATRA_ATTACH_MODE` env.
 - CI runs against a single host kernel. There's no kernel matrix
   (the lvh image registry has been unreliable).
 - L5 perf scenarios use `BPF_PROG_RUN` against synthetic packets,

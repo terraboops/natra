@@ -182,11 +182,12 @@ var _ = AfterSuite(func() {
 // Topology F's reinstatement step.
 func installNatraDaemon() {
 	// NATRA_E2E_ATTACH_MODE picks the attach path the test rig
-	// exercises. Default is "tcx" (production default). Set
-	// "clsact-podside" to exercise the fallback explicitly.
+	// exercises. Default is "tcx-hostside" (production default). Set
+	// to any of {tcx-hostside, tcx-podside, clsact-hostside,
+	// clsact-podside} to exercise that combination explicitly.
 	attachMode := os.Getenv("NATRA_E2E_ATTACH_MODE")
-	if attachMode == "" || attachMode == "tcx" {
-		attachMode = "" // empty in the manifest = tcx default
+	if attachMode == "tcx-hostside" {
+		attachMode = "" // empty in the manifest = default (tcx-hostside)
 	}
 	mustExec("bash", "-c",
 		fmt.Sprintf(`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' -e 's|value: ""$|value: "%s"|' %s | kubectl apply -f -`,

@@ -1,18 +1,26 @@
 //go:build linux
 
 // Package bpf loads the embedded natra BPF object and attaches it to a
-// pod-side veth in either or both directions. Two attach modes per
-// direction:
+// veth in either or both directions. The attach is parameterized by
+// two orthogonal choices:
 //
-//   - AttachTCX (default): cilium/ebpf link.AttachTCX, pin the resulting
-//     link to bpffs so it survives the CNI plugin's process exit. Uses
-//     bpf_mprog under the hood and composes cleanly with other
-//     pod-side BPF (cilium-agent, aws-network-policy-agent).
-//   - AttachClsactPodside (opt-in): clsact qdisc + tc filter on the
-//     pod-side veth from inside the pod netns. No userspace handle to
-//     track; the kernel garbage-collects the filter when the veth is
-//     deleted. Useful on kernels < 6.6 where tcx isn't available, but
-//     can collide with other pod-side clsact users.
+//   - Hook: TCX (kernel 6.6+, bpf_mprog) or Clsact (5.x+, classic
+//     filter on a clsact qdisc).
+//   - Side: HostSide (peer of pod's eth0, in the host netns) or
+//     PodSide (eth0 inside the pod netns).
+//
+// The four combinations are independently selectable. tcx-hostside is
+// the default and matches how Cilium and the AWS network-policy-agent
+// attach. Pod-side modes are useful when the host netns is locked
+// down or when host-side attach would collide with another BPF stack.
+//
+// The natra BPF program is symmetric per direction (`natra_ingress`
+// processes packets in the pod-ingress direction regardless of which
+// veth-half the program sits on). On the host side the hook direction
+// is the opposite of the pod direction: a packet leaving the pod
+// arrives at the host-side veth's ingress hook (TCX_INGRESS or
+// HANDLE_MIN_INGRESS), and vice versa. The loader handles that flip
+// internally so the caller specifies one pod-direction.
 //
 // The .bpf.o is embedded at build time so the natra binary is
 // self-contained — install is just "copy the binary to /opt/cni/bin".
@@ -34,20 +42,53 @@ import (
 //go:embed natra.bpf.o
 var natraBPF []byte
 
-// AttachMode selects how AttachIngress/AttachEgress wires the BPF
-// program to a veth.
-type AttachMode int
+// Hook selects the kernel hook surface used for attach.
+type Hook int
 
 const (
-	// AttachTCX is the default. Requires kernel 6.6+ and a bpffs mount
-	// at /sys/fs/bpf (or wherever pinPath lives). Composes cleanly with
-	// other pod-side BPF.
-	AttachTCX AttachMode = iota
-	// AttachClsactPodside is the opt-in fallback for older kernels.
-	// Works on 5.x+, no bpffs requirement, but collides with anything
-	// else attaching clsact filters in the pod's netns.
-	AttachClsactPodside
+	// HookTCX uses cilium/ebpf link.AttachTCX. Requires kernel 6.6+
+	// and a bpffs mount. Multiple TCX programs can coexist on the
+	// same hook in a defined order — composes cleanly with other
+	// BPF stacks (cilium, aws-network-policy-agent in newer versions).
+	HookTCX Hook = iota
+	// HookClsact uses a clsact qdisc plus a tc bpf filter. Works on
+	// 5.x+ and has no bpffs requirement. Multiple programs on the
+	// same hook need priority discipline.
+	HookClsact
 )
+
+func (h Hook) String() string {
+	switch h {
+	case HookTCX:
+		return "tcx"
+	case HookClsact:
+		return "clsact"
+	default:
+		return fmt.Sprintf("hook(%d)", int(h))
+	}
+}
+
+// Side selects which half of the veth pair to attach to.
+type Side int
+
+const (
+	// SideHost is the host-side veth (peer of pod's eth0, lives in
+	// the host netns). Same attach point Cilium and NPA use.
+	SideHost Side = iota
+	// SidePod is the pod-side veth (eth0 inside the pod netns).
+	SidePod
+)
+
+func (s Side) String() string {
+	switch s {
+	case SideHost:
+		return "hostside"
+	case SidePod:
+		return "podside"
+	default:
+		return fmt.Sprintf("side(%d)", int(s))
+	}
+}
 
 // Direction selects which BPF program / map slot to operate on.
 // Numeric values must match the C enum in bpf/natra.bpf.c.
@@ -102,6 +143,28 @@ func StatKey(dir Direction, slot uint32) uint32 {
 	return uint32(dir)*StatPerDir + slot
 }
 
+// AttachOptions parameterizes a single per-direction attach.
+type AttachOptions struct {
+	// Direction is the pod-direction (ingress = packets going INTO
+	// the pod). Selects which BPF program (natra_ingress or
+	// natra_egress) and which map slot to use.
+	Direction Direction
+	// Side is the veth half to attach on. The loader maps pod
+	// direction to kernel hook direction based on this.
+	Side Side
+	// Hook is the kernel attach API (TCX or clsact).
+	Hook Hook
+	// IfIndex is the kernel ifindex of the chosen veth side. The
+	// caller resolves it — host-side via netlink.VethPeerIndex from
+	// the pod-side, pod-side via net.InterfaceByName inside the pod
+	// netns.
+	IfIndex int
+	// PinPath is the bpffs path the tcx link gets pinned to so it
+	// outlives the CNI plugin process. Ignored for HookClsact (the
+	// kernel keeps the program loaded via the qdisc tree).
+	PinPath string
+}
+
 // Program holds a loaded natra BPF collection plus per-direction
 // program handles and links. One Program per attached veth — maps are
 // not shared across pods because each pod has its own rate limit, so
@@ -114,8 +177,8 @@ type Program struct {
 	bucketMap   *ebpf.Map
 	statsMap    *ebpf.Map
 	cmsMap      *ebpf.Map
-	ingressLink link.Link // set on AttachIngress with AttachTCX, nil otherwise
-	egressLink  link.Link // set on AttachEgress with AttachTCX, nil otherwise
+	ingressLink link.Link // set when DirectionIngress attaches via HookTCX
+	egressLink  link.Link // set when DirectionEgress attaches via HookTCX
 }
 
 // Load instantiates the embedded BPF object. Verification failures
@@ -218,44 +281,61 @@ func (p *Program) PinMaps(dir, containerID string) error {
 	return nil
 }
 
-// AttachIngress binds the ingress program to ifIndex (packets arriving
-// INTO the pod — the direction kubernetes.io/ingress-bandwidth
-// describes). Caller should already be inside the pod's netns. pinPath
-// is the bpffs path the tcx link gets pinned to so it survives the
-// plugin's process exit. Ignored for AttachClsactPodside.
-func (p *Program) AttachIngress(ifIndex int, mode AttachMode, pinPath string) error {
-	switch mode {
-	case AttachTCX:
-		l, err := p.attachTCX(ifIndex, p.progIngress, ebpf.AttachTCXIngress, pinPath, "ingress")
+// Attach binds one program direction to the chosen (hook, side,
+// ifindex). For host-side attach, the kernel hook direction is the
+// opposite of opts.Direction (a pod-ingress packet shows up at the
+// host-side veth's egress hook); the loader flips that internally.
+//
+// pinPath only matters for HookTCX. For HookClsact the kernel holds
+// the program reference via the qdisc tree until the veth is deleted.
+//
+// Caller is responsible for being in the right netns: SidePod requires
+// the pod netns, SideHost requires the host netns. The loader does
+// not switch netns.
+func (p *Program) Attach(opts AttachOptions) error {
+	prog := p.programFor(opts.Direction)
+	hookDir := opts.Direction
+	if opts.Side == SideHost {
+		// pod-ingress = host-side egress; pod-egress = host-side ingress
+		if hookDir == DirectionIngress {
+			hookDir = DirectionEgress
+		} else {
+			hookDir = DirectionIngress
+		}
+	}
+
+	switch opts.Hook {
+	case HookTCX:
+		attach := ebpf.AttachTCXIngress
+		if hookDir == DirectionEgress {
+			attach = ebpf.AttachTCXEgress
+		}
+		l, err := p.attachTCX(opts.IfIndex, prog, attach, opts.PinPath, opts.Direction.String())
 		if err != nil {
 			return err
 		}
-		p.ingressLink = l
+		if opts.Direction == DirectionIngress {
+			p.ingressLink = l
+		} else {
+			p.egressLink = l
+		}
 		return nil
-	case AttachClsactPodside:
-		return p.attachClsactPodside(ifIndex, p.progIngress, netlink.HANDLE_MIN_INGRESS, "natra_ingress")
+	case HookClsact:
+		parent := uint32(netlink.HANDLE_MIN_INGRESS)
+		if hookDir == DirectionEgress {
+			parent = uint32(netlink.HANDLE_MIN_EGRESS)
+		}
+		return p.attachClsact(opts.IfIndex, prog, parent, "natra_"+opts.Direction.String())
 	default:
-		return fmt.Errorf("unknown AttachMode %d", mode)
+		return fmt.Errorf("unknown Hook %d", opts.Hook)
 	}
 }
 
-// AttachEgress binds the egress program to ifIndex (packets leaving
-// the pod — the direction kubernetes.io/egress-bandwidth describes).
-// Same callsite contract and pinPath semantics as AttachIngress.
-func (p *Program) AttachEgress(ifIndex int, mode AttachMode, pinPath string) error {
-	switch mode {
-	case AttachTCX:
-		l, err := p.attachTCX(ifIndex, p.progEgress, ebpf.AttachTCXEgress, pinPath, "egress")
-		if err != nil {
-			return err
-		}
-		p.egressLink = l
-		return nil
-	case AttachClsactPodside:
-		return p.attachClsactPodside(ifIndex, p.progEgress, netlink.HANDLE_MIN_EGRESS, "natra_egress")
-	default:
-		return fmt.Errorf("unknown AttachMode %d", mode)
+func (p *Program) programFor(dir Direction) *ebpf.Program {
+	if dir == DirectionEgress {
+		return p.progEgress
 	}
+	return p.progIngress
 }
 
 func (p *Program) attachTCX(
@@ -281,14 +361,10 @@ func (p *Program) attachTCX(
 	return l, nil
 }
 
-// attachClsactPodside is the opt-in fallback. Adds a clsact qdisc to
-// the link (idempotent — the second call for the other direction is a
-// no-op via EEXIST), then attaches the BPF program via a tc filter on
-// the requested parent (HANDLE_MIN_INGRESS or HANDLE_MIN_EGRESS).
-// Because the caller has already entered the pod's netns, this
-// attaches to the pod-side end of the veth pair — host-side AWS VPC
-// CNI clsact filters live in the host netns and don't see this.
-func (p *Program) attachClsactPodside(ifIndex int, prog *ebpf.Program, parent uint32, name string) error {
+// attachClsact installs a clsact qdisc on the link (idempotent) and
+// then attaches the BPF program via a tc filter on the requested
+// parent (HANDLE_MIN_INGRESS or HANDLE_MIN_EGRESS).
+func (p *Program) attachClsact(ifIndex int, prog *ebpf.Program, parent uint32, name string) error {
 	// Local name `nl` (not `link`) so we don't shadow the cilium/ebpf/link
 	// import.
 	nl, err := netlink.LinkByIndex(ifIndex)
@@ -326,9 +402,9 @@ func (p *Program) attachClsactPodside(ifIndex int, prog *ebpf.Program, parent ui
 	return nil
 }
 
-// Close releases the userspace BPF references. For tcx, the kernel
+// Close releases the userspace BPF references. For HookTCX the kernel
 // keeps each program loaded and attached as long as its pinned link
-// exists, so packets keep flowing after Close. For clsact-podside the
+// exists, so packets keep flowing after Close. For HookClsact the
 // kernel similarly holds the programs via the qdisc tree.
 func (p *Program) Close() error {
 	if p.ingressLink != nil {

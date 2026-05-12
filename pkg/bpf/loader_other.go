@@ -11,12 +11,41 @@ import (
 	"fmt"
 )
 
-type AttachMode int
+type Hook int
 
 const (
-	AttachTCX AttachMode = iota
-	AttachClsactPodside
+	HookTCX Hook = iota
+	HookClsact
 )
+
+func (h Hook) String() string {
+	switch h {
+	case HookTCX:
+		return "tcx"
+	case HookClsact:
+		return "clsact"
+	default:
+		return fmt.Sprintf("hook(%d)", int(h))
+	}
+}
+
+type Side int
+
+const (
+	SideHost Side = iota
+	SidePod
+)
+
+func (s Side) String() string {
+	switch s {
+	case SideHost:
+		return "hostside"
+	case SidePod:
+		return "podside"
+	default:
+		return fmt.Sprintf("side(%d)", int(s))
+	}
+}
 
 type Direction uint32
 
@@ -60,13 +89,20 @@ func StatKey(dir Direction, slot uint32) uint32 {
 	return uint32(dir)*StatPerDir + slot
 }
 
+type AttachOptions struct {
+	Direction Direction
+	Side      Side
+	Hook      Hook
+	IfIndex   int
+	PinPath   string
+}
+
 type Program struct{}
 
 var errNotLinux = errors.New("pkg/bpf: BPF requires Linux; the natra binary is Linux-only")
 
-func Load() (*Program, error)                                { return nil, errNotLinux }
-func (*Program) Configure(Direction, Config) error           { return errNotLinux }
-func (*Program) AttachIngress(int, AttachMode, string) error { return errNotLinux }
-func (*Program) AttachEgress(int, AttachMode, string) error  { return errNotLinux }
-func (*Program) PinMaps(string, string) error                { return errNotLinux }
-func (*Program) Close() error                                { return nil }
+func Load() (*Program, error)                      { return nil, errNotLinux }
+func (*Program) Configure(Direction, Config) error { return errNotLinux }
+func (*Program) Attach(AttachOptions) error        { return errNotLinux }
+func (*Program) PinMaps(string, string) error      { return errNotLinux }
+func (*Program) Close() error                      { return nil }

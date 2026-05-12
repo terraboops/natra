@@ -106,21 +106,21 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 		})
 
-		// tcx is the production default. The pin filename uses a
-		// dotless suffix ("-link") because bpffs's bpf_lookup rejects
+		// tcx-hostside is the production default. The pin filename uses
+		// a dotless suffix ("-link") because bpffs's bpf_lookup rejects
 		// any path component containing a '.' on user-mounted
 		// subdirectories (kernel/bpf/inode.c) — those names are
 		// reserved for populate_bpffs's internal special files. An
 		// earlier revision used `<id>-eth0.link` and got EPERM on
 		// every Pin call; same shape applies to map pins (`-map`
 		// suffix). Test asserts the happy path end-to-end.
-		It("default mode attaches ingress via tcx and pins the link to bpffs", func() {
+		It("default mode attaches ingress via tcx-hostside and pins the link to bpffs", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
 			defer cleanup()
 
-			containerID := "test-attach-tcx"
+			containerID := "test-attach-tcx-hostside"
 			stdin := []byte(`{
 				"cniVersion": "1.0.0",
 				"name": "natra-test",
@@ -139,19 +139,56 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0 ingress"))
+			Expect(string(stderr)).To(ContainSubstring("attached hostside/ingress"))
 			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
-			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeTrue(),
-				"tcx ingress attached but no link pin found")
-			Expect(linkPinExists(containerID, "eth0", "egress")).To(BeFalse(),
+			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeTrue(),
+				"tcx-hostside ingress attached but no link pin found")
+			Expect(linkPinExists(containerID, "hostside", "egress")).To(BeFalse(),
 				"egress was not annotated; no egress pin should exist")
 
 			_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
 			Expect(delErr).NotTo(HaveOccurred(), "stderr: %s", string(delStderr))
-			Expect(anyLinkPinExists(containerID, "eth0")).To(BeFalse(),
+			Expect(anyLinkPinExists(containerID)).To(BeFalse(),
 				"link pin should be gone after DEL")
 			Expect(remainingPinsFor(containerID)).To(BeEmpty(),
 				"all per-container pins should be cleaned up by DEL")
+		})
+
+		It("tcx-podside attaches ingress to pod-side eth0 and pins", func() {
+			By("creating a veth pair end inside the pod netns")
+			ns, cleanup, err := newTestNetnsWithVeth("eth0")
+			Expect(err).NotTo(HaveOccurred())
+			defer cleanup()
+
+			containerID := "test-attach-tcx-podside"
+			stdin := []byte(`{
+				"cniVersion": "1.0.0",
+				"name": "natra-test",
+				"type": "natra",
+				"attachMode": "tcx-podside",
+				"runtimeConfig": {
+					"podAnnotations": {
+						"kubernetes.io/ingress-bandwidth": "10M"
+					}
+				}
+			}`)
+
+			stdout, stderr, runErr := runPlugin(natra, "ADD", containerID, netnsPath(ns), "eth0", stdin)
+			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
+
+			var result map[string]any
+			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
+			Expect(result["cniVersion"]).To(Equal("1.0.0"))
+
+			Expect(string(stderr)).To(ContainSubstring("attached podside/ingress"))
+			Expect(linkPinExists(containerID, "podside", "ingress")).To(BeTrue(),
+				"tcx-podside ingress attached but no link pin found")
+			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeFalse(),
+				"explicit podside mode must not pin host-side")
+
+			_, _, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
+			Expect(delErr).NotTo(HaveOccurred())
+			Expect(remainingPinsFor(containerID)).To(BeEmpty())
 		})
 
 		It("attaches via clsact-podside fallback when explicitly requested", func() {
@@ -176,20 +213,53 @@ var _ = Describe("natra CNI binary", func() {
 			stdout, stderr, runErr := runPlugin(natra, "ADD", containerID, netnsPath(ns), "eth0", stdin)
 			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0 ingress"))
-			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
+			Expect(string(stderr)).To(ContainSubstring("attached podside/ingress"))
 
 			var result map[string]any
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			// No tcx link pin in this mode (the kernel holds the program
+			// No tcx link pin in clsact mode (the kernel holds the program
 			// reference via the qdisc tree until the veth is deleted).
-			Expect(anyLinkPinExists(containerID, "eth0")).To(BeFalse(),
+			Expect(anyLinkPinExists(containerID)).To(BeFalse(),
 				"clsact-podside mode should not produce a link pin")
 		})
 
-		It("default mode attaches egress via tcx with only egress-bandwidth annotated", func() {
+		It("attaches via clsact-hostside when explicitly requested", func() {
+			By("creating a veth pair end inside the pod netns")
+			ns, cleanup, err := newTestNetnsWithVeth("eth0")
+			Expect(err).NotTo(HaveOccurred())
+			defer cleanup()
+
+			containerID := "test-attach-clsact-hostside"
+			stdin := []byte(`{
+				"cniVersion": "1.0.0",
+				"name": "natra-test",
+				"type": "natra",
+				"attachMode": "clsact-hostside",
+				"runtimeConfig": {
+					"podAnnotations": {
+						"kubernetes.io/ingress-bandwidth": "10M"
+					}
+				}
+			}`)
+
+			stdout, stderr, runErr := runPlugin(natra, "ADD", containerID, netnsPath(ns), "eth0", stdin)
+			Expect(runErr).NotTo(HaveOccurred(), "stderr: %s", string(stderr))
+
+			Expect(string(stderr)).To(ContainSubstring("attached hostside/ingress"))
+
+			var result map[string]any
+			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
+			Expect(result["cniVersion"]).To(Equal("1.0.0"))
+
+			// clsact: kernel holds the program via the qdisc tree, no
+			// bpffs link pin written by natra in this mode.
+			Expect(anyLinkPinExists(containerID)).To(BeFalse(),
+				"clsact-hostside mode should not produce a link pin")
+		})
+
+		It("default mode attaches egress via tcx-hostside with only egress-bandwidth annotated", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
@@ -214,11 +284,11 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0 egress"))
+			Expect(string(stderr)).To(ContainSubstring("attached hostside/egress"))
 			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
-			Expect(linkPinExists(containerID, "eth0", "egress")).To(BeTrue(),
-				"tcx egress attached but no link pin found")
-			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeFalse(),
+			Expect(linkPinExists(containerID, "hostside", "egress")).To(BeTrue(),
+				"tcx-hostside egress attached but no link pin found")
+			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeFalse(),
 				"ingress was not annotated; no ingress pin should exist")
 
 			_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
@@ -253,11 +323,11 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0 ingress"))
-			Expect(string(stderr)).To(ContainSubstring("attached to eth0 egress"))
-			Expect(linkPinExists(containerID, "eth0", "ingress")).To(BeTrue(),
+			Expect(string(stderr)).To(ContainSubstring("attached hostside/ingress"))
+			Expect(string(stderr)).To(ContainSubstring("attached hostside/egress"))
+			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeTrue(),
 				"both annotations present but ingress pin missing")
-			Expect(linkPinExists(containerID, "eth0", "egress")).To(BeTrue(),
+			Expect(linkPinExists(containerID, "hostside", "egress")).To(BeTrue(),
 				"both annotations present but egress pin missing")
 
 			_, delStderr, delErr := runPlugin(natra, "DEL", containerID, netnsPath(ns), "eth0", stdin)
@@ -288,7 +358,7 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(json.Unmarshal(stdout, &result)).To(Succeed())
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
-			Expect(string(stderr)).NotTo(ContainSubstring("attached to eth0"),
+			Expect(string(stderr)).NotTo(ContainSubstring("attached"),
 				"no annotation should mean no attachment")
 			Expect(remainingPinsFor(containerID)).To(BeEmpty(),
 				"unannotated pod must not produce any pins")
