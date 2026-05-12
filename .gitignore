@@ -37,3 +37,4 @@ tmp/
 dist/
 *.tar.gz
 *.zip
+.claude/
