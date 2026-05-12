@@ -287,22 +287,35 @@ start_profile_collector() {
     mkdir -p "$profile_dir"
 
     # The profile process writes inside the kind node to a known path;
-    # we copy out via docker cp at stop time. Background-with-PID-file
-    # pattern so stop_profile_collector can kill it deterministically.
-    docker exec "${cluster}-worker" mkdir -p /tmp/natra-profile
-    docker exec -d "${cluster}-worker" bash -c '
-        /opt/cni/bin/natra profile \
+    # we copy out via docker cp at stop time. setsid + nohup so the
+    # process survives the docker-exec shell exiting (default SIGHUP
+    # on exec-shell teardown was killing the collector before its
+    # first snapshot landed).
+    docker exec "${cluster}-worker" mkdir -p /var/log/natra-profile
+    docker exec "${cluster}-worker" bash -c '
+        setsid nohup /opt/cni/bin/natra profile \
             -interval 2s \
-            -output /tmp/natra-profile/snapshots.jsonl \
-            -heap-dir /tmp/natra-profile/heap \
-            >/tmp/natra-profile/profile.log 2>&1 &
-        echo $! > /tmp/natra-profile/profile.pid
+            -output /var/log/natra-profile/snapshots.jsonl \
+            -heap-dir /var/log/natra-profile/heap \
+            </dev/null \
+            >/var/log/natra-profile/profile.log 2>&1 &
+        echo $! > /var/log/natra-profile/profile.pid
     '
-    # Brief settle so the SIGTERM-arrival in stop doesn't race the
-    # write of the pid file. 1s is plenty; bash's `&` returns before
-    # the child actually runs in the kernel scheduler sometimes.
+    # Brief settle so the first snapshot is on disk and the collector
+    # has stabilized before workload traffic starts.
     sleep 1
     echo "==> started natra profile collector on ${cluster}-worker" >&2
+    # Diagnostic: dump state of /var/log/natra-profile/ so a missing
+    # snapshot or a startup error in the profile binary shows up
+    # immediately rather than as a silent "no snapshots written".
+    docker exec "${cluster}-worker" bash -c '
+        echo "  profile pid: $(cat /var/log/natra-profile/profile.pid 2>/dev/null)";
+        echo "  profile process: $(ps -p $(cat /var/log/natra-profile/profile.pid 2>/dev/null) -o comm= 2>/dev/null || echo NOT_RUNNING)";
+        echo "  profile dir:";
+        ls -la /var/log/natra-profile/ 2>&1 | sed "s/^/    /";
+        echo "  profile.log first 5 lines:";
+        head -5 /var/log/natra-profile/profile.log 2>&1 | sed "s/^/    /";
+    ' >&2 || true
 }
 
 stop_profile_collector() {
@@ -310,7 +323,7 @@ stop_profile_collector() {
     local profile_dir="$TMPDIR/profile-${tag}"
 
     docker exec "${cluster}-worker" bash -c '
-        pid=$(cat /tmp/natra-profile/profile.pid 2>/dev/null || true)
+        pid=$(cat /var/log/natra-profile/profile.pid 2>/dev/null || true)
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
             # Wait briefly for SIGTERM-handler to flush the last record.
@@ -320,14 +333,18 @@ stop_profile_collector() {
             done
         fi
     '
-    # Copy out the artifacts. -L for the symlink-edge case on some
-    # docker storage drivers.
-    docker cp -L "${cluster}-worker:/tmp/natra-profile/snapshots.jsonl" \
-        "$profile_dir/snapshots.jsonl" 2>/dev/null || true
-    docker cp -L "${cluster}-worker:/tmp/natra-profile/heap" \
-        "$profile_dir/heap" 2>/dev/null || true
-    docker cp -L "${cluster}-worker:/tmp/natra-profile/profile.log" \
-        "$profile_dir/profile.log" 2>/dev/null || true
+    # Copy out the artifacts. Surface errors loudly — silent docker
+    # cp failures previously masked the real reason snapshots weren't
+    # landing locally.
+    if ! docker cp "${cluster}-worker:/var/log/natra-profile/snapshots.jsonl" \
+        "$profile_dir/snapshots.jsonl"; then
+        echo "==> docker cp snapshots.jsonl FAILED" >&2
+    fi
+    docker cp "${cluster}-worker:/var/log/natra-profile/heap" \
+        "$profile_dir/heap" || \
+        echo "==> docker cp heap-dir failed (skipping)" >&2
+    docker cp "${cluster}-worker:/var/log/natra-profile/profile.log" \
+        "$profile_dir/profile.log" || true
     echo "==> profile artifacts: $profile_dir" >&2
     summarize_profile "$profile_dir/snapshots.jsonl"
 }
