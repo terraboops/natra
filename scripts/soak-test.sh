@@ -276,22 +276,28 @@ EOF
 
     case "$MODE" in
         natra)
-            log_event "bootstrap: installing natra layer"
-            # Reuses the existing installer manifest. The image needs
-            # to be loaded into k3d nodes — for soak we expect the
-            # user to have pre-built and tagged the image; the
-            # operator-friendly path is `make docker-build` once
-            # before invoking this script.
+            log_event "bootstrap: installing natra layer (k3s-adapted)"
             local natra_image="ghcr.io/terraboops/natra:soak"
             if ! docker image inspect "$natra_image" >/dev/null 2>&1; then
                 log_event "bootstrap: building natra image $natra_image"
                 docker build -q -t "$natra_image" -f "${REPO_ROOT}/deploy/docker/Dockerfile.cni" "$REPO_ROOT"
             fi
             k3d image import "$natra_image" -c "$CLUSTER"
+            # k3s embeds its own CNI plugins under
+            # /var/lib/rancher/k3s/data/cni/ and writes conflists to
+            # /var/lib/rancher/k3s/agent/etc/cni/net.d/ — different
+            # paths than kind/EKS which both use /opt/cni/bin and
+            # /etc/cni/net.d. Sed-rewrite the installer manifest's
+            # hostPath volumes so natra writes to k3s's actual
+            # locations. The container-side mount paths stay
+            # /host/opt/cni/bin and /host/etc/cni/net.d because
+            # those are referenced by the install-container script.
             sed -e "s|ghcr.io/terraboops/natra:latest|${natra_image}|" \
                 -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
+                -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
+                -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
                 "${REPO_ROOT}/deploy/cni-installer.yaml" | kubectl apply -f -
-            kubectl -n kube-system rollout status daemonset/natra-installer --timeout=120s
+            kubectl -n kube-system rollout status daemonset/natra-installer --timeout=180s
             ;;
         vanilla)
             log_event "bootstrap: installing upstream bandwidth plugin layer"
