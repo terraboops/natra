@@ -57,9 +57,16 @@ var (
 // AttachMode is the top-level natra-specific knob — one of
 // "tcx-hostside" (default), "tcx-podside", "clsact-hostside",
 // "clsact-podside".
+//
+// Defaults is the cluster-wide knob block, written by the installer
+// from NATRA_DEFAULT_* env vars. Lets an operator change natra's
+// baseline (heavy-hitter threshold, burst-to-rate ratio) without
+// rebuilding the binary. Per-pod annotations still win where they
+// specify a value.
 type NetConf struct {
 	types.NetConf
-	AttachMode    string `json:"attachMode,omitempty"`
+	AttachMode    string           `json:"attachMode,omitempty"`
+	Defaults      *NetConfDefaults `json:"defaults,omitempty"`
 	RuntimeConfig struct {
 		Bandwidth *struct {
 			IngressRate  int64 `json:"ingressRate,omitempty"`
@@ -69,6 +76,19 @@ type NetConf struct {
 		} `json:"bandwidth,omitempty"`
 		PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 	} `json:"runtimeConfig,omitempty"`
+}
+
+// NetConfDefaults holds cluster-wide defaults. Both fields are
+// optional; zero means "use natra's compiled-in default".
+type NetConfDefaults struct {
+	// HHThreshold overrides the heavy-hitter threshold default
+	// (compiled-in: 10). Lower = stricter shaping (mice become
+	// elephants faster); higher = more mice protection.
+	HHThreshold int64 `json:"hhThreshold,omitempty"`
+	// BurstRatio overrides the default burst-to-rate ratio
+	// (compiled-in: 2). A 10 Mbps annotation with ratio 2 gives a
+	// 2.5 MB token bucket (= 2 seconds of credit).
+	BurstRatio float64 `json:"burstRatio,omitempty"`
 }
 
 // resolveAttachMode parses NetConf.AttachMode into a (hook, side)
@@ -311,14 +331,28 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 		annotationKey = "kubernetes.io/egress-bandwidth"
 	}
 
+	// Cluster-default burst ratio. Falls back to 2× when the
+	// conflist doesn't set one — same value baked into pkg/cni/config.
+	burstRatio := 2.0
+	if conf.Defaults != nil && conf.Defaults.BurstRatio > 0 {
+		burstRatio = conf.Defaults.BurstRatio
+	}
+
 	if rateBits > 0 {
 		out := config.DefaultConfig()
 		out.Rate = rateBits / 8 // bits → bytes
 		burst := burstBits / 8
-		if burst <= 0 || burst > out.Rate*2 {
-			burst = out.Rate * 2
+		maxBurst := int64(float64(out.Rate) * burstRatio)
+		if burst <= 0 || burst > maxBurst {
+			burst = maxBurst
 		}
 		out.Burst = burst
+		// Cluster-default heavy-hitter threshold. kubelet's
+		// runtimeConfig.bandwidth has no per-pod way to specify
+		// this, so the cluster default is the only knob.
+		if conf.Defaults != nil && conf.Defaults.HHThreshold > 0 {
+			out.HeavyHitterThreshold = conf.Defaults.HHThreshold
+		}
 		return out
 	}
 	if conf.RuntimeConfig.PodAnnotations != nil {
@@ -329,6 +363,17 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 				return nil
 			}
 			if parsed != nil && parsed.Rate > 0 {
+				// Apply cluster defaults only where the annotation
+				// didn't (heuristically: value matches the library's
+				// compiled-in default). Explicit per-pod values win.
+				if conf.Defaults != nil {
+					if conf.Defaults.HHThreshold > 0 && parsed.HeavyHitterThreshold == 10 {
+						parsed.HeavyHitterThreshold = conf.Defaults.HHThreshold
+					}
+					if conf.Defaults.BurstRatio > 0 && parsed.Burst == parsed.Rate*2 {
+						parsed.Burst = int64(float64(parsed.Rate) * burstRatio)
+					}
+				}
 				return parsed
 			}
 		}

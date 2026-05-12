@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -100,6 +101,27 @@ func writeChainedSibling(src, dst string) error {
 				mode, "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside",
 			)
 		}
+	}
+
+	// Cluster-tier knobs. Both go into the natra entry's "defaults"
+	// block; per-pod annotations override on a field-by-field basis.
+	defaults := map[string]any{}
+	if t := os.Getenv("NATRA_DEFAULT_HH_THRESHOLD"); t != "" {
+		v, err := strconv.ParseInt(t, 10, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("NATRA_DEFAULT_HH_THRESHOLD=%q must be a positive integer", t)
+		}
+		defaults["hhThreshold"] = v
+	}
+	if r := os.Getenv("NATRA_DEFAULT_BURST_RATIO"); r != "" {
+		v, err := strconv.ParseFloat(r, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("NATRA_DEFAULT_BURST_RATIO=%q must be a positive number", r)
+		}
+		defaults["burstRatio"] = v
+	}
+	if len(defaults) > 0 {
+		natraEntry["defaults"] = defaults
 	}
 	chained["plugins"] = append(append([]any{}, plugins...), natraEntry)
 

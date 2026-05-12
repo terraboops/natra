@@ -95,12 +95,38 @@ struct {
 	__uint(max_entries, DIR_MAX);
 } natra_bucket_map SEC(".maps");
 
+// CMS cell holds a count plus a decay-interval index. Lazy aging:
+// each cell-access reads the cell's last_decay_idx, computes how
+// many decay intervals have elapsed since, right-shifts the count by
+// that many (capped at 32 to avoid UB), and updates last_decay_idx
+// to the current time. Recent elephants keep climbing faster than
+// decay reduces (they re-increment on every packet); dormant cells
+// fade lazily the next time they're touched.
+//
+// last_decay_idx uses CMS_DECAY_INTERVAL_NS as its unit (one tick per
+// 60 seconds) and stores as u32, wrapping every ~136 years — fine.
+//
+// Cost vs the prior u32-only cell: doubles memory (32 KiB → 64 KiB
+// per pod) and adds ~10 extra instructions per cell hit. Per packet
+// (4 rows × 1 cell each) that's ~40 instructions. Negligible.
+//
+// We intentionally don't use atomics on the count anymore. The CMS
+// is approximate by design; lost increments under cross-CPU race
+// give slightly conservative classification (an elephant takes one
+// extra packet to be marked heavy), which is the safe direction.
+#define CMS_DECAY_INTERVAL_NS (60ULL * 1000000000ULL)
+
+struct cms_cell {
+	__u32 count;
+	__u32 last_decay_idx;
+};
+
 // CMS as a flat array; index = dir * CMS_WIDTH * CMS_DEPTH +
 // row * CMS_WIDTH + col. Per-direction halves are independent.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
-	__type(value, __u32);
+	__type(value, struct cms_cell);
 	__uint(max_entries, CMS_WIDTH * CMS_DEPTH * DIR_MAX);
 } natra_cms_map SEC(".maps");
 
@@ -154,9 +180,20 @@ static __always_inline __u32 cms_hash(const struct flow_key *k, __u32 seed)
 	return h;
 }
 
-// Increment all CMS_DEPTH counters in `dir`'s half of the array and
+// Update all CMS_DEPTH counters in `dir`'s half of the array and
 // return the post-increment min across rows (CMS estimator).
-static __always_inline __u32 cms_update_and_min(__u32 dir, const struct flow_key *k)
+//
+// Lazy aging: before incrementing, fade the cell by 2^elapsed (where
+// elapsed is in CMS_DECAY_INTERVAL_NS units). cell->count >> elapsed
+// is the post-decay value; we cap shift at 32 because >>32 on u32 is
+// undefined behavior. last_decay_idx advances to now_idx so the next
+// access measures from here, not from the original last-seen.
+//
+// `now_idx` is computed once per packet (callers pass it in) so all
+// four cells see a consistent timestamp.
+static __always_inline __u32 cms_update_and_min(__u32 dir,
+						const struct flow_key *k,
+						__u32 now_idx)
 {
 	__u32 base = dir * (CMS_WIDTH * CMS_DEPTH);
 	__u32 mn = 0xffffffffu;
@@ -165,12 +202,27 @@ static __always_inline __u32 cms_update_and_min(__u32 dir, const struct flow_key
 		__u32 h = cms_hash(k, cms_seeds[row]);
 		__u32 col = h % CMS_WIDTH;
 		__u32 idx = base + (__u32)row * CMS_WIDTH + col;
-		__u32 *cell = bpf_map_lookup_elem(&natra_cms_map, &idx);
+		struct cms_cell *cell = bpf_map_lookup_elem(&natra_cms_map, &idx);
 		if (!cell)
 			return 0;
-		__u32 v = __sync_add_and_fetch(cell, 1);
-		if (v < mn)
-			mn = v;
+
+		__u32 elapsed = 0;
+		if (now_idx > cell->last_decay_idx)
+			elapsed = now_idx - cell->last_decay_idx;
+
+		__u32 next = cell->count;
+		if (elapsed >= 32)
+			next = 0;
+		else if (elapsed > 0)
+			next >>= elapsed;
+		next += 1;
+
+		cell->count = next;
+		if (elapsed > 0)
+			cell->last_decay_idx = now_idx;
+
+		if (next < mn)
+			mn = next;
 	}
 	return mn;
 }
@@ -279,7 +331,12 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 		return TC_ACT_OK;
 	}
 
-	__u32 count = cms_update_and_min(dir, &k);
+	// One ktime read per packet — reused for CMS aging (now_idx) and
+	// token bucket refill (now_ns). Avoids a second syscall.
+	__u64 now_ns = bpf_ktime_get_ns();
+	__u32 now_idx = (__u32)(now_ns / CMS_DECAY_INTERVAL_NS);
+
+	__u32 count = cms_update_and_min(dir, &k, now_idx);
 	if (count <= cfg->hh_threshold) {
 		// Mouse: fast pass with no lock. Low-volume traffic stays
 		// at line rate even when an elephant exists on the same pod.
@@ -289,8 +346,7 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 
 	// Heavy hitter — token bucket gate.
 	bump_stat(dir, STAT_HH_HITS);
-	__u64 now = bpf_ktime_get_ns();
-	if (consume_tokens(dir, skb->len, cfg->rate_bps, cfg->burst_bytes, now)) {
+	if (consume_tokens(dir, skb->len, cfg->rate_bps, cfg->burst_bytes, now_ns)) {
 		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}

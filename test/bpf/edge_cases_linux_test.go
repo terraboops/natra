@@ -265,11 +265,17 @@ func TestEdgeBucketTokensClamp(t *testing.T) {
 	}
 }
 
-// TestEdgeCMSMonotonicGrowth — under heavy concurrent load, CMS
-// counters must never decrease (no torn writes / lost increments).
-// Drives many goroutines, samples the cell value periodically, asserts
-// the value only grows.
-func TestEdgeCMSMonotonicGrowth(t *testing.T) {
+// TestEdgeCMSGrowsUnderTraffic — drives many concurrent goroutines
+// pushing the same flow's packets, samples CMS max periodically, and
+// asserts the max grows over the sample window. With lazy decay in
+// the BPF dataplane (CMS_DECAY_INTERVAL_NS = 60s), the decay path
+// doesn't fire during a sub-second test, so counts grow effectively
+// monotonically. Atomics were dropped along with the aging change,
+// so concurrent updates can lose individual increments — the test
+// no longer asserts strict monotonicity between samples (the design
+// accepts a small under-count under cross-CPU race), only that
+// across the full sample window the max grew.
+func TestEdgeCMSGrowsUnderTraffic(t *testing.T) {
 	coll, _, prog := loadNatra(t)
 	cmsMap := coll.Maps["natra_cms_map"]
 
@@ -289,18 +295,12 @@ func TestEdgeCMSMonotonicGrowth(t *testing.T) {
 
 	var lastMaxes []uint32
 	for sample := 0; sample < 20; sample++ {
-		// Pick the cell that the test packet's first hash row hits.
-		// We don't know which cell exactly without re-implementing the
-		// hash; instead, scan all cells and take the max.
 		var curMax uint32
 		for k := uint32(0); k < 4096; k++ {
-			var v uint32
-			if err := cmsMap.Lookup(&k, &v); err == nil && v > curMax {
-				curMax = v
+			var cell cmsCell
+			if err := cmsMap.Lookup(&k, &cell); err == nil && cell.Count > curMax {
+				curMax = cell.Count
 			}
-		}
-		if len(lastMaxes) > 0 && curMax < lastMaxes[len(lastMaxes)-1] {
-			t.Errorf("CMS max decreased between samples: %v -> %d (atomic add not working?)", lastMaxes, curMax)
 		}
 		lastMaxes = append(lastMaxes, curMax)
 	}
@@ -308,7 +308,17 @@ func TestEdgeCMSMonotonicGrowth(t *testing.T) {
 	for g := 0; g < goroutines; g++ {
 		<-done
 	}
-	t.Logf("CMS max samples (monotonic): %v", lastMaxes)
+	if lastMaxes[len(lastMaxes)-1] <= lastMaxes[0] {
+		t.Errorf("CMS max did not grow over sample window: %v", lastMaxes)
+	}
+	t.Logf("CMS max samples: %v", lastMaxes)
+}
+
+// cmsCell mirrors `struct cms_cell` in bpf/natra.bpf.c. The Linux
+// CMS map value is the 8-byte (count, last_decay_idx) tuple.
+type cmsCell struct {
+	Count        uint32
+	LastDecayIdx uint32
 }
 
 // TestEdgeJumboPacket — modern Linux paths produce GRO superpackets up
@@ -363,9 +373,14 @@ func TestEdgeCounterOverflow(t *testing.T) {
 	cmsMap := coll.Maps["natra_cms_map"]
 
 	// Pre-set every CMS cell to (max - 5) so 6 increments wrap.
-	nearMax := uint32(0xFFFFFFFF - 5)
+	// last_decay_idx is set to a far-future value (uint32 max - 1)
+	// so the lazy-decay check `now_idx > cell->last_decay_idx`
+	// evaluates false and decay does not fire — otherwise the
+	// first packet would reset the count to 0 and we'd never see
+	// wraparound.
+	preset := cmsCell{Count: 0xFFFFFFFF - 5, LastDecayIdx: 0xFFFFFFFE}
 	for k := uint32(0); k < 4096; k++ {
-		if err := cmsMap.Update(&k, &nearMax, ebpf.UpdateAny); err != nil {
+		if err := cmsMap.Update(&k, &preset, ebpf.UpdateAny); err != nil {
 			t.Fatalf("cms[%d] preset: %v", k, err)
 		}
 	}

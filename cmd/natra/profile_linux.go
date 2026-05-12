@@ -302,23 +302,29 @@ func readPodMaps(containerID string, paths map[string]string) podSnapshot {
 
 	if p, ok := paths["cms"]; ok {
 		if m, err := ebpf.LoadPinnedMap(p, nil); err == nil {
+			// Each cell is `struct cms_cell { u32 count; u32 last_decay_idx; }`
+			// per bpf/natra.bpf.c. We summarize count; last_decay_idx
+			// is per-cell aging state, not aggregated here.
 			for i := uint32(0); ; i++ {
-				var v uint32
-				err := m.Lookup(&i, &v)
+				var cell struct {
+					Count        uint32
+					LastDecayIdx uint32
+				}
+				err := m.Lookup(&i, &cell)
 				if err != nil {
 					if errors.Is(err, ebpf.ErrKeyNotExist) {
 						break
 					}
 					break
 				}
-				if v == 0 {
+				if cell.Count == 0 {
 					snap.CMSZeros++
 				} else {
 					snap.CMSNonZero++
-					if v > snap.CMSMaxCount {
-						snap.CMSMaxCount = v
+					if cell.Count > snap.CMSMaxCount {
+						snap.CMSMaxCount = cell.Count
 					}
-					snap.CMSTotalCount += uint64(v)
+					snap.CMSTotalCount += uint64(cell.Count)
 				}
 			}
 			_ = m.Close()

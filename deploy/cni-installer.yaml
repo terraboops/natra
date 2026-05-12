@@ -96,6 +96,10 @@ spec:
       # benefit. No CPU, no work, no logs of its own. Same image
       # kubelet uses for Pod sandbox containers, so it's already
       # cached on every node.
+      #
+      # CMS aging happens in the BPF program itself (lazy decay on
+      # cell access — see bpf/natra.bpf.c) so there's no userspace
+      # daemon to run here.
       containers:
         - name: pause
           image: registry.k8s.io/pause:3.10

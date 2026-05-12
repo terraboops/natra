@@ -296,16 +296,21 @@ func TestMapCapacityOOM(t *testing.T) {
 	}
 
 	// Sanity: the CMS map is still queryable (no kernel-side corruption)
-	// and contains values within u32 range (no overflow).
+	// and contains values within u32 range (no overflow). Cells are
+	// `struct cms_cell { u32 count; u32 last_decay_idx; }` — see
+	// bpf/natra.bpf.c.
 	cmsMap := coll.Maps["natra_cms_map"]
 	var maxV uint32
 	for i := uint32(0); i < 4096; i++ {
-		var v uint32
-		if err := cmsMap.Lookup(&i, &v); err != nil {
+		var cell struct {
+			Count        uint32
+			LastDecayIdx uint32
+		}
+		if err := cmsMap.Lookup(&i, &cell); err != nil {
 			t.Fatalf("cms[%d]: %v", i, err)
 		}
-		if v > maxV {
-			maxV = v
+		if cell.Count > maxV {
+			maxV = cell.Count
 		}
 	}
 	if maxV == 0 {
