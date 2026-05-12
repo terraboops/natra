@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
+	"time"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -112,6 +114,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "profile" {
+		if err := profileCmd(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	skel.PluginMainFuncs(
 		skel.CNIFuncs{
@@ -144,6 +153,7 @@ func main() {
 // so successful invocations leave a trace — useful for "is natra even
 // being called?" without cranking up runtime log levels.
 func cmdAdd(args *skel.CmdArgs) error {
+	defer maybeWriteHeapProfile(args.ContainerID)
 	logf("ADD containerID=%s netns=%s ifname=%s", args.ContainerID, args.Netns, args.IfName)
 	logCaps()
 	conf, err := parseConfig(args.StdinData)
@@ -472,6 +482,33 @@ func resolveIfIndex(netnsPath, ifName string, side bpf.Side) (int, func(), error
 	default:
 		return 0, func() {}, fmt.Errorf("unknown bpf.Side %v", side)
 	}
+}
+
+// maybeWriteHeapProfile dumps the Go heap profile of the natra CNI
+// process at end of cmdAdd when NATRA_HEAP_PROFILE_DIR is set in the
+// environment. Files land at <dir>/cmdadd-<unixnano>-<containerID>.pprof,
+// one per invocation — kubelet typically calls a CNI plugin once per
+// pod sandbox, so the file count grows with pod churn.
+//
+// Aggregated across many ADDs during the perf-vs-vanilla rig, the
+// profile shows what natra allocates per-invocation; useful for
+// catching allocator regressions in the ADD hot path.
+func maybeWriteHeapProfile(containerID string) {
+	dir := os.Getenv("NATRA_HEAP_PROFILE_DIR")
+	if dir == "" {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	runtime.GC()
+	path := filepath.Join(dir, fmt.Sprintf("cmdadd-%d-%s.pprof", time.Now().UnixNano(), containerID))
+	f, err := os.Create(path)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	_ = pprof.WriteHeapProfile(f)
 }
 
 // announce writes the "attached" line to stderr (kubelet captures it)

@@ -193,9 +193,18 @@ run_workload() {
 # any value that couldn't be parsed (e.g., hey crashed) — caller
 # decides what to do.
 run_mixed_workload() {
-    local namespace="natra-e2e" tag="$1"
+    local namespace="natra-e2e" tag="$1" cluster="$2"
     local iperf_log="$TMPDIR/iperf-mixed-${tag}.json"
     local hey_log="$TMPDIR/hey-mixed-${tag}.txt"
+
+    # Profile collector runs on the worker node only when natra is
+    # under test (tag == natra). The vanilla cluster has no natra
+    # binary on /opt/cni/bin.
+    local profile_started=0
+    if [ "$tag" = "natra" ]; then
+        start_profile_collector "$cluster" "$tag"
+        profile_started=1
+    fi
 
     echo "==> warming up perf-server (draining initial burst)" >&2
     warmup_pod perf-server perf-client
@@ -256,7 +265,119 @@ run_mixed_workload() {
     : "${p99:=0}"
     : "${total:=0}"
 
+    if [ "$profile_started" = 1 ]; then
+        stop_profile_collector "$cluster" "$tag"
+    fi
+
     echo "$iperf_ing $iperf_eg $rps $p50 $p99 $total"
+}
+
+# Profile collector: runs `natra profile` on the worker node as a
+# background process for the duration of the mixed workload. Captures
+# per-tick BPF program stats (runtime_ns / run_count → derived ns/op)
+# and per-pod map state (CMS fill, stats counters) so a regression in
+# the hot path or a CMS-saturation drift can be inspected after the
+# run.
+#
+# Output lands at ${TMPDIR}/profile-${tag}/snapshots.jsonl and
+# heap-NNNNN.pprof; analyze with jq + go tool pprof respectively.
+start_profile_collector() {
+    local cluster="$1" tag="$2"
+    local profile_dir="$TMPDIR/profile-${tag}"
+    mkdir -p "$profile_dir"
+
+    # The profile process writes inside the kind node to a known path;
+    # we copy out via docker cp at stop time. Background-with-PID-file
+    # pattern so stop_profile_collector can kill it deterministically.
+    docker exec "${cluster}-worker" mkdir -p /tmp/natra-profile
+    docker exec -d "${cluster}-worker" bash -c '
+        /opt/cni/bin/natra profile \
+            -interval 2s \
+            -output /tmp/natra-profile/snapshots.jsonl \
+            -heap-dir /tmp/natra-profile/heap \
+            >/tmp/natra-profile/profile.log 2>&1 &
+        echo $! > /tmp/natra-profile/profile.pid
+    '
+    # Brief settle so the SIGTERM-arrival in stop doesn't race the
+    # write of the pid file. 1s is plenty; bash's `&` returns before
+    # the child actually runs in the kernel scheduler sometimes.
+    sleep 1
+    echo "==> started natra profile collector on ${cluster}-worker" >&2
+}
+
+stop_profile_collector() {
+    local cluster="$1" tag="$2"
+    local profile_dir="$TMPDIR/profile-${tag}"
+
+    docker exec "${cluster}-worker" bash -c '
+        pid=$(cat /tmp/natra-profile/profile.pid 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+            # Wait briefly for SIGTERM-handler to flush the last record.
+            for i in 1 2 3 4 5; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.2
+            done
+        fi
+    '
+    # Copy out the artifacts. -L for the symlink-edge case on some
+    # docker storage drivers.
+    docker cp -L "${cluster}-worker:/tmp/natra-profile/snapshots.jsonl" \
+        "$profile_dir/snapshots.jsonl" 2>/dev/null || true
+    docker cp -L "${cluster}-worker:/tmp/natra-profile/heap" \
+        "$profile_dir/heap" 2>/dev/null || true
+    docker cp -L "${cluster}-worker:/tmp/natra-profile/profile.log" \
+        "$profile_dir/profile.log" 2>/dev/null || true
+    echo "==> profile artifacts: $profile_dir" >&2
+    summarize_profile "$profile_dir/snapshots.jsonl"
+}
+
+# summarize_profile prints first/last snapshot deltas — most useful
+# single-number from the JSONL: average ns/op per program over the
+# whole run, plus CMS fill drift.
+summarize_profile() {
+    local jsonl="$1"
+    if [ ! -s "$jsonl" ]; then
+        echo "==> profile: no snapshots written" >&2
+        return
+    fi
+    # jq does the heavy lifting: pull first and last lines, compute
+    # per-program delta runtime / delta count.
+    local n
+    n=$(wc -l < "$jsonl" | tr -d ' ')
+    echo "==> profile: $n snapshots" >&2
+    jq -s '
+        {
+            duration_s: ((.[-1].time | fromdateiso8601) - (.[0].time | fromdateiso8601)),
+            programs: (
+                [.[0].programs[], .[-1].programs[]]
+                | group_by(.id)
+                | map(select(length == 2))
+                | map({
+                    name: .[0].name,
+                    delta_runtime_ns: (.[1].runtime_ns - .[0].runtime_ns),
+                    delta_run_count: (.[1].run_count - .[0].run_count),
+                    avg_ns_per_op: (if (.[1].run_count - .[0].run_count) > 0
+                        then (((.[1].runtime_ns - .[0].runtime_ns) | tonumber) / ((.[1].run_count - .[0].run_count) | tonumber))
+                        else 0 end)
+                })
+            ),
+            pods: (
+                [.[0].pods[]? // empty, .[-1].pods[]? // empty]
+                | group_by(.container_id)
+                | map(select(length == 2))
+                | map({
+                    container_id: .[0].container_id,
+                    cms_zeros_start: .[0].cms_zeros,
+                    cms_zeros_end: .[1].cms_zeros,
+                    cms_nonzero_start: .[0].cms_nonzero,
+                    cms_nonzero_end: .[1].cms_nonzero,
+                    cms_max_start: .[0].cms_max_count,
+                    cms_max_end: .[1].cms_max_count
+                })
+            )
+        }
+    ' "$jsonl" >&2
 }
 
 TMPDIR=$(mktemp -d)
@@ -310,7 +431,7 @@ echo "  natra egress  elephant=$natra_eg_elephant bps  mice=$natra_eg_mice bps"
 echo "==> running mixed workload (phase A)"
 read -r natra_mixed_iperf_ing natra_mixed_iperf_eg \
         natra_mixed_rps natra_mixed_p50 natra_mixed_p99 natra_mixed_total \
-    < <(run_mixed_workload natra)
+    < <(run_mixed_workload natra "$NATRA_CLUSTER")
 echo "  natra mixed iperf ingress=$natra_mixed_iperf_ing bps  egress=$natra_mixed_iperf_eg bps"
 echo "  natra mixed hey rps=$natra_mixed_rps  p50=$natra_mixed_p50  p99=$natra_mixed_p99  total=$natra_mixed_total"
 
@@ -365,7 +486,7 @@ echo "  vanilla egress  elephant=$vanilla_eg_elephant bps  mice=$vanilla_eg_mice
 echo "==> running mixed workload (phase B)"
 read -r vanilla_mixed_iperf_ing vanilla_mixed_iperf_eg \
         vanilla_mixed_rps vanilla_mixed_p50 vanilla_mixed_p99 vanilla_mixed_total \
-    < <(run_mixed_workload vanilla)
+    < <(run_mixed_workload vanilla "$VANILLA_CLUSTER")
 echo "  vanilla mixed iperf ingress=$vanilla_mixed_iperf_ing bps  egress=$vanilla_mixed_iperf_eg bps"
 echo "  vanilla mixed hey rps=$vanilla_mixed_rps  p50=$vanilla_mixed_p50  p99=$vanilla_mixed_p99  total=$vanilla_mixed_total"
 
