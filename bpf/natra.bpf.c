@@ -51,28 +51,26 @@
 // to cover ~50K-flow workloads without saturating.
 //
 // Sizing history — every step driven by profile data:
-//   1024 × 4 — original. Saturated in ~5s of mixed-workload traffic
-//             (iperf3 --bidir + ~1500 hey RPS); all cells nonzero,
-//             cell-value-mean climbed above the heavy-hitter
-//             threshold of 10, so new mice flows were false-positive
-//             classified as heavy on their first packet. Hey RPS
-//             topped out at ~1000 because most flows hit the bucket.
-//   4096 × 4 — bumped 4×. Still 99.9% saturated under the same
-//             workload (45K distinct hey 5-tuples in 30s vs 32K
-//             cells). Per-pod stats showed 70% of packets
-//             classified as heavy. Hey RPS improved to ~1500.
-//   16384 × 4 — current. 65K cells per direction; the 45K-flow
-//             workload now under-fills the sketch with ~0.7 flows
-//             per cell on average, so most new mice find their
-//             min-across-rows well below threshold and take the
-//             fast pass as intended.
+//   1024 × 4   — original. Saturated in ~5s of mixed-workload
+//               traffic (iperf3 --bidir + ~1500 hey RPS); all cells
+//               nonzero, cell-value-mean climbed above the
+//               heavy-hitter threshold of 10, so new mice flows were
+//               false-positive-classified as heavy on their first
+//               packet. Hey RPS topped out at ~1000.
+//   4096 × 4   — 4×. Still 99.9% saturated, 69% packets classified
+//               heavy. Hey RPS improved to ~1500.
+//   16384 × 4  — 16×. 82% fill, 54% heavy. Hey RPS ~2000.
+//   32768 × 4  — 32×, current. 41% fill expected; most flows take
+//               the fast pass. Diminishing returns past this point
+//               unless the workload's flow cardinality grows.
 //
-// Cost: 64 × original memory. Cell is 8 bytes (count + last_decay_idx)
-// after aging added the timestamp, so per pod: 16384 × 4 × 2 × 8 =
-// 1 MiB. At 100 pods/node that's 100 MiB — still trivial for a
-// kernel-side data structure. Cluster-tier knobs (forthcoming) will
-// let operators pick a smaller tier for low-cardinality workloads.
-#define CMS_WIDTH 16384
+// Cost: 32× original memory. Cell is 8 bytes (count + last_decay_idx)
+// after aging added the timestamp, so per pod: 32768 × 4 × 2 × 8 =
+// 2 MiB. At 100 pods/node that's 200 MiB — still trivial for a
+// kernel-side data structure. Cluster-tier knobs let operators pick a
+// smaller tier for low-cardinality workloads (saving memory at the
+// cost of CMS accuracy under load spikes).
+#define CMS_WIDTH 32768
 #define CMS_DEPTH 4
 
 // Direction enum. Userspace must use the same numeric values when

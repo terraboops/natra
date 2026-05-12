@@ -257,8 +257,8 @@ func elephantPkt() []byte {
 // "the program doesn't crash, kernel doesn't panic, and STAT_PASSED
 // continues counting".
 //
-// We send 131072 distinct flows × 1 packet each. CMS_WIDTH × CMS_DEPTH
-// is 16384 × 4 = 65536 cells per direction, so this is 2× capacity —
+// We send 262144 distinct flows × 1 packet each. CMS_WIDTH × CMS_DEPTH
+// is 32768 × 4 = 131072 cells per direction, so this is 2× capacity —
 // every flow's counters must collide with at least one other flow.
 func TestMapCapacityOOM(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -282,7 +282,7 @@ func TestMapCapacityOOM(t *testing.T) {
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny)
 
 	prog := coll.Programs["natra_ingress"]
-	const flows = 131072 // 2× CMS capacity (65536 cells per direction)
+	const flows = 262144 // 2× CMS capacity (131072 cells per direction)
 	for i := 0; i < flows; i++ {
 		pkt := mkUniqueFlowPkt(uint32(i))
 		if _, _, err := prog.Test(pkt); err != nil {
@@ -301,8 +301,8 @@ func TestMapCapacityOOM(t *testing.T) {
 	// bpf/natra.bpf.c.
 	cmsMap := coll.Maps["natra_cms_map"]
 	var maxV uint32
-	// 65536 = CMS_WIDTH (16384) × CMS_DEPTH (4) cells per direction.
-	for i := uint32(0); i < 65536; i++ {
+	// 131072 = CMS_WIDTH (32768) × CMS_DEPTH (4) cells per direction.
+	for i := uint32(0); i < 131072; i++ {
 		var cell struct {
 			Count        uint32
 			LastDecayIdx uint32
