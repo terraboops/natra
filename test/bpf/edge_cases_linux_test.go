@@ -296,7 +296,7 @@ func TestEdgeCMSGrowsUnderTraffic(t *testing.T) {
 	var lastMaxes []uint32
 	for sample := 0; sample < 20; sample++ {
 		var curMax uint32
-		for k := uint32(0); k < 16384; k++ {
+		for k := uint32(0); k < 65536; k++ {
 			var cell cmsCell
 			if err := cmsMap.Lookup(&k, &cell); err == nil && cell.Count > curMax {
 				curMax = cell.Count
@@ -379,7 +379,7 @@ func TestEdgeCounterOverflow(t *testing.T) {
 	// first packet would reset the count to 0 and we'd never see
 	// wraparound.
 	preset := cmsCell{Count: 0xFFFFFFFF - 5, LastDecayIdx: 0xFFFFFFFE}
-	for k := uint32(0); k < 16384; k++ {
+	for k := uint32(0); k < 65536; k++ {
 		if err := cmsMap.Update(&k, &preset, ebpf.UpdateAny); err != nil {
 			t.Fatalf("cms[%d] preset: %v", k, err)
 		}

@@ -47,23 +47,32 @@
 #include <bpf/bpf_endian.h>
 
 // CMS dimensions are compile-time constants because BPF map sizes are
-// fixed at load time. 4096 × 4 = 16384 cells per direction; covers
-// 30K-flow workloads (an iperf3 --bidir + 1000 hey RPS over 30s
-// generates ~30K distinct 5-tuples) without saturating, where the
-// previous 1024 × 4 saturated within seconds and started false-
-// positive-classifying mice as heavy from hash-collision residue.
+// fixed at load time. 16384 × 4 = 65536 cells per direction; sized
+// to cover ~50K-flow workloads without saturating.
 //
-// Profile data from the perf-vs-vanilla mixed workload showed every
-// cell of the old 4096-cell layout was nonzero by end-of-test, and
-// natra's iperf throughput sat at ~8 Mbps (under the 10 Mbps cap)
-// because hey traffic was hitting the bucket instead of fast-passing.
-// 4× wider drops the collision rate ~4× and lets the fast pass do
-// its job under realistic load.
+// Sizing history — every step driven by profile data:
+//   1024 × 4 — original. Saturated in ~5s of mixed-workload traffic
+//             (iperf3 --bidir + ~1500 hey RPS); all cells nonzero,
+//             cell-value-mean climbed above the heavy-hitter
+//             threshold of 10, so new mice flows were false-positive
+//             classified as heavy on their first packet. Hey RPS
+//             topped out at ~1000 because most flows hit the bucket.
+//   4096 × 4 — bumped 4×. Still 99.9% saturated under the same
+//             workload (45K distinct hey 5-tuples in 30s vs 32K
+//             cells). Per-pod stats showed 70% of packets
+//             classified as heavy. Hey RPS improved to ~1500.
+//   16384 × 4 — current. 65K cells per direction; the 45K-flow
+//             workload now under-fills the sketch with ~0.7 flows
+//             per cell on average, so most new mice find their
+//             min-across-rows well below threshold and take the
+//             fast pass as intended.
 //
-// Cost: 4× CMS memory. Cell is 8 bytes (count + last_decay_idx),
-// so per pod: 4096 × 4 × 2 × 8 = 256 KiB. At 100 pods/node that's
-// 25 MiB — negligible.
-#define CMS_WIDTH 4096
+// Cost: 64 × original memory. Cell is 8 bytes (count + last_decay_idx)
+// after aging added the timestamp, so per pod: 16384 × 4 × 2 × 8 =
+// 1 MiB. At 100 pods/node that's 100 MiB — still trivial for a
+// kernel-side data structure. Cluster-tier knobs (forthcoming) will
+// let operators pick a smaller tier for low-cardinality workloads.
+#define CMS_WIDTH 16384
 #define CMS_DEPTH 4
 
 // Direction enum. Userspace must use the same numeric values when
