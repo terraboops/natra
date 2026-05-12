@@ -52,9 +52,28 @@ const (
 	namespace    = "natra-e2e"
 	natraImage   = "ghcr.io/terraboops/natra:e2e"
 	bandwidthBps = 10_000_000 // 10 Mbps annotation under test
-	// throttledCapRatio is the +20% slack against the configured rate;
-	// throttledCap is the literal byte/sec ceiling.
-	throttledCapRatio       = 1.20
+	// throttledCapRatio is the slack against the configured rate.
+	// 1.40 (40%) accommodates two compounding overshoot sources:
+	//
+	//   - The 2.5 MB initial token bucket (burst = 2× rate) amortizes
+	//     into ~+13% over a 15s measurement. natra's first-second
+	//     window goes at line rate before steady-state throttling
+	//     kicks in.
+	//
+	//   - The CMS heavy-hitter threshold (default 50) lets each flow
+	//     fast-pass its first ~50 GRO-coalesced super-packets — on
+	//     kindnet that's enough for an iperf3 stream to push a
+	//     couple of MB before classification crosses to heavy. Over
+	//     a 15s measurement this adds another ~10-15%. The threshold
+	//     was tuned for realistic mice (HTTP requests at <10 packets
+	//     each, well below the threshold); single-stream elephants
+	//     pay slightly more overshoot in exchange for mice fast-pass
+	//     working as designed.
+	//
+	// 1.40 leaves headroom above both effects without masking real
+	// regressions (any failure to throttle drives throughput >80x
+	// over cap, far outside 1.40).
+	throttledCapRatio       = 1.40
 	throttledCap      int64 = int64(float64(bandwidthBps) * throttledCapRatio)
 	// unthrottledFloor is the lower bound for a pod that is NOT
 	// supposed to be throttled. Conservative — kind cross-node TCP
