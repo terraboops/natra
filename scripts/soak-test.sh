@@ -180,7 +180,89 @@ EOF
     kubectl -n calico-system rollout status daemonset/calico-node --timeout=300s
 
     log_event "bootstrap: installing goldpinger"
-    kubectl apply -f https://raw.githubusercontent.com/bloomberg/goldpinger/v3.10.1/deploy/goldpinger-daemon.yaml
+    # Minimal goldpinger manifest. Upstream ships Helm charts, not
+    # a single-file apply target — easier to inline a stripped-down
+    # DaemonSet here than to add Helm as a dependency.
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: goldpinger
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: goldpinger
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: goldpinger
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: goldpinger
+subjects:
+  - kind: ServiceAccount
+    name: goldpinger
+    namespace: default
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: goldpinger
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: goldpinger
+  template:
+    metadata:
+      labels:
+        app: goldpinger
+    spec:
+      serviceAccountName: goldpinger
+      tolerations:
+        - operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: goldpinger
+          image: docker.io/bloomberg/goldpinger:v3.10.1
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "80"
+            - name: HOSTS_TO_RESOLVE
+              value: "1.1.1.1 8.8.8.8 kubernetes.default.svc.cluster.local"
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: REFRESH_INTERVAL
+              value: "30"
+          ports:
+            - containerPort: 80
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: goldpinger
+  namespace: default
+spec:
+  selector:
+    app: goldpinger
+  ports:
+    - port: 80
+      targetPort: 80
+EOF
     kubectl -n default rollout status daemonset/goldpinger --timeout=120s
 
     kubectl create namespace "$NS"

@@ -8,6 +8,9 @@
 - LLVM clang with the `bpf` target. Apple clang lacks it; on macOS,
   `brew install llvm` and the Makefile picks up `/opt/homebrew/opt/llvm/bin/clang`.
 - `kubectl` and `kind` for L4
+- `k3d` (optional) — only needed for `scripts/soak-test.sh`, which
+  uses a different cluster base than the rest of the test rig to
+  exercise node-membership changes (`brew install k3d`).
 
 ## Git hooks
 
