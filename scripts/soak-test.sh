@@ -416,14 +416,17 @@ measure() {
     : "${rps:=0}"; : "${p50:=0}"; : "${p99:=0}"
 
     # Goldpinger /metrics scrape via in-cluster service. Sum probe
-    # totals and failures across all pods. Best-effort — if
-    # goldpinger isn't reachable yet the values are 0.
+    # totals and failures across all pods. Best-effort — under node
+    # churn the apiserver briefly 502s on kubectl exec; we wrap in
+    # `|| true` subshells so a failed scrape just records 0 instead
+    # of killing the script (set -o pipefail otherwise propagates
+    # the kubectl error through the pipe).
     local gp_total gp_failed
-    gp_total=$(kubectl exec -n "$NS" soak-client -- \
-        sh -c 'wget -qO- http://goldpinger.default.svc.cluster.local:80/metrics 2>/dev/null || true' \
+    gp_total=$( (kubectl exec -n "$NS" soak-client -- \
+        sh -c 'wget -qO- http://goldpinger.default.svc.cluster.local:80/metrics 2>/dev/null || true' 2>/dev/null || true) \
         | awk '/^goldpinger_peers_response_time_s_count/ {sum+=$NF} END{print sum+0}')
-    gp_failed=$(kubectl exec -n "$NS" soak-client -- \
-        sh -c 'wget -qO- http://goldpinger.default.svc.cluster.local:80/metrics 2>/dev/null || true' \
+    gp_failed=$( (kubectl exec -n "$NS" soak-client -- \
+        sh -c 'wget -qO- http://goldpinger.default.svc.cluster.local:80/metrics 2>/dev/null || true' 2>/dev/null || true) \
         | awk '/^goldpinger_peers_response_time_s_count.*"timeout"|"error"/ {sum+=$NF} END{print sum+0}')
     : "${gp_total:=0}"; : "${gp_failed:=0}"
 
@@ -498,7 +501,7 @@ snapshot_loop() {
         # Single-shot natra profile: -interval longer than we wait
         # so it only writes one snapshot, then we kill it.
         docker exec "$worker" mkdir -p /var/log/natra-soak 2>/dev/null || true
-        docker exec "$worker" bash -c "
+        docker exec "$worker" sh -c "
             setsid nohup /opt/cni/bin/natra profile \
                 -interval 10s \
                 -output /var/log/natra-soak/snapshots-${idx}.jsonl \
@@ -507,7 +510,7 @@ snapshot_loop() {
             echo \$! > /var/log/natra-soak/profile.pid
         " || true
         sleep 12  # let it write one snapshot
-        docker exec "$worker" bash -c '
+        docker exec "$worker" sh -c '
             kill $(cat /var/log/natra-soak/profile.pid) 2>/dev/null || true
         ' || true
         # Copy out the snapshot and the heap dir contents.
