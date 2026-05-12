@@ -85,7 +85,10 @@ static __always_inline int vanilla_classify(struct __sk_buff *skb, __u32 dir)
 	__u64 now = bpf_ktime_get_ns();
 	int allowed = 0;
 	bpf_spin_lock(&tb->lock);
-	__u64 elapsed_ns = now - tb->last_update_ns;
+	// Same monotonicity guard as natra.bpf.c — see comment there.
+	__u64 elapsed_ns = 0;
+	if (now > tb->last_update_ns)
+		elapsed_ns = now - tb->last_update_ns;
 	__u64 added = (elapsed_ns / 1000ULL) * cfg->rate_bps / 1000000ULL;
 	__u64 tokens = tb->tokens + added;
 	if (tokens > cfg->burst_bytes)
@@ -95,7 +98,8 @@ static __always_inline int vanilla_classify(struct __sk_buff *skb, __u32 dir)
 		allowed = 1;
 	}
 	tb->tokens = tokens;
-	tb->last_update_ns = now;
+	if (now > tb->last_update_ns)
+		tb->last_update_ns = now;
 	bpf_spin_unlock(&tb->lock);
 
 	if (allowed) {

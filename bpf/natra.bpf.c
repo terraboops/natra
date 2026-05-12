@@ -232,7 +232,17 @@ static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps
 
 	int allowed = 0;
 	bpf_spin_lock(&tb->lock);
-	__u64 elapsed_ns = now - tb->last_update_ns;
+	// bpf_ktime_get_ns is monotonic per CPU but the timekeeping core's
+	// fast-path latch can return slightly out-of-order values across
+	// CPUs (and around the seqlock's swap). If now < last_update_ns,
+	// a naive subtraction underflows to ~2^64, which then gets
+	// multiplied through and refills the bucket all the way to burst
+	// on every such packet — turning the throttle off entirely under
+	// multi-stream workloads. Treat any non-monotonic reading as zero
+	// elapsed.
+	__u64 elapsed_ns = 0;
+	if (now > tb->last_update_ns)
+		elapsed_ns = now - tb->last_update_ns;
 	// Two-step (ns / 1000) * rate / 1_000_000 keeps the multiply
 	// inside u64 even for hours of idle time. The cap-by-burst step
 	// after enforces the bucket ceiling regardless.
@@ -245,7 +255,8 @@ static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps
 		allowed = 1;
 	}
 	tb->tokens = tokens;
-	tb->last_update_ns = now;
+	if (now > tb->last_update_ns)
+		tb->last_update_ns = now;
 	bpf_spin_unlock(&tb->lock);
 	return allowed;
 }
