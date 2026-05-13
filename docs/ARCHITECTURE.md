@@ -208,9 +208,14 @@ metadata:
       {
         "rate": "10M",
         "burst": "20M",
-        "heavyHitterThreshold": 50
+        "heavyHitterThreshold": 131072
       }
 ```
+
+`rate` and `burst` follow the k8s annotation convention (bits/sec
+with SI/IEC suffixes); the parser divides by 8 to populate the
+bytes/sec Config. `heavyHitterThreshold` is a raw byte count in
+CMS units — 131072 = 128 KiB.
 
 The parser is direction-agnostic — same fields and semantics apply on
 the egress annotation.

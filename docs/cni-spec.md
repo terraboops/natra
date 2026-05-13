@@ -146,15 +146,19 @@ independently:
 metadata:
   annotations:
     kubernetes.io/ingress-bandwidth: |
-      {"rate":"10M","burst":"20M","heavyHitterThreshold":50}
+      {"rate":"10M","burst":"20M","heavyHitterThreshold":131072}
     kubernetes.io/egress-bandwidth: |
-      {"rate":"5M","heavyHitterThreshold":20}
+      {"rate":"5M","heavyHitterThreshold":65536}
 ```
 
-The threshold unit is **bytes** (CMS counts byte volume per flow,
-not packet count). When unset on a per-pod basis, the per-pod
-default is rate-scaled:
-`max(16 KiB, rate_bps × FASTPASS_TIME_CONSTANT_MS / 1000)`. With
+`rate` and `burst` follow the k8s annotation convention — bits per
+second with SI/IEC suffixes ("M" = Mbit, not MB). The parser divides
+by 8 to populate the bytes/sec Config the BPF dataplane needs.
+
+`heavyHitterThreshold` is a raw byte count (CMS unit). 131072 is
+128 KiB, 65536 is 64 KiB. When unset on a per-pod basis, the
+per-pod default is rate-scaled:
+`max(16 KiB, rate_bytes × FASTPASS_TIME_CONSTANT_MS / 1000)`. With
 the default 100 ms time constant, a 10 Mbps pod gets ~125 KiB
 threshold and a 1 Gbps pod gets ~12.5 MiB.
 

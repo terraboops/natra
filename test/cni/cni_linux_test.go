@@ -144,7 +144,7 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
 			Expect(string(stderr)).To(ContainSubstring("attached hostside/ingress"))
-			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
+			Expect(string(stderr)).To(ContainSubstring("rate=1250000"))
 			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeTrue(),
 				"tcx-hostside ingress attached but no link pin found")
 			Expect(linkPinExists(containerID, "hostside", "egress")).To(BeFalse(),
@@ -290,7 +290,7 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 
 			Expect(string(stderr)).To(ContainSubstring("attached hostside/egress"))
-			Expect(string(stderr)).To(ContainSubstring("rate=10000000"))
+			Expect(string(stderr)).To(ContainSubstring("rate=1250000"))
 			Expect(linkPinExists(containerID, "hostside", "egress")).To(BeTrue(),
 				"tcx-hostside egress attached but no link pin found")
 			Expect(linkPinExists(containerID, "hostside", "ingress")).To(BeFalse(),

@@ -1,15 +1,17 @@
 // Package config parses the bandwidth pod annotations. Two forms are
 // accepted:
 //
-//   - Simple:   "10M"   →  Rate=10_000_000 bytes/s, Burst=20_000_000 bytes
+//   - Simple:   "10M"   →  Rate=1_250_000 bytes/s, Burst=2_500_000 bytes
 //   - Extended: {"rate":"10M","burst":"15M","heavyHitterThreshold":131072}
 //
-// Units: the parser treats inputs as byte quantities (so "M" = MB,
-// not Mbit). This is intentional — natra's BPF dataplane operates in
-// bytes — but it differs from the kubelet runtimeConfig.bandwidth
-// path which delivers bits/sec per k8s convention; the caller (main.go)
-// divides that path by 8 before populating Config. Pod-annotation
-// direct-reads go straight through this parser as-is.
+// Units: rate and burst inputs follow the kubernetes
+// kubernetes.io/{ingress,egress}-bandwidth convention — bits per
+// second, with SI/IEC suffixes (K=10^3 bits, M=10^6 bits, Ki=2^10
+// bits, etc.). The parser converts to bytes (divides by 8) before
+// populating Config so the BPF dataplane gets bytes/sec. Matches
+// kubelet's runtimeConfig.bandwidth interpretation, so the
+// pod-annotation-direct path and the runtimeConfig path produce the
+// same Config from the same annotation.
 //
 // heavyHitterThreshold is in bytes (CMS counts byte volume per flow,
 // not packets). 131072 is a 128 KiB example; the default is 256 KiB.
@@ -88,6 +90,10 @@ func DefaultConfig() *Config {
 // returns DefaultConfig. JSON shapes (any leading whitespace then `{`)
 // go through parseJSONConfig; everything else is treated as a simple
 // "10M"-style value.
+//
+// The string parses as bits/sec per k8s convention; the returned
+// Config carries bytes/sec, so a "10M" annotation becomes 1_250_000
+// bytes/sec (10 Mbit/s).
 func ParseBandwidthAnnotation(annotation string) (*Config, error) {
 	if annotation == "" {
 		return DefaultConfig(), nil
@@ -96,18 +102,22 @@ func ParseBandwidthAnnotation(annotation string) (*Config, error) {
 		return parseJSONConfig(annotation)
 	}
 
-	rate, err := parseBandwidth(annotation)
+	rateBits, err := parseBandwidth(annotation)
 	if err != nil {
 		return nil, fmt.Errorf("invalid bandwidth format: %w", err)
 	}
 	cfg := DefaultConfig()
-	cfg.Rate = rate
-	cfg.Burst = rate * 2
+	cfg.Rate = rateBits / 8
+	cfg.Burst = cfg.Rate * 2
 	return cfg, nil
 }
 
 // parseJSONConfig parses the extended JSON form. Unspecified fields
 // keep the DefaultConfig value; specified ones override.
+//
+// "rate" and "burst" follow the same bits/sec convention as the
+// simple form — both are divided by 8 to populate the bytes/sec
+// Config fields. heavyHitterThreshold is a raw byte count (CMS unit).
 func parseJSONConfig(data string) (*Config, error) {
 	var raw struct {
 		Rate                 string `json:"rate"`
@@ -120,18 +130,18 @@ func parseJSONConfig(data string) (*Config, error) {
 
 	cfg := DefaultConfig()
 	if raw.Rate != "" {
-		rate, err := parseBandwidth(raw.Rate)
+		rateBits, err := parseBandwidth(raw.Rate)
 		if err != nil {
 			return nil, fmt.Errorf("invalid rate: %w", err)
 		}
-		cfg.Rate = rate
+		cfg.Rate = rateBits / 8
 	}
 	if raw.Burst != "" {
-		burst, err := parseBandwidth(raw.Burst)
+		burstBits, err := parseBandwidth(raw.Burst)
 		if err != nil {
 			return nil, fmt.Errorf("invalid burst: %w", err)
 		}
-		cfg.Burst = burst
+		cfg.Burst = burstBits / 8
 	} else if cfg.Rate > 0 {
 		cfg.Burst = cfg.Rate * 2
 	}
@@ -141,9 +151,11 @@ func parseJSONConfig(data string) (*Config, error) {
 	return cfg, nil
 }
 
-// parseBandwidth parses a single quantity like "10M", "500K", "1Gi".
-// SI suffixes (K, M, G) are decimal; IEC suffixes (Ki, Mi, Gi) are
-// binary. Case-insensitive on the suffix.
+// parseBandwidth parses a single quantity like "10M", "500K", "1Gi"
+// and returns the scaled integer (units agnostic — the caller
+// interprets the result as bits/sec, bytes, etc. per its own
+// convention). SI suffixes (K, M, G) are decimal; IEC suffixes
+// (Ki, Mi, Gi) are binary. Case-insensitive on the suffix.
 func parseBandwidth(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -177,9 +189,10 @@ func parseBandwidth(s string) (int64, error) {
 	return num * multiplier, nil
 }
 
-// suffixMultiplier returns the byte multiplier for the parsed suffix,
-// or 0 if the suffix is unknown. Pulled out so parseBandwidth's body
-// is one fact per line.
+// suffixMultiplier returns the multiplier for the parsed suffix, or
+// 0 if the suffix is unknown. Caller interprets the resulting scaled
+// integer per its own unit convention. Pulled out so parseBandwidth's
+// body is one fact per line.
 func suffixMultiplier(suffix string) int64 {
 	switch suffix {
 	case "", "B":
