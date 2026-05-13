@@ -23,7 +23,9 @@
 #      whether the plugin adds any overhead to neighboring unannotated
 #      pods.
 #
-# Output: docs/perf-vs-vanilla-result.txt with the raw numbers.
+# Output: /tmp/natra-perf-vs-vanilla-result.txt with the raw numbers
+# (live-tee'd to stdout during the run). Out-of-tree so it can't
+# accidentally land in a commit.
 #
 # Run time: ~18-22 minutes. Docker required on macOS (colima or Docker
 # Desktop).
@@ -31,7 +33,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RESULT_FILE="${REPO_ROOT}/docs/perf-vs-vanilla-result.txt"
+RESULT_FILE="${RESULT_FILE:-/tmp/natra-perf-vs-vanilla-result.txt}"
 
 BASELINE_CLUSTER="natra-vs-vanilla-baseline"
 NATRA_CLUSTER="natra-vs-vanilla-natra"

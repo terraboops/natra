@@ -22,8 +22,7 @@ Two workloads per configuration:
 Run with:
 
 ```bash
-make perf-vs-vanilla
-cat docs/perf-vs-vanilla-result.txt
+make perf-vs-vanilla   # tees to /tmp/natra-perf-vs-vanilla-result.txt
 ```
 
 The driver is `scripts/perf-vs-vanilla.sh`.

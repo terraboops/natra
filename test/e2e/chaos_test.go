@@ -1,7 +1,8 @@
 //go:build e2e
 
 // Layer 4 chaos — cluster-shaped failure modes that don't fit in Layer 3
-// (lvh has no DaemonSet, no Pod scheduler, no veth lifecycle to perturb).
+// (BPF_PROG_RUN has no DaemonSet, no Pod scheduler, no veth lifecycle
+// to perturb).
 
 package e2e_test
 

@@ -228,7 +228,7 @@ else
 endif
 
 .PHONY: perf-vs-vanilla
-perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugin (~6 min).
+perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugin (~18-22 min; three k3d phases).
 	@bash scripts/perf-vs-vanilla.sh
 
 .PHONY: test-all
