@@ -1,8 +1,18 @@
 // Package config parses the bandwidth pod annotations. Two forms are
 // accepted:
 //
-//   - Simple:   "10M"   →  Rate=10_000_000 Burst=20_000_000
-//   - Extended: {"rate":"10M","burst":"15M","heavyHitterThreshold":50}
+//   - Simple:   "10M"   →  Rate=10_000_000 bytes/s, Burst=20_000_000 bytes
+//   - Extended: {"rate":"10M","burst":"15M","heavyHitterThreshold":131072}
+//
+// Units: the parser treats inputs as byte quantities (so "M" = MB,
+// not Mbit). This is intentional — natra's BPF dataplane operates in
+// bytes — but it differs from the kubelet runtimeConfig.bandwidth
+// path which delivers bits/sec per k8s convention; the caller (main.go)
+// divides that path by 8 before populating Config. Pod-annotation
+// direct-reads go straight through this parser as-is.
+//
+// heavyHitterThreshold is in bytes (CMS counts byte volume per flow,
+// not packets). 131072 is a 128 KiB example; the default is 256 KiB.
 //
 // The parser is direction-agnostic — the caller picks the annotation
 // key (`kubernetes.io/ingress-bandwidth` or
