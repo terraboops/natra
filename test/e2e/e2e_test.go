@@ -1,13 +1,14 @@
 //go:build e2e
 
-// Layer 4 — kind end-to-end happy path.
+// Layer 4 — k3d end-to-end happy path.
 //
-// Brings up a 2-node kind cluster (kindnet as main CNI), builds and
-// loads the natra container image, installs the natra DaemonSet
-// (which copies the binary into /opt/cni/bin on every node), deploys
-// the iperf3 client + multiple iperf3 server pods covering the
-// topology matrix, runs traffic, and verifies bandwidth annotations
-// are enforced (or not) for each topology.
+// Brings up a 2-node k3d cluster (k3s in Docker, flannel host-gw as
+// main CNI), builds and loads the natra container image, installs
+// the natra DaemonSet (which copies the binary into every CNI bin
+// candidate path on every node), deploys the iperf3 client +
+// multiple iperf3 server pods covering the topology matrix, runs
+// traffic, and verifies bandwidth annotations are enforced (or not)
+// for each topology.
 //
 // Topologies covered (one Describe block each, plus a smoke check):
 //   A. ingress only         — server with kubernetes.io/ingress-bandwidth=10M
@@ -116,9 +117,10 @@ var (
 )
 
 // unthrottledFloor is the lower bound for a pod that is NOT supposed
-// to be throttled. Conservative — kind cross-node TCP over kindnet
-// on a CI runner sustains > 1 Gbps without natra, and natra-the-no-op
-// should not change that meaningfully. Not jitter-derived because the
+// to be throttled. Conservative — k3d cross-node TCP over flannel
+// host-gw on a CI runner sustains > 1 Gbps without natra, and
+// natra-the-no-op should not change that meaningfully. Not
+// jitter-derived because the
 // floor is 10× below typical unthrottled throughput; runner jitter
 // doesn't approach this gap.
 var unthrottledFloor int64 = 100_000_000 // 100 Mbps
@@ -143,7 +145,7 @@ var _ = BeforeSuite(func() {
 	// (no hw offload in LinuxKit), which is below the rate-limit
 	// caps under test and makes throttle assertions meaningless.
 	// host-gw uses direct route entries between nodes on the same
-	// docker bridge; near-line-rate, matches kind+kindnet behavior.
+	// docker bridge — near-line-rate, what the assertions need.
 	mustExec("k3d", "cluster", "create", clusterName,
 		"--agents", "1",
 		"--no-lb",
@@ -708,7 +710,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		By("removing the natra DaemonSet")
 		removeNatraDaemon()
 
-		By("deploying unannotated server (kindnet-only path)")
+		By("deploying unannotated server (flannel-only path)")
 		reapplyPod(podName, manifest)
 
 		// Brief settle window. kubectl wait --for=condition=Ready

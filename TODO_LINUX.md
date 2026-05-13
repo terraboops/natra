@@ -167,8 +167,9 @@ Files under `test/perf/`:
   BPF_PROG_RUN tests; the test fails on regression past the recorded
   value.
 - `realworld/vanilla-installer.yaml` — DaemonSet that fetches the
-  upstream `bandwidth` plugin and chains it after kindnet, used by
-  `make perf-vs-vanilla` for both ingress and egress phases.
+  upstream `bandwidth` plugin and chains it after flannel (k3d's
+  default CNI), used by `make perf-vs-vanilla` for both ingress
+  and egress phases.
 
 Run:
 ```bash

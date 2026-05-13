@@ -7,9 +7,10 @@ metadata:
     app: iperf-client
 spec:
   # Pinned to the control-plane node so traffic to iperf-server crosses
-  # the inter-node fabric (kindnet bridge + vxlan), exercising natra's
-  # clsact filter on the *server* side veth where the packet arrives
-  # from a remote source — the production-shaped scenario.
+  # the inter-node fabric (flannel host-gw between docker-bridged
+  # k3d nodes), exercising natra's filter on the *server*-side veth
+  # where the packet arrives from a remote source — the
+  # production-shaped scenario.
   nodeSelector:
     kubernetes.io/hostname: k3d-natra-e2e-server-0
   tolerations:

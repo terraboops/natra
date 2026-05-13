@@ -1,6 +1,7 @@
 # Chains the upstream containernetworking/plugins/bandwidth plugin
-# after kindnet. The bandwidth binary ships in /opt/cni/bin/ on kind
-# nodes already, so this is just a conflist patch.
+# after flannel (the k3d default CNI). k3d's base image doesn't ship
+# the bandwidth plugin binary, so the init container fetches it from
+# the upstream release before patching the conflist.
 #
 # Same shape as deploy/cni-installer.yaml but writes a 00-bandwidth-...
 # sibling conflist instead of a 00-natra-... one. Used by
@@ -39,9 +40,10 @@ spec:
             - /bin/sh
             - -ec
             - |
-              # kind nodes only ship a subset of CNI plugins
-              # (host-local, loopback, portmap, ptp). The bandwidth
-              # plugin needs to be fetched from the upstream release.
+              # k3d's base image ships a subset of CNI plugins
+              # (host-local, loopback, portmap, ptp, flannel). The
+              # bandwidth plugin needs to be fetched from the
+              # upstream release.
               CNI_VERSION="v1.5.1"
               ARCH="$(uname -m)"
               case "$ARCH" in

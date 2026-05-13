@@ -1,8 +1,9 @@
 # Mixed-workload client: one pod with both iperf3 and hey installed so
 # the two generators run concurrently from the same source IP, against
 # the same server pod. Pinned to control-plane so traffic crosses the
-# inter-node fabric (kindnet bridge/vxlan) and hits the server's veth
-# as remote-origin packets — the production-shaped scenario.
+# inter-node fabric (flannel host-gw between docker-bridged k3d
+# nodes) and hits the server's veth as remote-origin packets — the
+# production-shaped scenario.
 apiVersion: v1
 kind: Pod
 metadata:
