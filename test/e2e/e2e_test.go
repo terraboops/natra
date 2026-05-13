@@ -208,6 +208,13 @@ var _ = BeforeSuite(func() {
 			"tail -100 /var/log/natra-cni.log 2>/dev/null || echo '(no natra log)'")
 		dump("natra binary caps", "docker", "exec", "k3d-"+clusterName+"-agent-0", "sh", "-c",
 			"ls -l /var/lib/rancher/k3s/data/cni/natra && getcap /var/lib/rancher/k3s/data/cni/natra 2>&1 || true")
+		dump("containerd CNI config (bin_dir search path)", "docker", "exec",
+			"k3d-"+clusterName+"-agent-0", "sh", "-c",
+			"grep -E 'bin_dir|conf_dir|cni' /var/lib/rancher/k3s/agent/etc/containerd/config.toml 2>/dev/null || "+
+				"find / -name 'config.toml' -path '*containerd*' -exec grep -lE 'cni' {} + 2>/dev/null | head -3")
+		dump("which directories actually have natra", "docker", "exec",
+			"k3d-"+clusterName+"-agent-0", "sh", "-c",
+			"find / -name 'natra' -type f 2>/dev/null | head -10")
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
 
