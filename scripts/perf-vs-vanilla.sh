@@ -356,6 +356,40 @@ start_profile_collector() {
     # has stabilized before workload traffic starts.
     sleep 1
     echo "==> started natra profile collector on ${cluster}-worker" >&2
+
+    # bpftool prog profile gives cycles + instructions per
+    # natra_ingress / natra_egress invocation — finer-grained than
+    # the runtime_ns/run_count `natra profile` collects. Runs for
+    # 25s in the background; the natra mixed workload lasts ~30s,
+    # so this overlaps the steady-state phase. Captures land at
+    # ${profile_dir}/bpftool-prog-profile.txt.
+    docker exec "${cluster}-worker" bash -c '
+        if ! command -v bpftool >/dev/null 2>&1; then
+            echo "bpftool not available; skipping prog profile" > /var/log/natra-profile/bpftool.txt
+            exit 0
+        fi
+        # Resolve natra prog IDs by name. There may be multiple if
+        # several pods are attached; capture each separately so we
+        # can spot per-pod variance.
+        ids=$(bpftool prog show 2>/dev/null \
+            | awk -F"[ :]+" "/name (natra_ingress|natra_egress)/ {print \$1\":\"\$5}")
+        if [ -z "$ids" ]; then
+            echo "no natra programs loaded yet" > /var/log/natra-profile/bpftool.txt
+            exit 0
+        fi
+        : > /var/log/natra-profile/bpftool.txt
+        for entry in $ids; do
+            pid="${entry%%:*}"
+            pname="${entry##*:}"
+            (
+                echo "=== prog id=$pid name=$pname ==="
+                bpftool prog profile id "$pid" duration 25 \
+                    cycles instructions cache_references cache_misses 2>&1
+                echo
+            ) >> /var/log/natra-profile/bpftool.txt &
+        done
+        wait
+    ' >/dev/null 2>&1 &
     # Diagnostic: dump state of /var/log/natra-profile/ so a missing
     # snapshot or a startup error in the profile binary shows up
     # immediately rather than as a silent "no snapshots written".
@@ -396,6 +430,8 @@ stop_profile_collector() {
         echo "==> docker cp heap-dir failed (skipping)" >&2
     docker cp "${cluster}-worker:/var/log/natra-profile/profile.log" \
         "$profile_dir/profile.log" || true
+    docker cp "${cluster}-worker:/var/log/natra-profile/bpftool.txt" \
+        "$profile_dir/bpftool-prog-profile.txt" || true
     echo "==> profile artifacts: $profile_dir" >&2
     summarize_profile "$profile_dir/snapshots.jsonl"
     preserve_artifacts
