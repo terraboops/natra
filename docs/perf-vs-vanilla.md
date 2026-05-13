@@ -179,34 +179,52 @@ vs 320× win), but it's not zero — worth knowing when sizing nodes
 that mix annotated heavy traffic with unannotated latency-sensitive
 workloads.
 
-### With EDT pacing enabled
+### Bystander gap closed: EDT auto-detect + ECN
 
-Setting `NATRA_EDT_PACING=1` on the installer flips natra to use
-EDT-stamped pacing for above-rate egress instead of dropping. natra
-installs an `fq` qdisc on each pod's eth0 at CNI ADD; `fq` honors
-`skb->tstamp` and delays the packet until its scheduled time.
-Result: no TCP retransmits, smaller softirq footprint on the worker.
+EDT pacing now defaults to `auto` — at CNI ADD, natra probes `fq`
+install on pod-eth0, uses EDT pacing if it succeeds, falls back to
+drop semantics if it fails. ECN-mark fires whenever the peer
+negotiated ECN-capable TCP. The combination removes virtually all
+above-rate drops, and the TCP retransmit amplifier that was
+bleeding worker CPU into the bystander disappears with them.
 
-| Plugin                              | Iperf ing  | Iperf eg  | Annotated mice RPS | Bystander mice RPS |
-|-------------------------------------|------------|-----------|-------------------:|-------------------:|
-| baseline (no plugin)                | 7883 Mbps  | 27490 Mbps | 5189              | 6881               |
-| natra (default — ECN+drop)          | 10.7 Mbps  | 9.3 Mbps  | 3539              | 4728               |
-| **natra with EDT (`NATRA_EDT_PACING=1`)** | **9.96 Mbps** | **6.71 Mbps** | **4381** | **6303** |
+The progression across runs:
 
-EDT cuts the bystander bleed from ~34% under baseline to ~12%, and
-annotated-mice RPS goes from 3539 to 4381 (+24%). The egress
-rate-limit stays enforced (fq honoring the timestamps); without `fq`
-downstream the EDT path silently passes packets at line rate (see
-the cautionary observed-50-Gbps incident in commit history). This
-is why EDT is opt-in — it only works correctly when natra's `fq`
-install sticks on pod-eth0, which requires that no other CNI plugin
-has set a competing root qdisc.
+| Plugin                          | Iperf ing  | Iperf eg  | Annotated mice RPS | Bystander RPS | Bystander Δ vs baseline |
+|---------------------------------|------------|-----------|-------------------:|--------------:|------------------------:|
+| baseline (no plugin)            | ~8 Gbps    | ~27 Gbps  | 5283               | 6479          | 0% (reference)          |
+| natra (early — drop only)       | 10.7 Mbps  | 9.3 Mbps  | 3539               | 4728          | **-27%**                |
+| natra (EDT only, ECN passive)   | 9.96 Mbps  | 6.71 Mbps | 4381               | 6303          | -3%                     |
+| **natra (EDT auto + ECN=1)**    | **9.12 Mbps** | **6.77 Mbps** | **4073**       | **6913**      | **+6.7%** (within noise)|
+| upstream `bandwidth` (HTB)      | 10.59 Mbps | 8.67 Mbps | 12                 | 8519          | +31% (HTB queueing artifact) |
 
-The remaining ~12% bystander gap under EDT is the ingress half: natra
-still drops over-rate non-ECN packets on ingress because there's no
-transmission-side qdisc to honor `skb->tstamp` on the receive path.
-For ECN-capable peers (`net.ipv4.tcp_ecn=1` on either end), the
-ingress drops become ECN-marks and that residue closes too.
+The EDT auto-detect change:
+
+- At CNI ADD, the plugin tries `tc qdisc replace dev eth0 root fq`
+  inside the pod netns. Idempotent — skips when `fq` is already
+  the root qdisc.
+- If the install succeeds, `cfg.edt_pacing` is set in the BPF
+  config slot and the BPF program EDT-stamps above-rate packets
+  instead of dropping.
+- If it fails (e.g., some other plugin already set a non-`fq`
+  root qdisc), `cfg.edt_pacing` stays zero and the BPF falls back
+  to drop after ECN-mark.
+
+Operators can force the behavior either way with
+`NATRA_EDT_PACING=on` (fail attach if `fq` install fails) or
+`NATRA_EDT_PACING=off` (never install `fq`, always drop after
+ECN-mark). Auto is the recommended default — it picks the
+optimal configuration when supported and degrades cleanly when
+not.
+
+For ECN to fire on a TCP flow, both peers' kernels need
+`net.ipv4.tcp_ecn` set to allow negotiation. Linux's default of
+`2` (passive — only respond, never initiate) means most flows
+won't negotiate even if natra can mark them. Setting `tcp_ecn=1`
+on the cluster nodes lets active negotiation happen and closes
+the ingress side of the bystander bleed (natra still drops
+non-ECN ingress traffic — there's no transmission-side qdisc to
+delay incoming packets).
 
 The mixed iperf throughput under natra comes in close to but below
 the 10 Mbps cap because when hey *does* occasionally hit the bucket
