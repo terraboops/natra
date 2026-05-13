@@ -1,5 +1,8 @@
 natra vs upstream containernetworking/plugins/bandwidth — kind cluster head-to-head
 ====================================================================================
+Three configurations: baseline (kindnet alone, no rate-limiting), natra, upstream
+containernetworking/plugins/bandwidth. Same workloads against each.
+
 Workload 1: iperf-only (legacy). Same iperf3 client/server, 10M annotation each direction.
   - ingress: forward iperf3 (client → server, charged to server's ingress)
   - egress:  reverse iperf3 -R (server → client, charged to server's egress)
@@ -9,45 +12,76 @@ Iperf goodput, receiver-side aggregate (sum_received.bits_per_second).
 
 Direction  Plugin                          Elephant            Mice (20× parallel)
 -------------------------------------------------------------------------------------------
-ingress    natra                           12.14 Mbps        36.79 Mbps
-ingress    upstream bandwidth              10.04 Mbps        9.59 Mbps
-egress     natra                           12.16 Mbps        38.99 Mbps
-egress     upstream bandwidth              10.12 Mbps        9.61 Mbps
+ingress    baseline (no plugin)            55963.10 Mbps        54970.74 Mbps
+ingress    natra                           12.16 Mbps        36.60 Mbps
+ingress    upstream bandwidth              10.04 Mbps        9.64 Mbps
+egress     baseline (no plugin)            54811.72 Mbps        49324.99 Mbps
+egress     natra                           12.20 Mbps        39.04 Mbps
+egress     upstream bandwidth              10.11 Mbps        9.61 Mbps
 
 
-Workload 2: realistic mixed (elephant + hey HTTP mice). Same server pod runs iperf3 +
-nginx; client runs iperf3 --bidir for 30s and (starting 5s later) hey -c
-50 -disable-keepalive -z 20s against the nginx. Each hey request is a
-fresh TCP connection → distinct CMS flow_key → stays under heavy-hitter
-threshold. Under natra, hey fast-passes the bucket; under vanilla HTB, hey
-shares the bucket with the elephant.
+Workload 2: mixed (elephant + HTTP mice on annotated pod + HTTP mice on unannotated
+bystander). perf-server (annotated 10M/10M) runs iperf3 + nginx; bystander
+(unannotated, same node) runs nginx. Client runs iperf3 --bidir against perf-server
+for 30s and (starting 5s later) two parallel
+hey runs (-c 50 -disable-keepalive -z 20s)
+against perf-server and bystander. Each hey request is a fresh TCP connection →
+distinct flow_key → stays under heavy-hitter threshold.
 
-Plugin                Elephant ingress    Elephant egress    Hey RPS         Hey p50     Hey p99
--------------------------------------------------------------------------------------------------
-natra                 9.23 Mbps        5.13 Mbps       4426 req/s         1.1 ms   208.2 ms
-upstream bandwidth    10.59 Mbps        8.32 Mbps       12 req/s      4786.0 ms  5034.5 ms
+The annotated-pod-mice column shows whether the plugin can isolate small flows
+inside an annotated pod's budget. The bystander column shows whether the plugin
+adds any overhead to neighboring unannotated pods.
+
+                       │ Elephant flows           │ Annotated mice (perf-server) │ Bystander mice (unannotated)
+Plugin                 │ ingress       egress     │ RPS          p50      p99    │ RPS          p50      p99
+---------------------------------------------------------------------------------------------------------------------
+baseline (no plugin)   │ 8168.00 Mbps  27407.02 Mbps  │ 5462 req/s      6.3 ms    72.9 ms │ 7143 req/s      6.1 ms    21.8 ms
+natra                  │ 10.73 Mbps  9.30 Mbps  │ 3539 req/s      5.0 ms   211.1 ms │ 4728 req/s      5.0 ms   133.8 ms
+upstream bandwidth     │ 10.63 Mbps  7.03 Mbps  │ 11 req/s   4947.9 ms  5117.8 ms │ 7560 req/s      2.8 ms    41.6 ms
 
 
 Raw numbers:
-  natra_ingress_elephant=12142301.225423958
-  natra_ingress_mice=36787717.418389231
-  natra_egress_elephant=12158306.50529067
-  natra_egress_mice=38987685.525607638
-  vanilla_ingress_elephant=10044591.528919268
-  vanilla_ingress_mice=9588577.51373923
-  vanilla_egress_elephant=10115863.842911545
-  vanilla_egress_mice=9614504.6350961737
-  natra_mixed_iperf_ingress=9226936.7133162
-  natra_mixed_iperf_egress=5128632.2488736482
-  natra_mixed_hey_rps=4426.4097
-  natra_mixed_hey_p50=0.0011
-  natra_mixed_hey_p99=0.2082
-  natra_mixed_hey_total=20.8761
-  vanilla_mixed_iperf_ingress=10590188.697357757
-  vanilla_mixed_iperf_egress=8318366.0395087339
-  vanilla_mixed_hey_rps=12.2090
-  vanilla_mixed_hey_p50=4.7860
-  vanilla_mixed_hey_p99=5.0345
-  vanilla_mixed_hey_total=24.4901
+  baseline_ingress_elephant=55963102186.426773
+  baseline_ingress_mice=54970742561.9291
+  baseline_egress_elephant=54811717081.196083
+  baseline_egress_mice=49324989942.311363
+  baseline_mixed_iperf_ingress=8167999386.94819
+  baseline_mixed_iperf_egress=27407015324.661964
+  baseline_mixed_pod_rps=5462.3108
+  baseline_mixed_pod_p50=0.0063
+  baseline_mixed_pod_p99=0.0729
+  baseline_mixed_pod_total=20.0333
+  baseline_mixed_bystander_rps=7143.4343
+  baseline_mixed_bystander_p50=0.0061
+  baseline_mixed_bystander_p99=0.0218
+  baseline_mixed_bystander_total=20.0034
+  natra_ingress_elephant=12163290.752092596
+  natra_ingress_mice=36604393.296820521
+  natra_egress_elephant=12204474.326710688
+  natra_egress_mice=39043394.106081411
+  natra_mixed_iperf_ingress=10729780.012279926
+  natra_mixed_iperf_egress=9298807.1953389738
+  natra_mixed_pod_rps=3539.2518
+  natra_mixed_pod_p50=0.0050
+  natra_mixed_pod_p99=0.2111
+  natra_mixed_pod_total=20.3475
+  natra_mixed_bystander_rps=4727.9772
+  natra_mixed_bystander_p50=0.0050
+  natra_mixed_bystander_p99=0.1338
+  natra_mixed_bystander_total=20.0033
+  vanilla_ingress_elephant=10039782.788980942
+  vanilla_ingress_mice=9636367.30497522
+  vanilla_egress_elephant=10114998.01420467
+  vanilla_egress_mice=9614552.7067829
+  vanilla_mixed_iperf_ingress=10625088.46265636
+  vanilla_mixed_iperf_egress=7025140.7269537123
+  vanilla_mixed_pod_rps=10.6656
+  vanilla_mixed_pod_p50=4.9479
+  vanilla_mixed_pod_p99=5.1178
+  vanilla_mixed_pod_total=23.4398
+  vanilla_mixed_bystander_rps=7560.0083
+  vanilla_mixed_bystander_p50=0.0028
+  vanilla_mixed_bystander_p99=0.0416
+  vanilla_mixed_bystander_total=20.0239
 
-Generated by scripts/perf-vs-vanilla.sh on 2026-05-12T14:11:27Z
+Generated by scripts/perf-vs-vanilla.sh on 2026-05-13T04:04:15Z

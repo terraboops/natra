@@ -78,17 +78,16 @@ iperf3 against an iperf3-only server, four phases per cluster:
 Receiver-side aggregate goodput from
 `end.sum_received.bits_per_second`.
 
-Numbers from the latest run live in `docs/perf-vs-vanilla-result.txt`;
-this doc explains what each column is measuring rather than carrying
-a snapshot that drifts on every rerun.
+### Most recent run (colima, aarch64)
 
-For Workload 1, expect roughly:
-
-- baseline: elephant and 20-parallel mice both at kindnet line rate
-  (hundreds of Mbps; whatever the runner allows)
-- vanilla: elephant ~10 Mbps, mice ~10 Mbps (HTB shares the bucket)
-- natra: elephant ~12 Mbps, mice ~30-40 Mbps (CMS fast-passes new
-  streams until each one's per-flow count crosses threshold)
+| Direction | Plugin                | Elephant     | Mice (20× parallel)  |
+|-----------|-----------------------|--------------|----------------------|
+| ingress   | baseline (no plugin)  | 55,963 Mbps  | 54,971 Mbps          |
+| ingress   | natra                 | 12.16 Mbps   | 36.60 Mbps           |
+| ingress   | upstream `bandwidth`  | 10.04 Mbps   |  9.64 Mbps           |
+| egress    | baseline (no plugin)  | 54,812 Mbps  | 49,325 Mbps          |
+| egress    | natra                 | 12.20 Mbps   | 39.04 Mbps           |
+| egress    | upstream `bandwidth`  | 10.11 Mbps   |  9.61 Mbps           |
 
 The single-stream elephant lands within ~21% of the 10 Mbps cap
 under natra and exactly at cap under vanilla.
@@ -145,21 +144,47 @@ Three things to read out of the result table:
    the cluster" assertion; if natra ever regresses to charging
    every pod, this column drops.
 
-Numbers from the latest run are in `docs/perf-vs-vanilla-result.txt`.
-The qualitative shape to expect:
+### Most recent run
 
-- Elephant: ~line rate under baseline, ~10 Mbps under natra and
-  vanilla.
-- Annotated mice: ~line rate under baseline, very high (thousands
-  of RPS, sub-second p99) under natra, very low (single-digit RPS,
-  multi-second p99) under vanilla.
-- Bystander mice: ~line rate under all three.
+| Plugin                | iperf ing  | iperf eg   | Annotated mice (perf-server) |             | Bystander mice (unannotated)  |             |
+|-----------------------|------------|------------|-----------------------------:|------------:|-------------------------------:|------------:|
+|                       |            |            | RPS                          | p99         | RPS                            | p99         |
+| baseline (no plugin)  | 8168 Mbps  | 27407 Mbps | 5462                         | 73 ms       | 7143                           | 22 ms       |
+| natra                 | 10.7 Mbps  | 9.3 Mbps   | **3539**                     | 211 ms      | 4728                           | 134 ms      |
+| upstream `bandwidth`  | 10.6 Mbps  | 7.0 Mbps   | 11                           | 5118 ms     | 7560                           | 42 ms       |
 
-The mixed iperf throughput under natra comes in below 10 Mbps
-because when hey *does* hit the bucket (CMS collisions, occasional
-above-threshold bursts on a connection), it consumes tokens iperf
-would otherwise have. The headline guarantee is "annotated rate is
-the ceiling," not "the annotated rate is always reached."
+The headline wedge is the **annotated mice** column. natra serves
+3539 RPS in the same pod as a 10 Mbps elephant; vanilla serves 11
+RPS — natra is ~320× higher. CMS classification is what makes that
+gap: each hey request is a fresh flow_key that stays under the
+heavy-hitter threshold, fast-passes the bucket, and isn't queued
+behind the elephant.
+
+The **bystander** column is honest news in both directions:
+
+- Vanilla bystander is essentially baseline (7560 vs 7143 RPS) —
+  the unannotated pod gets no HTB attached, so it's untouched.
+- natra bystander is **~35% lower than baseline** (4728 vs 7143
+  RPS), even though no BPF program is attached to the bystander
+  itself. The most likely cause is CPU/NIC contention: natra's
+  per-packet BPF work on perf-server's veth (CMS update + bucket
+  check on every packet of a sustained 10 Mbps elephant) consumes
+  worker-node cycles that the bystander's HTTP serving would
+  otherwise have. Vanilla's HTB shaping is cheaper per-packet, so
+  vanilla doesn't show this bleed.
+
+This is a real, measurable cost of natra's design on neighboring
+pods. It's much smaller than the gain on annotated mice (35% bleed
+vs 320× win), but it's not zero — worth knowing when sizing nodes
+that mix annotated heavy traffic with unannotated latency-sensitive
+workloads.
+
+The mixed iperf throughput under natra comes in close to but below
+the 10 Mbps cap because when hey *does* occasionally hit the bucket
+(CMS collisions, above-threshold bursts on a connection), it
+consumes tokens iperf would otherwise have. The headline guarantee
+is "annotated rate is the ceiling," not "the annotated rate is
+always reached."
 
 ## Reproduce
 
