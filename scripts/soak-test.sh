@@ -73,9 +73,14 @@ Usage: soak-test.sh [flags]
   --deep-interval <seconds>          Heap/bpf snapshot cadence. Default: 1800.
 
 Modes:
-  natra     — k3d + Calico-eBPF + natra chained after.
-  vanilla   — k3d + Calico-eBPF + upstream containernetworking bandwidth plugin.
-  baseline  — k3d + Calico-eBPF alone. The "no rate limiter" reference.
+  natra     — k3d (k3s default flannel) + natra chained after.
+  vanilla   — k3d (k3s default flannel) + upstream containernetworking bandwidth plugin.
+  baseline  — k3d (k3s default flannel) alone. The "no rate limiter" reference.
+
+Note: the base CNI is currently k3s's default flannel. A Cilium- or
+Calico-eBPF base (to simulate AWS Network Policy Agent's clsact-eBPF
+coexistence with the bandwidth plugin) is on the TODO list — see
+the comment block around bootstrap_cluster() for context.
 EOF
 }
 
