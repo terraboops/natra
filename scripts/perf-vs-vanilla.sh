@@ -42,7 +42,26 @@ PERFCLIENT_IMAGE="ghcr.io/terraboops/natra-perfclient:vsperf"
 ELEPHANT_DURATION=15
 MICE_PARALLEL=20
 MICE_DURATION=10
-RATE="10M"
+# iperf-only sweeps RATE_SWEEP and reports one row per rate per phase;
+# the mixed workload stays at the canonical 10M rate (hard-coded in the
+# perf-server manifest) because its question — can the plugin isolate
+# annotated mice from an annotated elephant — is about ratio, not
+# absolute rate.
+#
+# RATE_SWEEP defaults to 10M / 1G / 10G so we exercise three orders of
+# magnitude: 10M is the canonical "small workload" rate, 1G is "modern
+# pod NIC budget", 10G is "real-hardware ceiling" — the latter won't
+# reach line rate on Mac/colima because flannel host-gw via the docker
+# bridge tops out around 1 Gbps single-stream, but encoding it now
+# means the rig produces meaningful numbers when run on metal.
+RATE_SWEEP="${RATE_SWEEP:-10M 1G 10G}"
+
+# rate_to_label normalizes a rate string into a k8s-friendly suffix:
+# "10M" → "10m", "1G" → "1g". Pod and service names follow RFC 1123
+# (lowercase alphanumeric); annotations preserve original casing.
+rate_to_label() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
 
 # Mixed-workload phase tuning. The iperf3 --bidir flow runs for
 # MIXED_IPERF_DURATION; hey runs for MIXED_HEY_DURATION starting after
@@ -210,20 +229,49 @@ render_manifests() {
     local cluster_name="$1" outdir="$2"
     local k3d_agent="k3d-${cluster_name}-agent-0"
     local k3d_server="k3d-${cluster_name}-server-0"
-    # Rename the pod/service from iperf-server-bidi → iperf-server so
-    # the run_workload commands below can use the canonical name and
-    # match the L4 e2e shape. The bidi YAML carries both annotations,
-    # which is what we want for this two-phase per-direction workload.
-    sed -e "s|k3d-natra-e2e-agent-0|${k3d_agent}|" \
-        -e "s|k3d-natra-e2e-server-0|${k3d_server}|" \
-        -e "s|iperf-server-bidi|iperf-server|g" \
-        "${REPO_ROOT}/test/e2e/manifests/iperf-server-bidi.yaml" \
-        > "$outdir/iperf-server.yaml"
+    # One server pod + service per RATE_SWEEP entry. Each carries
+    # ingress + egress annotations at that rate. The bidi YAML is the
+    # template since it ships with both directions already wired.
+    local rate label
+    for rate in $RATE_SWEEP; do
+        label=$(rate_to_label "$rate")
+        sed -e "s|k3d-natra-e2e-agent-0|${k3d_agent}|" \
+            -e "s|k3d-natra-e2e-server-0|${k3d_server}|" \
+            -e "s|iperf-server-bidi|iperf-server-r${label}|g" \
+            -e "s|\"10M\"|\"${rate}\"|g" \
+            "${REPO_ROOT}/test/e2e/manifests/iperf-server-bidi.yaml" \
+            > "$outdir/iperf-server-r${label}.yaml"
+    done
     sed -e "s|k3d-natra-e2e-agent-0|${k3d_agent}|" \
         -e "s|k3d-natra-e2e-server-0|${k3d_server}|" \
         "${REPO_ROOT}/test/e2e/manifests/iperf-client.yaml" \
         > "$outdir/iperf-client.yaml"
     cp "${REPO_ROOT}/test/e2e/manifests/namespace.yaml" "$outdir/namespace.yaml"
+}
+
+# apply_rate_sweep_servers applies every per-rate iperf-server manifest
+# in the given outdir. Idempotent: kubectl apply tolerates re-apply.
+apply_rate_sweep_servers() {
+    local outdir="$1" rate label
+    for rate in $RATE_SWEEP; do
+        label=$(rate_to_label "$rate")
+        kubectl apply -f "$outdir/iperf-server-r${label}.yaml"
+    done
+}
+
+# wait_rate_sweep_servers waits for every per-rate iperf-server pod to
+# be Ready. Single kubectl wait call with all targets — failure dumps
+# kubectl's own (already verbose) status which is plenty for diagnosis.
+wait_rate_sweep_servers() {
+    local rate label pods
+    pods=""
+    for rate in $RATE_SWEEP; do
+        label=$(rate_to_label "$rate")
+        pods="$pods pod/iperf-server-r${label}"
+    done
+    # shellcheck disable=SC2086  # intentional word-splitting
+    kubectl wait --for=condition=Ready $pods \
+        -n natra-e2e --timeout=180s
 }
 
 # Patch the upstream bandwidth plugin's HTB classes to use a sane
@@ -303,31 +351,60 @@ warmup_pod() {
 #   ingress_elephant_bps ingress_mice_bps egress_elephant_bps egress_mice_bps
 # Forward iperf3 measures throughput INTO the server (ingress); reverse
 # (-R) measures throughput OUT of the server (egress).
+#
+# Takes the server name (e.g. iperf-server-r10m, iperf-server-r1g) so
+# the same workload can be driven against multiple per-rate pods on the
+# same cluster without redeploys.
 run_workload() {
-    local namespace="natra-e2e"
+    local namespace="natra-e2e" server="$1"
 
-    echo "==> warming up iperf-server (draining initial burst)" >&2
-    warmup_pod iperf-server iperf-client
+    echo "==> warming up $server (draining initial burst)" >&2
+    warmup_pod "$server" iperf-client
 
     local ing_elephant ing_mice eg_elephant eg_mice
 
     ing_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c iperf-server -t "$ELEPHANT_DURATION" -J 2>/dev/null \
+        iperf3 -c "$server" -t "$ELEPHANT_DURATION" -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
     ing_mice=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c iperf-server -t "$MICE_DURATION" -P "$MICE_PARALLEL" -J 2>/dev/null \
+        iperf3 -c "$server" -t "$MICE_DURATION" -P "$MICE_PARALLEL" -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
     eg_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c iperf-server -t "$ELEPHANT_DURATION" -R -J 2>/dev/null \
+        iperf3 -c "$server" -t "$ELEPHANT_DURATION" -R -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
     eg_mice=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c iperf-server -t "$MICE_DURATION" -P "$MICE_PARALLEL" -R -J 2>/dev/null \
+        iperf3 -c "$server" -t "$MICE_DURATION" -P "$MICE_PARALLEL" -R -J 2>/dev/null \
         | jq '.end.sum_received.bits_per_second // 0')
 
     echo "$ing_elephant $ing_mice $eg_elephant $eg_mice"
+}
+
+# record stashes a per-rate iperf result into the global results file.
+# Columns: phase rate direction kind bps. Kind ∈ {elephant, mice}.
+record() {
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULTS_TSV"
+}
+
+# sweep_rate_workload runs the iperf-only workload against every per-
+# rate server pod, recording results to $RESULTS_TSV under the given
+# phase tag (baseline, natra, vanilla).
+sweep_rate_workload() {
+    local phase="$1" rate label
+    local ing_e ing_m eg_e eg_m
+    for rate in $RATE_SWEEP; do
+        label=$(rate_to_label "$rate")
+        echo "==> running iperf-only workload (phase $phase, rate $rate)"
+        read -r ing_e ing_m eg_e eg_m < <(run_workload "iperf-server-r${label}")
+        record "$phase" "$rate" ingress elephant "$ing_e"
+        record "$phase" "$rate" ingress mice     "$ing_m"
+        record "$phase" "$rate" egress  elephant "$eg_e"
+        record "$phase" "$rate" egress  mice     "$eg_m"
+        echo "  $phase rate=$rate ingress elephant=$ing_e bps  mice=$ing_m bps"
+        echo "  $phase rate=$rate egress  elephant=$eg_e bps  mice=$eg_m bps"
+    done
 }
 
 # parse_hey extracts (rps p50 p99 total) from a hey log. Defaults
@@ -730,6 +807,8 @@ summarize_profile() {
 }
 
 TMPDIR=$(mktemp -d)
+RESULTS_TSV="$TMPDIR/results.tsv"
+: > "$RESULTS_TSV"
 trap 'rm -rf "$TMPDIR"; cleanup' EXIT
 
 # k3d cluster bootstrap is the same for every phase: 1 agent + 1
@@ -781,19 +860,17 @@ kubectl apply -f "$TMPDIR/baseline/namespace.yaml"
 # at line rate; this row is the "what does the cluster do unaided"
 # floor for the comparison.
 
-kubectl apply -f "$TMPDIR/baseline/iperf-server.yaml"
+apply_rate_sweep_servers "$TMPDIR/baseline"
 kubectl apply -f "$TMPDIR/baseline/iperf-client.yaml"
 kubectl apply -f "$TMPDIR/baseline/perf-server.yaml"
 kubectl apply -f "$TMPDIR/baseline/perf-client.yaml"
 kubectl apply -f "$TMPDIR/baseline/bystander.yaml"
+wait_rate_sweep_servers
 kubectl wait --for=condition=Ready \
-    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
+    pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
-echo "==> running iperf-only workload (phase 0)"
-read -r baseline_ing_elephant baseline_ing_mice baseline_eg_elephant baseline_eg_mice < <(run_workload)
-echo "  baseline ingress elephant=$baseline_ing_elephant bps  mice=$baseline_ing_mice bps"
-echo "  baseline egress  elephant=$baseline_eg_elephant bps  mice=$baseline_eg_mice bps"
+sweep_rate_workload baseline
 
 echo "==> running mixed workload (phase 0)"
 read -r baseline_mixed_iperf_ing baseline_mixed_iperf_eg \
@@ -849,19 +926,17 @@ sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
     ' | kubectl apply -f -
 kubectl rollout status daemonset/natra-installer -n kube-system --timeout=120s
 
-kubectl apply -f "$TMPDIR/natra/iperf-server.yaml"
+apply_rate_sweep_servers "$TMPDIR/natra"
 kubectl apply -f "$TMPDIR/natra/iperf-client.yaml"
 kubectl apply -f "$TMPDIR/natra/perf-server.yaml"
 kubectl apply -f "$TMPDIR/natra/perf-client.yaml"
 kubectl apply -f "$TMPDIR/natra/bystander.yaml"
+wait_rate_sweep_servers
 kubectl wait --for=condition=Ready \
-    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
+    pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
-echo "==> running iperf-only workload (phase A)"
-read -r natra_ing_elephant natra_ing_mice natra_eg_elephant natra_eg_mice < <(run_workload)
-echo "  natra ingress elephant=$natra_ing_elephant bps  mice=$natra_ing_mice bps"
-echo "  natra egress  elephant=$natra_eg_elephant bps  mice=$natra_eg_mice bps"
+sweep_rate_workload natra
 
 echo "==> running mixed workload (phase A)"
 read -r natra_mixed_iperf_ing natra_mixed_iperf_eg \
@@ -907,13 +982,14 @@ sed -e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' \
     | kubectl apply -f -
 kubectl rollout status daemonset/vanilla-bandwidth-installer -n kube-system --timeout=120s
 
-kubectl apply -f "$TMPDIR/vanilla/iperf-server.yaml"
+apply_rate_sweep_servers "$TMPDIR/vanilla"
 kubectl apply -f "$TMPDIR/vanilla/iperf-client.yaml"
 kubectl apply -f "$TMPDIR/vanilla/perf-server.yaml"
 kubectl apply -f "$TMPDIR/vanilla/perf-client.yaml"
 kubectl apply -f "$TMPDIR/vanilla/bystander.yaml"
+wait_rate_sweep_servers
 kubectl wait --for=condition=Ready \
-    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
+    pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
 # Patch HTB burst on every veth/ifb the bandwidth plugin created.
@@ -922,10 +998,7 @@ kubectl wait --for=condition=Ready \
 # never see HTB engage.
 fix_vanilla_htb_burst "$VANILLA_CLUSTER"
 
-echo "==> running iperf-only workload (phase B)"
-read -r vanilla_ing_elephant vanilla_ing_mice vanilla_eg_elephant vanilla_eg_mice < <(run_workload)
-echo "  vanilla ingress elephant=$vanilla_ing_elephant bps  mice=$vanilla_ing_mice bps"
-echo "  vanilla egress  elephant=$vanilla_eg_elephant bps  mice=$vanilla_eg_mice bps"
+sweep_rate_workload vanilla
 
 echo "==> running mixed workload (phase B)"
 read -r vanilla_mixed_iperf_ing vanilla_mixed_iperf_eg \
@@ -960,27 +1033,59 @@ fmt_secs() {
     }'
 }
 
+# lookup pulls one bps result out of $RESULTS_TSV by composite key.
+# Returns "0" if no row matches (e.g. a phase that errored out).
+lookup() {
+    local phase="$1" rate="$2" dir="$3" kind="$4"
+    awk -F'\t' -v p="$phase" -v r="$rate" -v d="$dir" -v k="$kind" \
+        '$1==p && $2==r && $3==d && $4==k { print $5; found=1; exit }
+         END { if (!found) print "0" }' "$RESULTS_TSV"
+}
+
+# render_iperf_table emits the Workload 1 table: one block per direction,
+# rows = phase × rate. Uses $RATE_SWEEP as the column order.
+render_iperf_table() {
+    local dir
+    for dir in ingress egress; do
+        printf '\nDirection: %s\n' "$dir"
+        printf 'Plugin                Rate     Elephant            Mice (%sx parallel)\n' "$MICE_PARALLEL"
+        printf -- '-------------------------------------------------------------------------------\n'
+        local phase phase_label rate
+        for phase in baseline natra vanilla; do
+            case "$phase" in
+                baseline) phase_label="baseline (no plugin)" ;;
+                natra)    phase_label="natra" ;;
+                vanilla)  phase_label="upstream bandwidth" ;;
+            esac
+            for rate in $RATE_SWEEP; do
+                printf '%-21s %-8s %-19s %s\n' \
+                    "$phase_label" "$rate" \
+                    "$(fmt_bps "$(lookup "$phase" "$rate" "$dir" elephant)")" \
+                    "$(fmt_bps "$(lookup "$phase" "$rate" "$dir" mice)")"
+            done
+        done
+    done
+}
+
 cat <<EOF | tee "$RESULT_FILE"
 natra vs upstream containernetworking/plugins/bandwidth — k3d cluster head-to-head
 ====================================================================================
 Three configurations: baseline (flannel alone, no rate-limiting), natra, upstream
 containernetworking/plugins/bandwidth. Same workloads against each.
 
-Workload 1: iperf-only (legacy). Same iperf3 client/server, ${RATE} annotation each direction.
+Workload 1: iperf-only at annotated rates ${RATE_SWEEP}.
   - ingress: forward iperf3 (client → server, charged to server's ingress)
   - egress:  reverse iperf3 -R (server → client, charged to server's egress)
   - Phase 1: ${ELEPHANT_DURATION}s single elephant flow
-  - Phase 2: ${MICE_DURATION}s × ${MICE_PARALLEL} parallel long-lived TCP flows
+  - Phase 2: ${MICE_DURATION}s x ${MICE_PARALLEL} parallel long-lived TCP flows
 Iperf goodput, receiver-side aggregate (sum_received.bits_per_second).
 
-Direction  Plugin                          Elephant            Mice (${MICE_PARALLEL}× parallel)
--------------------------------------------------------------------------------------------
-ingress    baseline (no plugin)            $(fmt_bps "$baseline_ing_elephant")        $(fmt_bps "$baseline_ing_mice")
-ingress    natra                           $(fmt_bps "$natra_ing_elephant")        $(fmt_bps "$natra_ing_mice")
-ingress    upstream bandwidth              $(fmt_bps "$vanilla_ing_elephant")        $(fmt_bps "$vanilla_ing_mice")
-egress     baseline (no plugin)            $(fmt_bps "$baseline_eg_elephant")        $(fmt_bps "$baseline_eg_mice")
-egress     natra                           $(fmt_bps "$natra_eg_elephant")        $(fmt_bps "$natra_eg_mice")
-egress     upstream bandwidth              $(fmt_bps "$vanilla_eg_elephant")        $(fmt_bps "$vanilla_eg_mice")
+At rates above the rig's underlying line rate (host-gw via the docker
+bridge tops out around 1 Gbps single-stream on Mac/colima; cloud
+runners vary), all three plugins report ~line-rate — the bottleneck is
+the wire, not the shaper. The high-rate rows are still meaningful for
+detecting plugin-induced regressions (lock contention, BPF map cost).
+$(render_iperf_table)
 
 
 Workload 2: mixed (elephant + HTTP mice on annotated pod + HTTP mice on unannotated
@@ -1003,11 +1108,10 @@ natra                  │ $(fmt_bps "$natra_mixed_iperf_ing")  $(fmt_bps "$natr
 upstream bandwidth     │ $(fmt_bps "$vanilla_mixed_iperf_ing")  $(fmt_bps "$vanilla_mixed_iperf_eg")  │ $(fmt_rps "$vanilla_mixed_pod_rps")   $(fmt_secs "$vanilla_mixed_pod_p50")  $(fmt_secs "$vanilla_mixed_pod_p99") │ $(fmt_rps "$vanilla_mixed_by_rps")   $(fmt_secs "$vanilla_mixed_by_p50")  $(fmt_secs "$vanilla_mixed_by_p99")
 
 
-Raw numbers:
-  baseline_ingress_elephant=$baseline_ing_elephant
-  baseline_ingress_mice=$baseline_ing_mice
-  baseline_egress_elephant=$baseline_eg_elephant
-  baseline_egress_mice=$baseline_eg_mice
+Raw iperf numbers (phase / rate / direction / kind / bps):
+$(awk -F'\t' '{printf "  %-9s %-5s %-8s %-9s %s\n", $1, $2, $3, $4, $5}' "$RESULTS_TSV")
+
+Raw mixed-workload numbers:
   baseline_mixed_iperf_ingress=$baseline_mixed_iperf_ing
   baseline_mixed_iperf_egress=$baseline_mixed_iperf_eg
   baseline_mixed_pod_rps=$baseline_mixed_pod_rps
@@ -1018,10 +1122,6 @@ Raw numbers:
   baseline_mixed_bystander_p50=$baseline_mixed_by_p50
   baseline_mixed_bystander_p99=$baseline_mixed_by_p99
   baseline_mixed_bystander_total=$baseline_mixed_by_total
-  natra_ingress_elephant=$natra_ing_elephant
-  natra_ingress_mice=$natra_ing_mice
-  natra_egress_elephant=$natra_eg_elephant
-  natra_egress_mice=$natra_eg_mice
   natra_mixed_iperf_ingress=$natra_mixed_iperf_ing
   natra_mixed_iperf_egress=$natra_mixed_iperf_eg
   natra_mixed_pod_rps=$natra_mixed_pod_rps
@@ -1032,10 +1132,6 @@ Raw numbers:
   natra_mixed_bystander_p50=$natra_mixed_by_p50
   natra_mixed_bystander_p99=$natra_mixed_by_p99
   natra_mixed_bystander_total=$natra_mixed_by_total
-  vanilla_ingress_elephant=$vanilla_ing_elephant
-  vanilla_ingress_mice=$vanilla_ing_mice
-  vanilla_egress_elephant=$vanilla_eg_elephant
-  vanilla_egress_mice=$vanilla_eg_mice
   vanilla_mixed_iperf_ingress=$vanilla_mixed_iperf_ing
   vanilla_mixed_iperf_egress=$vanilla_mixed_iperf_eg
   vanilla_mixed_pod_rps=$vanilla_mixed_pod_rps

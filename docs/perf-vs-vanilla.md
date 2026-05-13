@@ -66,9 +66,12 @@ steady-state behavior, not initial-burst artifacts:
   the real measurement starts. Applies symmetrically to both
   plugins.
 
-## Workload 1: iperf-only (legacy)
+## Workload 1: iperf-only (rate sweep)
 
-iperf3 against an iperf3-only server, four phases per cluster:
+iperf3 against per-rate iperf3-only servers. One pod per rate in
+`RATE_SWEEP` (default `10M 1G 10G`); each pod carries
+`kubernetes.io/{ingress,egress}-bandwidth` at its own rate. Each rate
+sees four phases:
 
 - **Ingress elephant**: one TCP flow, 15s, forward (client → server)
 - **Ingress mice**: 20 parallel TCP flows, 10s, forward
@@ -77,6 +80,18 @@ iperf3 against an iperf3-only server, four phases per cluster:
 
 Receiver-side aggregate goodput from
 `end.sum_received.bits_per_second`.
+
+The rate sweep is there to catch plugin-induced regressions that only
+appear at higher annotated rates (token-bucket math edge cases,
+fast-pass threshold scaling, BPF map cost under heavier traffic). On
+Mac/colima the underlying wire (flannel host-gw via the docker
+bridge) tops out around 1 Gbps single-stream, so 10G annotations
+report ~Gbps line rate — both natra and vanilla. Override the sweep
+on metal:
+
+```bash
+RATE_SWEEP="100M 1G 10G 40G" make perf-vs-vanilla
+```
 
 ### Most recent run (colima, aarch64, k3d + flannel host-gw)
 
