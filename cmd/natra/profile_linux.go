@@ -12,7 +12,7 @@
 //	natra profile [-interval 5s] [-output PATH] [-heap-dir DIR] [-pin-dir /sys/fs/bpf/natra]
 //
 // Requires CAP_BPF or root. Linux 5.8+ for runtime stats. Designed
-// to run as a sidecar / docker exec on kind worker nodes during the
+// to run as a sidecar / docker exec on k3d worker nodes during the
 // perf-vs-vanilla mixed workload — the place where natra is under
 // the most packet load and where allocator / hot-path regressions
 // would surface.
