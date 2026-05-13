@@ -61,6 +61,9 @@ make ci              # All of the above + lint + license scan
 
 L2/L3/L4/L5 all run on macOS via Docker. None of them require lvh.
 
+For what each layer actually validates — and the kernel-to-kernel
+behaviors none of them cover — see `docs/test-environments.md`.
+
 A real-cluster head-to-head against the upstream
 `containernetworking/plugins/bandwidth` plugin is available
 on-demand:
