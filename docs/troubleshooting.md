@@ -49,13 +49,25 @@ Common attach errors:
 ### `unknown attachMode "..."`
 
 The natra entry in the conflist has an `attachMode` value that isn't
-one of `tcx` (default) or `clsact-podside`. Either fix the manifest or
+one of `auto` (default), `tcx-hostside`, `tcx-podside`,
+`clsact-hostside`, or `clsact-podside`. Either fix the manifest or
 unset `NATRA_ATTACH_MODE` on the install init container.
+
+### `edtPacing=on requires pod-side attach mode but strategy includes ...`
+
+`NATRA_EDT_PACING=on` was set while `NATRA_ATTACH_MODE` was pinned to
+a host-side variant. EDT needs `fq` downstream of the BPF program,
+which only works for pod-side attach. Either switch `NATRA_EDT_PACING`
+to `auto` (the default — host-side attach silently disables EDT) or
+unpin the attach mode.
 
 ## Attach mode
 
-natra defaults to `tcx`. Use `clsact-podside` only on kernels < 6.6
-or when investigating tcx-specific issues.
+natra defaults to `auto` — tries `tcx-pod` → `clsact-pod` →
+`tcx-host` → `clsact-host` (when EDT is auto, the standard default;
+the order flips host-first when EDT is explicitly off). First
+attempt that succeeds wins. Explicit modes pin a single attempt with
+no fallback.
 
 ```bash
 # DaemonSet
@@ -65,6 +77,32 @@ kubectl set env -n kube-system daemonset/natra-installer \
 # tests
 NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e
 ```
+
+## EDT pacing
+
+natra's default is `edtPacing: auto`. At CNI ADD, the plugin tries
+`tc qdisc replace dev eth0 root fq` inside the pod netns; on success
+the BPF program EDT-stamps above-rate egress packets, on failure it
+falls back to drop after ECN-mark.
+
+```bash
+# Force on (fail attach if fq install fails)
+kubectl set env -n kube-system daemonset/natra-installer \
+  NATRA_EDT_PACING=on
+
+# Force off (never install fq, always drop after ECN-mark)
+kubectl set env -n kube-system daemonset/natra-installer \
+  NATRA_EDT_PACING=off
+```
+
+Inspect the active disposition on a pod via `dump-stats`:
+
+```bash
+docker exec <node> /opt/cni/bin/natra dump-stats <containerID>
+```
+
+`ecn_marked`, `edt_delayed`, and `dropped` slots break down what
+natra did with each above-rate packet. Their sum equals `throttled`.
 
 ## bpffs and pin paths
 
@@ -99,7 +137,7 @@ annotation), natra is fail-open: it loaded but the attach failed. See
 
 Most likely cause: the heavy-hitter threshold is wrong for the
 workload. natra rate-limits flows whose CMS estimate exceeds the
-threshold (default 10). Below threshold, mice take the fast pass and
+threshold (default 50). Below threshold, mice take the fast pass and
 ignore the bucket. Above threshold, every packet pays tokens.
 
 A workload of many sustained TCP flows (each crossing threshold within

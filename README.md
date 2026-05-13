@@ -21,7 +21,14 @@ against one HTB bucket, so an elephant flow drains the bucket and
 short-lived flows arrive empty-handed. natra's CMS-then-bucket
 arrangement targets that asymmetry; whether the difference matters on
 real workloads depends on the workload's flow-length distribution.
-See [docs/perf-vs-vanilla.md](docs/perf-vs-vanilla.md) for measured
+
+Above-rate packets aren't dropped by default. natra tries
+`bpf_skb_ecn_set_ce` first (ECN-mark on ECN-capable flows, no
+retransmits), then EDT pacing on egress (`skb->tstamp` honored by an
+`fq` qdisc on pod-eth0), and only drops as a last resort for ingress
+non-ECN traffic. Both attach mode and EDT are auto-detected per pod
+at CNI ADD; operators can pin either if they need to. See
+[docs/perf-vs-vanilla.md](docs/perf-vs-vanilla.md) for measured
 results.
 
 ## Quick start
@@ -63,10 +70,13 @@ make ci            # full matrix (lint, licenses, L1-L5)
 - No production users. The code is days old.
 - Tested on kind + colima. Not yet exercised on EKS, GKE, AKS, or a
   real bare-metal cluster.
-- Default attach mode is `tcx-hostside` (kernel 6.6+, same hook
-  surface as Cilium and the AWS network-policy-agent). Alternates
-  are `tcx-podside`, `clsact-hostside`, `clsact-podside`; pick via
-  the conflist `attachMode` field or `NATRA_ATTACH_MODE` env.
+- Default attach mode is `auto` — tries TCX (kernel 6.6+) then
+  clsact, host-side then pod-side, taking the first that works.
+  EDT pacing on egress also defaults to `auto`: natra probes `fq`
+  install on pod-eth0 and uses EDT when the probe succeeds. Pin
+  attach mode via `attachMode` in the conflist or
+  `NATRA_ATTACH_MODE` env; pin EDT via `edtPacing` or
+  `NATRA_EDT_PACING`. ECN-mark is always-on.
 - CI runs against a single host kernel. There's no kernel matrix
   (the lvh image registry has been unreliable).
 - L5 perf scenarios use `BPF_PROG_RUN` against synthetic packets,
@@ -76,11 +86,12 @@ make ci            # full matrix (lint, licenses, L1-L5)
   traffic in a kind cluster, but kind is not bare metal either.
 - IPv6 is not classified. `parse_flow` returns -1 for non-IPv4, so
   IPv6 flows pass through unrate-limited.
-- The CMS sketch is fixed at compile time at 1024 × 4 = 4096 cells
-  per direction (8192 total). Past saturation, every flow's estimate
-  collides with at least one other flow's; classification accuracy
-  degrades silently. The chaos test confirms the program survives the
-  condition, not that the classification stays meaningful.
+- The CMS sketch is fixed at compile time at 32768 × 4 cells per
+  direction (262144 cells total per pod, ~2 MiB). Past saturation,
+  every flow's estimate collides with at least one other flow's;
+  classification accuracy degrades silently. The chaos test confirms
+  the program survives the condition, not that the classification
+  stays meaningful.
 
 ## Docs
 

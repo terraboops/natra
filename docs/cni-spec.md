@@ -24,22 +24,32 @@ Negotiated CNI version: 1.0.0 (with 0.3.0/0.3.1/0.4.0 also accepted).
    `capabilities.bandwidth: true`.
 3. If neither direction has a rate, print `prevResult` and return —
    no BPF is loaded.
-4. Resolve attach mode from the top-level `attachMode` field. One of
-   `tcx-hostside` (default), `tcx-podside`, `clsact-hostside`,
-   `clsact-podside`. Both directions use the same mode.
-5. Resolve the target ifindex for the chosen side — pod-side enters
-   the pod netns and reads eth0; host-side enters briefly to read
-   eth0's veth peer ifindex, then attaches in the host netns.
-6. Load the BPF object, and for each direction that has a rate:
+4. Resolve attach strategy from the top-level `attachMode` field and
+   the resolved EDT mode in `defaults.edtPacing`. `attachMode: auto`
+   (default) expands to an ordered fallback chain; explicit values
+   (`tcx-hostside` etc.) produce a single-attempt list. See
+   [ARCHITECTURE.md § Attachment](ARCHITECTURE.md#attachment) for
+   the chain order.
+5. Resolve the target ifindex for each candidate side — pod-side
+   enters the pod netns and reads eth0; host-side enters briefly to
+   read eth0's veth peer ifindex, then attaches in the host netns.
+6. For pod-side candidates when EDT is `on` or `auto`: install `fq`
+   as the root qdisc on pod-eth0 so `skb->tstamp` is honored on
+   egress. Set `cfg.edt_pacing = 1` in the BPF config slot on
+   success. On failure, `edtPacing: on` returns an error from the
+   attempt; `edtPacing: auto` continues with `cfg.edt_pacing = 0`
+   and the BPF falls back to drop after ECN-mark.
+7. Load the BPF object, and for each direction that has a rate:
    configure that direction's slot, attach the matching program
    (`natra_ingress` or `natra_egress`) to the matching hook. The
    loader flips hook-direction to opposite the pod-direction on
    host-side attach.
-7. Print `prevResult` and return.
+8. Print `prevResult` and return.
 
-If one direction's attach succeeds and the other fails, the
-successful side is rolled back (link closed, pin removed) and the
-plugin falls through to passthrough.
+If any step in an attempt fails, the partial state is torn down
+(link closed, pin removed) and the next attempt in the strategy
+runs. The plugin returns success once any attempt completes; if
+every attempt fails it falls through to passthrough (fail-open).
 
 Past stdin parsing every error path is fail-open: log to stderr and
 to `/var/log/natra-cni.log`, return success. A Pod stuck in
@@ -86,7 +96,12 @@ with `version.All`).
   "cniVersion": "1.0.0",
   "name": "kindnet",          // matches the upstream conflist
   "type": "natra",
-  "attachMode": "tcx-hostside", // optional; one of: tcx-hostside (default), tcx-podside, clsact-hostside, clsact-podside
+  "attachMode": "auto",       // optional; one of: auto (default), tcx-hostside, tcx-podside, clsact-hostside, clsact-podside
+  "defaults": {               // optional cluster-wide knobs
+    "hhThreshold": 50,        // CMS count above which a flow is "heavy"
+    "burstRatio": 2.0,        // bucket size = rate * burstRatio (seconds)
+    "edtPacing": "auto"       // one of: auto (default), on, off
+  },
   "capabilities": {
     "bandwidth": true         // tells kubelet to populate runtimeConfig.bandwidth
   },
@@ -136,8 +151,9 @@ metadata:
       {"rate":"5M","heavyHitterThreshold":20}
 ```
 
-The default threshold is 10 (lowered from earlier project defaults
-to work under realistic GRO/GSO).
+The default threshold is 50 (raised from the earlier project default
+of 10 based on observed GRO/GSO-coalesced super-packet behavior under
+a realistic mixed workload).
 
 ## Chained conflist
 

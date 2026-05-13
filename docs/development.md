@@ -92,7 +92,8 @@ kubectl apply -f deploy/cni-installer.yaml
 kubectl get pods -n kube-system -l app=natra
 ```
 
-To exercise the opt-in fallback attach path:
+To pin an explicit attach mode (default is `auto`, which auto-detects
+TCX vs clsact and host vs pod):
 
 ```bash
 NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e   # or tcx-podside, clsact-hostside

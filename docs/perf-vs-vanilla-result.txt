@@ -12,12 +12,12 @@ Iperf goodput, receiver-side aggregate (sum_received.bits_per_second).
 
 Direction  Plugin                          Elephant            Mice (20× parallel)
 -------------------------------------------------------------------------------------------
-ingress    baseline (no plugin)            54266.92 Mbps        52138.90 Mbps
-ingress    natra                           12.06 Mbps        37.37 Mbps
-ingress    upstream bandwidth              10.04 Mbps        9.61 Mbps
-egress     baseline (no plugin)            55723.21 Mbps        54564.16 Mbps
-egress     natra                           12.42 Mbps        40.22 Mbps
-egress     upstream bandwidth              10.11 Mbps        9.61 Mbps
+ingress    baseline (no plugin)            56250.06 Mbps        55178.67 Mbps
+ingress    natra                           12.15 Mbps        37.99 Mbps
+ingress    upstream bandwidth              10.04 Mbps        9.60 Mbps
+egress     baseline (no plugin)            55508.17 Mbps        56729.61 Mbps
+egress     natra                           12.90 Mbps        39.93 Mbps
+egress     upstream bandwidth              10.12 Mbps        9.62 Mbps
 
 
 Workload 2: mixed (elephant + HTTP mice on annotated pod + HTTP mice on unannotated
@@ -35,53 +35,53 @@ adds any overhead to neighboring unannotated pods.
                        │ Elephant flows           │ Annotated mice (perf-server) │ Bystander mice (unannotated)
 Plugin                 │ ingress       egress     │ RPS          p50      p99    │ RPS          p50      p99
 ---------------------------------------------------------------------------------------------------------------------
-baseline (no plugin)   │ 8384.38 Mbps  26938.69 Mbps  │ 5283 req/s      6.7 ms    70.6 ms │ 6479 req/s      6.6 ms    25.5 ms
-natra                  │ 9.12 Mbps  6.77 Mbps  │ 4073 req/s      4.0 ms   262.0 ms │ 6913 req/s      4.7 ms    42.8 ms
-upstream bandwidth     │ 10.59 Mbps  8.67 Mbps  │ 12 req/s   4452.5 ms  5715.8 ms │ 8519 req/s      2.7 ms    40.3 ms
+baseline (no plugin)   │ 8465.47 Mbps  27906.73 Mbps  │ 5478 req/s      6.4 ms    72.4 ms │ 6662 req/s      5.8 ms    42.0 ms
+natra                  │ 9.47 Mbps  6.75 Mbps  │ 4371 req/s      3.4 ms   251.7 ms │ 6874 req/s      4.7 ms    46.2 ms
+upstream bandwidth     │ 10.52 Mbps  8.11 Mbps  │ 11 req/s   4595.0 ms  5861.9 ms │ 7969 req/s      2.8 ms    41.0 ms
 
 
 Raw numbers:
-  baseline_ingress_elephant=54266924668.731453
-  baseline_ingress_mice=52138900178.690437
-  baseline_egress_elephant=55723207969.3755
-  baseline_egress_mice=54564161918.3904
-  baseline_mixed_iperf_ingress=8384383529.82125
-  baseline_mixed_iperf_egress=26938686887.131844
-  baseline_mixed_pod_rps=5282.5555
-  baseline_mixed_pod_p50=0.0067
-  baseline_mixed_pod_p99=0.0706
-  baseline_mixed_pod_total=20.0231
-  baseline_mixed_bystander_rps=6478.6828
-  baseline_mixed_bystander_p50=0.0066
-  baseline_mixed_bystander_p99=0.0255
-  baseline_mixed_bystander_total=20.0161
-  natra_ingress_elephant=12059754.233138142
-  natra_ingress_mice=37366151.9361589
-  natra_egress_elephant=12424919.677124573
-  natra_egress_mice=40224182.315323979
-  natra_mixed_iperf_ingress=9122550.07891447
-  natra_mixed_iperf_egress=6765004.27447136
-  natra_mixed_pod_rps=4072.8441
-  natra_mixed_pod_p50=0.0040
-  natra_mixed_pod_p99=0.2620
-  natra_mixed_pod_total=20.2672
-  natra_mixed_bystander_rps=6912.8854
+  baseline_ingress_elephant=56250057589.2084
+  baseline_ingress_mice=55178671841.379013
+  baseline_egress_elephant=55508165483.190857
+  baseline_egress_mice=56729608028.140732
+  baseline_mixed_iperf_ingress=8465474768.1359472
+  baseline_mixed_iperf_egress=27906728647.252953
+  baseline_mixed_pod_rps=5478.4222
+  baseline_mixed_pod_p50=0.0064
+  baseline_mixed_pod_p99=0.0724
+  baseline_mixed_pod_total=20.0309
+  baseline_mixed_bystander_rps=6662.1993
+  baseline_mixed_bystander_p50=0.0058
+  baseline_mixed_bystander_p99=0.0420
+  baseline_mixed_bystander_total=20.0284
+  natra_ingress_elephant=12150100.702957507
+  natra_ingress_mice=37992007.932073422
+  natra_egress_elephant=12901881.130112721
+  natra_egress_mice=39926523.248569
+  natra_mixed_iperf_ingress=9471703.9921843559
+  natra_mixed_iperf_egress=6745530.8874228075
+  natra_mixed_pod_rps=4370.7959
+  natra_mixed_pod_p50=0.0034
+  natra_mixed_pod_p99=0.2517
+  natra_mixed_pod_total=20.2446
+  natra_mixed_bystander_rps=6874.0434
   natra_mixed_bystander_p50=0.0047
-  natra_mixed_bystander_p99=0.0428
-  natra_mixed_bystander_total=20.0216
-  vanilla_ingress_elephant=10036980.5060376
-  vanilla_ingress_mice=9614325.32975299
-  vanilla_egress_elephant=10112441.1254712
-  vanilla_egress_mice=9614580.5885814652
-  vanilla_mixed_iperf_ingress=10590223.290686144
-  vanilla_mixed_iperf_egress=8667905.5316507053
-  vanilla_mixed_pod_rps=12.2213
-  vanilla_mixed_pod_p50=4.4525
-  vanilla_mixed_pod_p99=5.7158
-  vanilla_mixed_pod_total=24.5472
-  vanilla_mixed_bystander_rps=8519.3287
-  vanilla_mixed_bystander_p50=0.0027
-  vanilla_mixed_bystander_p99=0.0403
-  vanilla_mixed_bystander_total=20.0157
+  natra_mixed_bystander_p99=0.0462
+  natra_mixed_bystander_total=20.0137
+  vanilla_ingress_elephant=10042510.169288855
+  vanilla_ingress_mice=9598543.045430325
+  vanilla_egress_elephant=10115227.2690609
+  vanilla_egress_mice=9620746.8083064035
+  vanilla_mixed_iperf_ingress=10520153.913160544
+  vanilla_mixed_iperf_egress=8108557.1689476622
+  vanilla_mixed_pod_rps=10.8637
+  vanilla_mixed_pod_p50=4.5950
+  vanilla_mixed_pod_p99=5.8619
+  vanilla_mixed_pod_total=23.0124
+  vanilla_mixed_bystander_rps=7968.9015
+  vanilla_mixed_bystander_p50=0.0028
+  vanilla_mixed_bystander_p99=0.0410
+  vanilla_mixed_bystander_total=20.0197
 
-Generated by scripts/perf-vs-vanilla.sh on 2026-05-13T05:52:49Z
+Generated by scripts/perf-vs-vanilla.sh on 2026-05-13T06:08:08Z

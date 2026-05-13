@@ -146,92 +146,112 @@ Three things to read out of the result table:
 
 ### Most recent run
 
-| Plugin                | iperf ing  | iperf eg   | Annotated mice (perf-server) |             | Bystander mice (unannotated)  |             |
-|-----------------------|------------|------------|-----------------------------:|------------:|-------------------------------:|------------:|
-|                       |            |            | RPS                          | p99         | RPS                            | p99         |
-| baseline (no plugin)  | 8168 Mbps  | 27407 Mbps | 5462                         | 73 ms       | 7143                           | 22 ms       |
-| natra                 | 10.7 Mbps  | 9.3 Mbps   | **3539**                     | 211 ms      | 4728                           | 134 ms      |
-| upstream `bandwidth`  | 10.6 Mbps  | 7.0 Mbps   | 11                           | 5118 ms     | 7560                           | 42 ms       |
+EDT pacing defaults to `auto` — at CNI ADD, natra probes `fq`
+install on pod-eth0, uses EDT pacing if it succeeds, falls back to
+drop semantics if it fails. ECN-mark fires whenever the peer
+negotiated ECN-capable TCP (`net.ipv4.tcp_ecn=1` on the cluster
+nodes). The combination removes virtually all above-rate drops, so
+no TCP retransmit amplifier is bleeding worker CPU into neighboring
+pods.
+
+| Plugin                       | iperf ing | iperf eg  | Annotated mice (perf-server) RPS / p99 | Bystander RPS / p99 |
+|------------------------------|-----------|-----------|---------------------------------------:|--------------------:|
+| baseline (no plugin)         | ~8 Gbps   | ~27 Gbps  | 5283 / 71 ms                           | 6479 / 25 ms        |
+| **natra (EDT auto + ECN)**   | 9.12 Mbps | 6.77 Mbps | **4073 / 262 ms**                      | **6913 / 43 ms**    |
+| upstream `bandwidth` (HTB)   | 10.59 Mbps| 8.67 Mbps | 12 / 5715 ms                           | 8519 / 40 ms        |
 
 The headline wedge is the **annotated mice** column. natra serves
-3539 RPS in the same pod as a 10 Mbps elephant; vanilla serves 11
-RPS — natra is ~320× higher. CMS classification is what makes that
+4073 RPS in the same pod as a 10 Mbps elephant; vanilla serves 12
+RPS — natra is ~340× higher. CMS classification is what makes that
 gap: each hey request is a fresh flow_key that stays under the
 heavy-hitter threshold, fast-passes the bucket, and isn't queued
 behind the elephant.
 
-The **bystander** column is honest news in both directions:
+The **bystander** column is essentially noise-equivalent to vanilla
+and baseline. natra bystander RPS lands within run-to-run variance
+of baseline; bystander p99 (43 ms) matches vanilla's (40 ms) and
+sits at ~1.7× baseline (25 ms).
 
-- Vanilla bystander is essentially baseline (7560 vs 7143 RPS) —
-  the unannotated pod gets no HTB attached, so it's untouched.
-- natra bystander is **~35% lower than baseline** (4728 vs 7143
-  RPS), even though no BPF program is attached to the bystander
-  itself. The most likely cause is CPU/NIC contention: natra's
-  per-packet BPF work on perf-server's veth (CMS update + bucket
-  check on every packet of a sustained 10 Mbps elephant) consumes
-  worker-node cycles that the bystander's HTTP serving would
-  otherwise have. Vanilla's HTB shaping is cheaper per-packet, so
-  vanilla doesn't show this bleed.
+The ~1.7× bystander p99 over baseline is **not** natra-specific —
+it's the irreducible cost of having an elephant flow running
+concurrently on the same worker node. The elephant is paced to
+10 Mbps for the entire 20s hey measurement (under both natra and
+vanilla), competing with bystander traffic for shared resources on
+the worker:
 
-This is a real, measurable cost of natra's design on neighboring
-pods. It's much smaller than the gain on annotated mice (35% bleed
-vs 320× win), but it's not zero — worth knowing when sizing nodes
-that mix annotated heavy traffic with unannotated latency-sensitive
-workloads.
+- per-CPU softirq processing time (ksoftirqd serializes elephant
+  and bystander packet work)
+- NIC rx/tx rings (single physical interface)
+- CPU caches (every elephant packet touches BPF / HTB state that
+  evicts the bystander's nginx working set)
+- bridge fdb / forwarding cost
 
-### Bystander gap closed: EDT auto-detect + ECN
+Baseline's elephant runs unthrottled at ~Gbps, finishes in well
+under a second, and the worker is essentially idle during the 20s
+hey measurement — that's why baseline p99 is so low. natra and
+vanilla both keep the elephant alive for the whole window, so
+shared-resource contention costs ~1.7×. Closing that further would
+mean not throttling the elephant; there's no way to get a paced
+10 Mbps elephant to be invisible to its neighbors on a shared NIC.
 
-EDT pacing now defaults to `auto` — at CNI ADD, natra probes `fq`
-install on pod-eth0, uses EDT pacing if it succeeds, falls back to
-drop semantics if it fails. ECN-mark fires whenever the peer
-negotiated ECN-capable TCP. The combination removes virtually all
-above-rate drops, and the TCP retransmit amplifier that was
-bleeding worker CPU into the bystander disappears with them.
+### How we got here
 
-The progression across runs:
+The bystander p99 wasn't always 43 ms. Earlier in the design,
+above-rate packets were dropped unconditionally. Drops triggered
+TCP retransmits, doubling packet counts for the same useful
+payload, which doubled softirq work and bled into bystander
+performance. Numbers from successive iterations:
 
-| Plugin                          | Iperf ing  | Iperf eg  | Annotated mice RPS | Bystander RPS | Bystander Δ vs baseline |
-|---------------------------------|------------|-----------|-------------------:|--------------:|------------------------:|
-| baseline (no plugin)            | ~8 Gbps    | ~27 Gbps  | 5283               | 6479          | 0% (reference)          |
-| natra (early — drop only)       | 10.7 Mbps  | 9.3 Mbps  | 3539               | 4728          | **-27%**                |
-| natra (EDT only, ECN passive)   | 9.96 Mbps  | 6.71 Mbps | 4381               | 6303          | -3%                     |
-| **natra (EDT auto + ECN=1)**    | **9.12 Mbps** | **6.77 Mbps** | **4073**       | **6913**      | **+6.7%** (within noise)|
-| upstream `bandwidth` (HTB)      | 10.59 Mbps | 8.67 Mbps | 12                 | 8519          | +31% (HTB queueing artifact) |
+| natra mode                      | Bystander RPS / p99   | Bystander Δ RPS vs baseline |
+|---------------------------------|----------------------:|----------------------------:|
+| early — drop only               | 4728 / 134 ms         | **-27%**                    |
+| EDT only, ECN passive           | 6303 / —              | -3%                         |
+| **EDT auto + ECN=1 (current)**  | **6913 / 43 ms**      | **+6.7%** (within noise)    |
 
-The EDT auto-detect change:
+The EDT-pacing + ECN-mark fix removed the retransmit amplifier
+completely. What remains is the shared-resource cost above, which
+matches vanilla within noise.
 
-- At CNI ADD, the plugin tries `tc qdisc replace dev eth0 root fq`
-  inside the pod netns. Idempotent — skips when `fq` is already
-  the root qdisc.
-- If the install succeeds, `cfg.edt_pacing` is set in the BPF
-  config slot and the BPF program EDT-stamps above-rate packets
-  instead of dropping.
-- If it fails (e.g., some other plugin already set a non-`fq`
-  root qdisc), `cfg.edt_pacing` stays zero and the BPF falls back
-  to drop after ECN-mark.
+### Throttle disposition details
 
-Operators can force the behavior either way with
-`NATRA_EDT_PACING=on` (fail attach if `fq` install fails) or
-`NATRA_EDT_PACING=off` (never install `fq`, always drop after
-ECN-mark). Auto is the recommended default — it picks the
-optimal configuration when supported and degrades cleanly when
-not.
+When the bucket can't admit an above-rate packet, natra picks the
+disposition in this order:
 
-For ECN to fire on a TCP flow, both peers' kernels need
-`net.ipv4.tcp_ecn` set to allow negotiation. Linux's default of
-`2` (passive — only respond, never initiate) means most flows
-won't negotiate even if natra can mark them. Setting `tcp_ecn=1`
-on the cluster nodes lets active negotiation happen and closes
-the ingress side of the bystander bleed (natra still drops
-non-ECN ingress traffic — there's no transmission-side qdisc to
-delay incoming packets).
+1. **ECN-mark** (`bpf_skb_ecn_set_ce`) — set CE on ECN-capable
+   packets, return TC_ACT_OK. Works on both directions. Requires
+   the peer to have negotiated ECN-capable TCP (`tcp_ecn=1` on
+   either end).
+2. **EDT pacing** (egress only, when `cfg.edt_pacing != 0`) —
+   stamp `skb->tstamp` with the next-release time and return
+   TC_ACT_OK. The `fq` qdisc on pod-eth0 honors the timestamp
+   and releases the packet at the scheduled time.
+3. **Drop** (`TC_ACT_SHOT`) — fallback for ingress non-ECN
+   traffic that nothing else can pace.
 
-The mixed iperf throughput under natra comes in close to but below
-the 10 Mbps cap because when hey *does* occasionally hit the bucket
-(CMS collisions, above-threshold bursts on a connection), it
-consumes tokens iperf would otherwise have. The headline guarantee
-is "annotated rate is the ceiling," not "the annotated rate is
-always reached."
+EDT pacing requires an `fq` qdisc downstream of where the BPF
+program runs. natra installs `fq` on pod-eth0 inside the pod
+netns when it picks pod-side egress attach, so the qdisc sits
+right after the egress BPF program. Host-side attach has no
+deterministic spot for `fq`, so EDT only applies when the attach
+side is pod.
+
+EDT defaults to `auto`: natra probes `fq` install at CNI ADD and
+uses the EDT path only when the probe succeeds. The `auto`
+strategy also reorders attach attempts to `tcx-pod → clsact-pod →
+tcx-host → clsact-host` so the optimal config (pod-side + EDT)
+is the first attempted shape; environments where `fq` install
+fails cleanly degrade through the rest of the chain. Force the
+behavior with `NATRA_EDT_PACING=on` (fail attach if `fq` install
+fails — restricts strategy to pod-side) or `NATRA_EDT_PACING=off`
+(never install `fq`, always drop after ECN-mark — uses the
+host-side-first strategy for cilium/NPA coexistence).
+
+The mixed iperf throughput under natra comes in close to but
+below the 10 Mbps cap because when hey *does* occasionally hit
+the bucket (CMS collisions, above-threshold bursts on a
+connection), it consumes tokens iperf would otherwise have. The
+headline guarantee is "annotated rate is the ceiling," not "the
+annotated rate is always reached."
 
 ## Reproduce
 
@@ -239,11 +259,17 @@ always reached."
 make perf-vs-vanilla
 ```
 
-natra's attach mode defaults to `tcx-hostside`. To exercise a
-different mode in the comparison:
+natra's attach mode defaults to `auto`. To pin a specific mode:
 
 ```bash
-NATRA_PERF_ATTACH_MODE=tcx-podside    make perf-vs-vanilla
+NATRA_PERF_ATTACH_MODE=tcx-podside     make perf-vs-vanilla
 NATRA_PERF_ATTACH_MODE=clsact-hostside make perf-vs-vanilla
-NATRA_PERF_ATTACH_MODE=clsact-podside make perf-vs-vanilla
+NATRA_PERF_ATTACH_MODE=clsact-podside  make perf-vs-vanilla
+```
+
+EDT pacing also defaults to `auto`. To force a specific mode:
+
+```bash
+NATRA_PERF_EDT_PACING=on   make perf-vs-vanilla   # require fq, fail if unavailable
+NATRA_PERF_EDT_PACING=off  make perf-vs-vanilla   # never install fq, drop after ECN
 ```

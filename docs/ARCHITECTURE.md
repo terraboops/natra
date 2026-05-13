@@ -38,40 +38,67 @@ plugin; only the L5 perf test loads it, for head-to-head comparison.
 
 The per-direction state lives in direction-keyed map slots:
 
-| Map               | Layout                                                    |
-|-------------------|-----------------------------------------------------------|
-| `natra_config_map`| key = direction (0=ingress, 1=egress); 2 slots             |
-| `natra_bucket_map`| key = direction; 2 slots                                  |
-| `natra_stats_map` | key = direction × 3 + slot (passed/throttled/hh_hits); 6 slots, per-CPU |
-| `natra_cms_map`   | key = direction × 4096 + row × 1024 + col; 8192 cells     |
+| Map               | Layout                                                                                |
+|-------------------|---------------------------------------------------------------------------------------|
+| `natra_config_map`| key = direction (0=ingress, 1=egress); 2 slots                                        |
+| `natra_bucket_map`| key = direction; 2 slots (each: tokens, last_update_ns, next_release_ns + spin_lock)  |
+| `natra_stats_map` | key = direction × 6 + slot (passed/throttled/hh_hits/ecn_marked/edt_delayed/dropped); 12 slots, per-CPU |
+| `natra_cms_map`   | key = direction × 131072 + row × 32768 + col; 262144 cells × 8 bytes = ~2 MiB         |
 
 CMS halves are independent per-direction. Asymmetric workloads (HTTP
 downloads, file uploads, streaming) make a flow heavy in one direction
 and mice on the other (just ACKs); a shared CMS would falsely classify
-ACK streams as heavy. Cost is +16 KB per pod (~32 KB total CMS).
+ACK streams as heavy. Total CMS cost is ~2 MiB per pod, sized to
+cover ~50K-flow workloads without saturating.
 
 The pipeline is two stages on the Pod-side veth:
 
-1. **Count-Min Sketch.** 4-row × 1024-column sketch of `u32` counters
-   per direction. The 5-tuple (src/dst IP, src/dst port, proto) hashes
-   into one cell per row via FNV-1a mixed with per-row seeds. Each
-   cell is `__sync_add_and_fetch`-ed atomically (compiled with
-   `clang -mcpu=v3`). The estimator is `min` across the four rows. A
-   flow is "heavy" when its estimate exceeds `heavy_hitter_threshold`.
+1. **Count-Min Sketch.** 4-row × 32768-column sketch per direction
+   (8 bytes per cell, ~1 MiB per direction). The 5-tuple (src/dst
+   IP, src/dst port, proto) hashes into one cell per row via FNV-1a
+   mixed with per-row seeds. The estimator is `min` across the four
+   rows. A flow is "heavy" when its estimate exceeds the
+   `heavy_hitter_threshold`. Each cell carries a `last_decay_idx`
+   so cells fade lazily on access — old elephants stop counting
+   without a sweeper. CMS counters are non-atomic; lost increments
+   give slightly conservative classification (the safe direction).
 
 2. **Token bucket — heavy hitters only.** A per-direction bucket
    protected by `bpf_spin_lock`. Mice (below threshold) bypass the
    bucket entirely and return `TC_ACT_OK`. Heavy flows pay tokens
-   proportional to `skb->len`; when the bucket is starved, `TC_ACT_SHOT`.
-   `bpf_ktime_get_ns()` is read *outside* the spin-locked region —
-   helper calls inside `bpf_spin_lock` are verifier-rejected.
+   proportional to `skb->len`; when the bucket is starved, the
+   disposition helper picks the next action (ECN-mark → EDT pace →
+   drop, see below). `bpf_ktime_get_ns()` is read *outside* the
+   spin-locked region — helper calls inside `bpf_spin_lock` are
+   verifier-rejected.
+
+3. **Throttle disposition.** When the bucket can't admit a packet,
+   natra picks the disposition in this order:
+
+   - `bpf_skb_ecn_set_ce` — set CE on ECN-capable packets and pass
+     (TC_ACT_OK). Receiver's TCP backs off without a retransmit.
+     Works on both directions. Requires the peer to have negotiated
+     ECN (`tcp_ecn=1` on either end of the connection).
+   - **EDT pacing** (egress only, when `cfg.edt_pacing != 0`) —
+     advance the bucket's `next_release_ns` by
+     `bytes * 8e9 / rate_bps`, stamp `skb->tstamp = next_release_ns`,
+     and pass. The `fq` qdisc on pod-eth0 holds the packet until
+     that time. Drop becomes "delay" — no TCP retransmit amplifier,
+     and the bystander-bleed cost disappears.
+   - **Drop** (`TC_ACT_SHOT`) — fallback for ingress non-ECN
+     traffic. No transmission-side qdisc on the receive path, so
+     EDT can't apply.
+
+   Per-direction stats break the throttled-packet count down into
+   `STAT_ECN_MARKED`, `STAT_EDT_DELAYED`, `STAT_DROPPED` (their sum
+   equals `STAT_THROTTLED`).
 
 The upstream bandwidth plugin (HTB qdisc on IFB) charges every packet,
 so one elephant flow eats every token and mice starve. The
 CMS-then-bucket shape lets mice fast-pass, which is what the L5 test
 (`TestScenarioMixedVsVanilla` in both directions) measures.
 
-The default heavy-hitter threshold is 10. GRO/GSO superpackets
+The default heavy-hitter threshold is 50. GRO/GSO superpackets
 routinely produce 27 KB "packets" at the BPF layer; a higher threshold
 lets short flows through ~tens of MB before any throttling kicks in.
 
@@ -192,11 +219,32 @@ the egress annotation.
 
 natra picks an attach mode along two orthogonal axes — the kernel
 hook surface (TCX or clsact) and the veth half (host-side or
-pod-side). Four modes total: `tcx-hostside` (default), `tcx-podside`,
-`clsact-hostside`, `clsact-podside`. Selected via the `attachMode`
-field on the conflist entry or the `NATRA_ATTACH_MODE` env on the
-install init container. Both directions use the same mode; the
-choice is deployment-wide.
+pod-side). Four explicit modes: `tcx-hostside`, `tcx-podside`,
+`clsact-hostside`, `clsact-podside`. The default is `auto`, which
+expands to an ordered fallback chain — natra tries each attempt
+in sequence and uses the first that succeeds.
+
+The order depends on whether EDT pacing is active (see below):
+
+- `attachMode: auto`, `edtPacing: off`: tcx-host → tcx-pod →
+  clsact-host → clsact-pod. Host-side first matches Cilium / AWS
+  NPA's coexistence shape.
+- `attachMode: auto`, `edtPacing: auto` (default): tcx-pod →
+  clsact-pod → tcx-host → clsact-host. Pod-side first so the `fq`
+  install on pod-eth0 sits downstream of the BPF program. Host-side
+  attempts at the tail of the chain skip EDT but still attach.
+- `attachMode: auto`, `edtPacing: on`: tcx-pod → clsact-pod. EDT is
+  required, so host-side attempts are dropped from the chain
+  entirely.
+
+Explicit `attachMode` values (e.g. `tcx-hostside`) produce a
+single-attempt list with no fallback — the operator asked for that
+exact mode, so honor it. `edtPacing: on` with a non-pod attachMode
+errors at CNI ADD instead of silently downgrading.
+
+Selected via the `attachMode` field on the conflist entry or the
+`NATRA_ATTACH_MODE` env on the install init container. Both
+directions use the same mode; the choice is deployment-wide.
 
 The natra BPF program is symmetric per direction: `natra_ingress`
 processes packets in the pod-ingress direction regardless of which
