@@ -154,6 +154,9 @@ struct {
 // inside u32 wrap (2^32 ticks × 68.7 s ≈ 9300 years).
 #define CMS_DECAY_INTERVAL_NS (1ULL << 36)
 
+// Cell layout: u64 + u32 = 12 bytes of fields, padded to 16 bytes
+// for 8-byte alignment of `bytes` in array-of-struct. Per-pod CMS
+// cost = WIDTH × DEPTH × DIR_MAX × 16 = 4 MiB.
 struct cms_cell {
 	__u64 bytes;
 	__u32 last_decay_idx;
