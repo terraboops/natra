@@ -179,6 +179,35 @@ vs 320× win), but it's not zero — worth knowing when sizing nodes
 that mix annotated heavy traffic with unannotated latency-sensitive
 workloads.
 
+### With EDT pacing enabled
+
+Setting `NATRA_EDT_PACING=1` on the installer flips natra to use
+EDT-stamped pacing for above-rate egress instead of dropping. natra
+installs an `fq` qdisc on each pod's eth0 at CNI ADD; `fq` honors
+`skb->tstamp` and delays the packet until its scheduled time.
+Result: no TCP retransmits, smaller softirq footprint on the worker.
+
+| Plugin                              | Iperf ing  | Iperf eg  | Annotated mice RPS | Bystander mice RPS |
+|-------------------------------------|------------|-----------|-------------------:|-------------------:|
+| baseline (no plugin)                | 7883 Mbps  | 27490 Mbps | 5189              | 6881               |
+| natra (default — ECN+drop)          | 10.7 Mbps  | 9.3 Mbps  | 3539              | 4728               |
+| **natra with EDT (`NATRA_EDT_PACING=1`)** | **9.96 Mbps** | **6.71 Mbps** | **4381** | **6303** |
+
+EDT cuts the bystander bleed from ~34% under baseline to ~12%, and
+annotated-mice RPS goes from 3539 to 4381 (+24%). The egress
+rate-limit stays enforced (fq honoring the timestamps); without `fq`
+downstream the EDT path silently passes packets at line rate (see
+the cautionary observed-50-Gbps incident in commit history). This
+is why EDT is opt-in — it only works correctly when natra's `fq`
+install sticks on pod-eth0, which requires that no other CNI plugin
+has set a competing root qdisc.
+
+The remaining ~12% bystander gap under EDT is the ingress half: natra
+still drops over-rate non-ECN packets on ingress because there's no
+transmission-side qdisc to honor `skb->tstamp` on the receive path.
+For ECN-capable peers (`net.ipv4.tcp_ecn=1` on either end), the
+ingress drops become ECN-marks and that residue closes too.
+
 The mixed iperf throughput under natra comes in close to but below
 the 10 Mbps cap because when hey *does* occasionally hit the bucket
 (CMS collisions, above-threshold bursts on a connection), it
