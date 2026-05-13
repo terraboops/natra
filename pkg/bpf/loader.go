@@ -9,10 +9,14 @@
 //   - Side: HostSide (peer of pod's eth0, in the host netns) or
 //     PodSide (eth0 inside the pod netns).
 //
-// The four combinations are independently selectable. tcx-hostside is
-// the default and matches how Cilium and the AWS network-policy-agent
-// attach. Pod-side modes are useful when the host netns is locked
-// down or when host-side attach would collide with another BPF stack.
+// The four combinations are independently selectable. natra defaults
+// to attachMode=auto, which expands into an ordered fallback chain
+// whose head depends on the resolved EDT mode — pod-side first when
+// EDT is enabled, host-side first when EDT is off (host-side matches
+// how Cilium and the AWS network-policy-agent attach). Pod-side
+// modes are useful when the host netns is locked down or when
+// host-side attach would collide with another BPF stack. See
+// cmd/natra/main.go::resolveAttachStrategy for the full chains.
 //
 // The natra BPF program is symmetric per direction (`natra_ingress`
 // processes packets in the pod-ingress direction regardless of which
