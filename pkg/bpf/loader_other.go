@@ -69,6 +69,7 @@ type Config struct {
 	RateBps     uint64
 	BurstBytes  uint64
 	HHThreshold uint64
+	EDTPacing   uint64
 }
 
 type TokenBucket struct {

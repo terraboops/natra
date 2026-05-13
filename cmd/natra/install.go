@@ -122,6 +122,21 @@ func writeChainedSibling(src, dst string) error {
 		}
 		defaults["burstRatio"] = v
 	}
+	// NATRA_EDT_PACING=1 opts the cluster into EDT pacing on egress.
+	// natra will (a) install fq on each pod's eth0 at CNI ADD so EDT
+	// timestamps are honored, and (b) force pod-side egress attach so
+	// fq sits downstream of the BPF program. Off by default — without
+	// fq the EDT path silently breaks egress rate-limiting.
+	if e := os.Getenv("NATRA_EDT_PACING"); e != "" {
+		switch e {
+		case "1", "true", "yes", "on":
+			defaults["edtPacing"] = true
+		case "0", "false", "no", "off":
+			// explicitly disabled — omit
+		default:
+			return fmt.Errorf("NATRA_EDT_PACING=%q must be a boolean (1/0, true/false, yes/no, on/off)", e)
+		}
+	}
 	if len(defaults) > 0 {
 		natraEntry["defaults"] = defaults
 	}

@@ -43,6 +43,48 @@ func enterNetns(path string) (func(), error) {
 	return restore, nil
 }
 
+// installFQ replaces the root qdisc on `ifIndex` with `fq` so EDT
+// timestamps set by natra's BPF program are honored. Idempotent: if
+// the root qdisc is already `fq`, no change. The kernel's default
+// for veth is `noqueue`, which ignores skb->tstamp — natra has to
+// install fq itself or EDT pacing silently breaks (packets transmit
+// at line rate regardless of timestamp).
+//
+// Caller is responsible for being in the right netns. Pod-side
+// attach: call inside the pod netns so this acts on pod-eth0.
+func installFQ(ifIndex int) error {
+	link, err := netlink.LinkByIndex(ifIndex)
+	if err != nil {
+		return fmt.Errorf("LinkByIndex(%d): %w", ifIndex, err)
+	}
+
+	// Skip the replace if fq is already there. QdiscReplace is
+	// idempotent but the no-op still triggers a netlink round-trip
+	// per CNI ADD; this short-circuit keeps the hot path fast for
+	// pod churn.
+	existing, err := netlink.QdiscList(link)
+	if err == nil {
+		for _, q := range existing {
+			if q.Attrs().Parent == netlink.HANDLE_ROOT && q.Type() == "fq" {
+				return nil
+			}
+		}
+	}
+
+	fq := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: ifIndex,
+			Handle:    netlink.MakeHandle(0x1, 0),
+			Parent:    netlink.HANDLE_ROOT,
+		},
+		QdiscType: "fq",
+	}
+	if err := netlink.QdiscReplace(fq); err != nil {
+		return fmt.Errorf("QdiscReplace fq on ifindex %d: %w", ifIndex, err)
+	}
+	return nil
+}
+
 // hostsidePeerIfIndex finds the kernel ifindex of the host-side veth
 // peer of the pod's ifName interface (typically eth0). Briefly enters
 // the pod netns to read the peer index via netlink, then restores the

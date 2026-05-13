@@ -39,16 +39,13 @@ const (
 )
 
 // throttleVerdict returns the TC verdict and matching disposition stat
-// slot that natra produces for an above-rate non-ECN packet. The two
-// directions differ: egress paces via EDT (TC_ACT_OK, STAT_EDT_DELAYED);
-// ingress has no transmission-side qdisc to honor skb->tstamp, so it
-// falls back to drop (TC_ACT_SHOT, STAT_DROPPED). ECN-capable packets
-// land in STAT_ECN_MARKED in either direction; the synthetic packets
-// used by these tests don't set ECT bits so they never take that path.
-func throttleVerdict(dir bpf.Direction) (verdict uint32, stat uint32) {
-	if dir == bpf.DirectionEgress {
-		return 0, statEDTDelayed // TC_ACT_OK
-	}
+// slot that natra produces for an above-rate non-ECN packet with
+// cfg.EDTPacing == 0 (the default). Both directions drop in that case
+// because EDT pacing is opt-in (requires fq qdisc downstream — without
+// fq the EDT path silently breaks rate limiting). The
+// TestNatraEDTPacingOnEgress test covers the EDT-enabled path
+// separately.
+func throttleVerdict(_ bpf.Direction) (verdict uint32, stat uint32) {
 	return 2, statDropped // TC_ACT_SHOT
 }
 
@@ -243,6 +240,80 @@ func synthEthIPpktFromFlow(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte 
 func withECT(pkt []byte) []byte {
 	pkt[15] = 0x02
 	return pkt
+}
+
+// TestNatraEDTPacingOnEgress confirms that with cfg.EDTPacing != 0,
+// above-rate egress packets return TC_ACT_OK with STAT_EDT_DELAYED
+// bumped and skb->tstamp advanced. Ingress still drops because
+// transmission-side qdiscs can't pace incoming packets — natra
+// zeroes EDTPacing in the ingress slot at attach time, and this
+// test mirrors that contract.
+func TestNatraEDTPacingOnEgress(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			cfg := natraConfig{
+				RateBps:     1,
+				BurstBytes:  64,
+				HHThreshold: 0, // every packet is heavy
+			}
+			// EDT is per-direction in cfg; mirror attachBPF's
+			// "ingress always zero" rule here.
+			if dc.dir == bpf.DirectionEgress {
+				cfg.EDTPacing = 1
+			}
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config: %v", err)
+			}
+			tb := tokenBucket{Tokens: 64}
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket: %v", err)
+			}
+
+			pkt := synthEthIPpkt() // non-ECN
+
+			// Packet 1: bucket admits, passes normally.
+			if ret, _, err := dc.prog.Test(pkt); err != nil {
+				t.Fatalf("packet 1: %v", err)
+			} else if ret != 0 {
+				t.Fatalf("packet 1 ret=%d, want 0", ret)
+			}
+
+			beforeEDT := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed))
+			beforeDrop := readPerCPUStat(t, statsMap, dc.statKey(statDropped))
+
+			// Packet 2: bucket empty, non-ECN. Egress with EDTPacing=1
+			// → EDT-delayed (TC_ACT_OK, STAT_EDT_DELAYED). Ingress
+			// (EDTPacing=0) → dropped (TC_ACT_SHOT, STAT_DROPPED).
+			ret, _, err := dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("packet 2: %v", err)
+			}
+
+			if dc.dir == bpf.DirectionEgress {
+				if ret != 0 {
+					t.Errorf("egress ret=%d, want 0 (EDT-delayed)", ret)
+				}
+				if got := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed)) - beforeEDT; got != 1 {
+					t.Errorf("egress STAT_EDT_DELAYED delta=%d, want 1", got)
+				}
+				if got := readPerCPUStat(t, statsMap, dc.statKey(statDropped)) - beforeDrop; got != 0 {
+					t.Errorf("egress STAT_DROPPED delta=%d, want 0 (EDT preferred over drop)", got)
+				}
+			} else {
+				if ret != 2 {
+					t.Errorf("ingress ret=%d, want 2 (drop; EDT not set)", ret)
+				}
+				if got := readPerCPUStat(t, statsMap, dc.statKey(statDropped)) - beforeDrop; got != 1 {
+					t.Errorf("ingress STAT_DROPPED delta=%d, want 1", got)
+				}
+				if got := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed)) - beforeEDT; got != 0 {
+					t.Errorf("ingress STAT_EDT_DELAYED delta=%d, want 0", got)
+				}
+			}
+		})
+	}
 }
 
 // TestNatraECNMarkOnAboveRate confirms that an ECN-capable above-rate

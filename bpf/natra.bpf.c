@@ -90,10 +90,18 @@ static const __u32 cms_seeds[CMS_DEPTH] = {
 	0x27d4eb2fu,
 };
 
+// natra_config is loaded per-direction by userspace at CNI ADD. Read
+// by the BPF program on every above-rate packet to decide how to
+// throttle. edt_pacing must default to 0; without an fq qdisc
+// downstream of natra's attach point, EDT-stamped packets pass at
+// line rate and the rate limit silently breaks. Operators opt in
+// only on hosts where fq is in place (NATRA_EDT_PACING=1 on the
+// installer DaemonSet env).
 struct natra_config {
 	__u64 rate_bps;
 	__u64 burst_bytes;
 	__u64 hh_threshold; // CMS count above which a flow is "heavy"
+	__u64 edt_pacing;   // non-zero → use EDT (egress) before dropping; 0 → ECN-mark or drop
 };
 
 struct {
@@ -381,14 +389,15 @@ static __always_inline int throttle_disposition(struct __sk_buff *skb,
 						__u32 dir,
 						__u64 now_ns,
 						__u64 rate_bps,
-						__u64 bytes)
+						__u64 bytes,
+						__u64 edt_pacing)
 {
 	if (bpf_skb_ecn_set_ce(skb) > 0) {
 		bump_stat(dir, STAT_ECN_MARKED);
 		return TC_ACT_OK;
 	}
 
-	if (dir == DIR_EGRESS) {
+	if (dir == DIR_EGRESS && edt_pacing != 0) {
 		struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &dir);
 		if (tb && rate_bps > 0) {
 			// add_ns = bytes * 8 * 1e9 / rate_bps. Split so the
@@ -453,11 +462,13 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 		return TC_ACT_OK;
 	}
 	// Above the rate: prefer ECN-mark, fall back to EDT pacing on
-	// egress, drop only if nothing else applies. STAT_THROTTLED is
-	// the cardinality of all overflow events; the disposition stat
-	// (ECN_MARKED / EDT_DELAYED / DROPPED) records the outcome.
+	// egress (only when cfg->edt_pacing is set — without fq
+	// downstream EDT silently breaks the rate limit), drop only if
+	// nothing else applies. STAT_THROTTLED is the cardinality of all
+	// overflow events; the disposition stat (ECN_MARKED / EDT_DELAYED
+	// / DROPPED) records the outcome.
 	bump_stat(dir, STAT_THROTTLED);
-	return throttle_disposition(skb, dir, now_ns, cfg->rate_bps, len);
+	return throttle_disposition(skb, dir, now_ns, cfg->rate_bps, len, cfg->edt_pacing);
 }
 
 SEC("tc")

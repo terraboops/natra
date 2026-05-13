@@ -78,17 +78,24 @@ type NetConf struct {
 	} `json:"runtimeConfig,omitempty"`
 }
 
-// NetConfDefaults holds cluster-wide defaults. Both fields are
+// NetConfDefaults holds cluster-wide defaults. All fields are
 // optional; zero means "use natra's compiled-in default".
 type NetConfDefaults struct {
 	// HHThreshold overrides the heavy-hitter threshold default
-	// (compiled-in: 10). Lower = stricter shaping (mice become
+	// (compiled-in: 50). Lower = stricter shaping (mice become
 	// elephants faster); higher = more mice protection.
 	HHThreshold int64 `json:"hhThreshold,omitempty"`
 	// BurstRatio overrides the default burst-to-rate ratio
 	// (compiled-in: 2). A 10 Mbps annotation with ratio 2 gives a
 	// 2.5 MB token bucket (= 2 seconds of credit).
 	BurstRatio float64 `json:"burstRatio,omitempty"`
+	// EDTPacing turns on Earliest-Departure-Time pacing for
+	// above-rate egress packets. Without it natra falls back to
+	// drop on egress (after first trying ECN-mark). EDT requires
+	// an fq qdisc downstream of natra's attach point — without fq
+	// the EDT-stamped packets pass at line rate and the rate limit
+	// silently breaks. Default off.
+	EDTPacing bool `json:"edtPacing,omitempty"`
 }
 
 // attachAttempt is a single (hook, side) pair to try.
@@ -222,7 +229,11 @@ func cmdAdd(args *skel.CmdArgs) error {
 	logf("config resolved: ingress=%v egress=%v strategy=%v",
 		describeCfg(ingressCfg), describeCfg(egressCfg), strategy)
 
-	if err := attachBPF(args, ingressCfg, egressCfg, strategy); err != nil {
+	var edtPacing uint64
+	if conf.Defaults != nil && conf.Defaults.EDTPacing {
+		edtPacing = 1
+	}
+	if err := attachBPF(args, ingressCfg, egressCfg, strategy, edtPacing); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
@@ -431,7 +442,12 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 // program reference via the link until the pin is removed (cmdDel).
 // For HookClsact, the kernel holds the program reference via the
 // qdisc tree.
-func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, strategy []attachAttempt) error {
+func attachBPF(
+	args *skel.CmdArgs,
+	ingressCfg, egressCfg *config.Config,
+	strategy []attachAttempt,
+	edtPacing uint64,
+) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -439,9 +455,28 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, strateg
 		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
 
+	// EDT requires an fq qdisc downstream of where the BPF program
+	// runs. The only place natra can install fq deterministically is
+	// pod-eth0 (inside the pod netns), which is downstream only for
+	// pod-side egress attach. So when EDT is on, filter the strategy
+	// down to pod-side attempts and let tryAttachOne install fq next
+	// to its attach.
+	if edtPacing != 0 {
+		filtered := make([]attachAttempt, 0, len(strategy))
+		for _, a := range strategy {
+			if a.side == bpf.SidePod {
+				filtered = append(filtered, a)
+			}
+		}
+		if len(filtered) == 0 {
+			return fmt.Errorf("edtPacing requires a pod-side attach mode but strategy %v has none", strategy)
+		}
+		strategy = filtered
+	}
+
 	attemptErrs := make([]string, 0, len(strategy))
 	for _, attempt := range strategy {
-		err := tryAttachOne(args, ingressCfg, egressCfg, attempt)
+		err := tryAttachOne(args, ingressCfg, egressCfg, attempt, edtPacing)
 		if err == nil {
 			return nil
 		}
@@ -456,12 +491,34 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, strateg
 // pin maps. On any error it tears down anything it wrote (links,
 // pin files, the loaded Program) and returns the error to the
 // caller, who decides whether to fall through to the next attempt.
-func tryAttachOne(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, attempt attachAttempt) error {
+//
+// edtPacing flows through to bpf.Configure (sets cfg->edt_pacing in
+// each direction's slot) and gates the fq qdisc install. fq must be
+// the main qdisc on pod-eth0 for EDT to actually pace; without it
+// our skb->tstamp is ignored by noqueue and the rate limit silently
+// passes packets at line rate.
+func tryAttachOne(
+	args *skel.CmdArgs,
+	ingressCfg, egressCfg *config.Config,
+	attempt attachAttempt,
+	edtPacing uint64,
+) error {
 	ifIndex, restore, err := resolveIfIndex(args.Netns, args.IfName, attempt.side)
 	if err != nil {
 		return err
 	}
 	defer restore()
+
+	// Install fq on pod-eth0 so EDT actually paces. Only meaningful
+	// when attached pod-side (we're already in the pod netns and
+	// ifIndex is pod-eth0's). attachBPF restricts strategy to pod-side
+	// when edtPacing != 0, so this is reachable from the EDT path.
+	if edtPacing != 0 && attempt.side == bpf.SidePod {
+		if err := installFQ(ifIndex); err != nil {
+			fmt.Fprintf(os.Stderr, "natra: install fq on ifindex %d failed (%v) — EDT pacing will not engage\n", ifIndex, err)
+			logf("install fq failed: %v", err)
+		}
+	}
 
 	prog, err := bpf.Load()
 	if err != nil {
@@ -490,10 +547,19 @@ func tryAttachOne(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, atte
 	}
 
 	for i, step := range steps {
+		dirEdt := edtPacing
+		if step.dir == bpf.DirectionIngress {
+			// Ingress has no transmission-side qdisc to honor
+			// skb->tstamp, so EDT pacing on ingress is meaningless.
+			// Zero it so the ingress program never even tries the
+			// EDT path — saves a branch on the hot path.
+			dirEdt = 0
+		}
 		if err := prog.Configure(step.dir, bpf.Config{
 			RateBps:     uint64(step.cfg.Rate),
 			BurstBytes:  uint64(step.cfg.Burst),
 			HHThreshold: uint64(step.cfg.HeavyHitterThreshold),
+			EDTPacing:   dirEdt,
 		}); err != nil {
 			rollback(i)
 			_ = prog.Close()

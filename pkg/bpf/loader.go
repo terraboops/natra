@@ -111,11 +111,17 @@ func (d Direction) String() string {
 }
 
 // Config mirrors `struct natra_config` in bpf/natra.bpf.c. Field
-// order and types must match the C side exactly.
+// order and types must match the C side exactly. EDTPacing is the
+// runtime opt-in: 0 = ECN-mark-or-drop (safe everywhere), non-zero
+// = ECN-mark, then EDT pacing on egress, then drop. EDT requires
+// fq qdisc downstream of natra's attach point; without it packets
+// pass at line rate and the rate limit silently breaks. Operators
+// opt in per-cluster via NATRA_EDT_PACING=1 on the installer DS.
 type Config struct {
 	RateBps     uint64
 	BurstBytes  uint64
 	HHThreshold uint64
+	EDTPacing   uint64
 }
 
 // TokenBucket mirrors `struct token_bucket`. The first u32 is the
