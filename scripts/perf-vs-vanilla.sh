@@ -507,15 +507,22 @@ kind create cluster --name "$NATRA_CLUSTER" \
 kind load docker-image "$NATRA_IMAGE" "$PERFCLIENT_IMAGE" --name "$NATRA_CLUSTER"
 
 kubectl apply -f "$TMPDIR/natra/namespace.yaml"
-# NATRA_PERF_ATTACH_MODE picks the attach path. Default is
-# tcx-hostside (production default); other options are tcx-podside,
-# clsact-hostside, clsact-podside.
+# NATRA_PERF_ATTACH_MODE picks the attach path. Default is auto;
+# other options are tcx-{host,pod}side, clsact-{host,pod}side.
+# NATRA_PERF_EDT_PACING={1,true} flips the cluster-default EDT
+# pacing knob — natra installs fq on each pod eth0 and uses
+# EDT-stamped skbs for above-rate egress instead of dropping.
 ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
 if [ "$ATTACH_MODE" = "tcx-hostside" ]; then ATTACH_MODE=""; fi
+EDT_PACING="${NATRA_PERF_EDT_PACING:-}"
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
-    -e "s|value: \"\"$|value: \"${ATTACH_MODE}\"|" \
-    "${REPO_ROOT}/deploy/cni-installer.yaml" | kubectl apply -f -
+    "${REPO_ROOT}/deploy/cni-installer.yaml" | \
+    awk -v am="$ATTACH_MODE" -v ep="$EDT_PACING" '
+        /name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next }
+        /name: NATRA_EDT_PACING/  { print; getline; sub(/value: ".*"/, "value: \"" ep "\""); print; next }
+        { print }
+    ' | kubectl apply -f -
 kubectl rollout status daemonset/natra-installer -n kube-system --timeout=120s
 
 kubectl apply -f "$TMPDIR/natra/iperf-server.yaml"

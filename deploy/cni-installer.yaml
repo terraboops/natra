@@ -33,12 +33,24 @@ spec:
           image: ghcr.io/terraboops/natra:latest
           imagePullPolicy: IfNotPresent
           # NATRA_ATTACH_MODE controls how natra hooks BPF onto pod
-          # veths. Empty (default) → tcx, the recommended path on
-          # kernel 6.6+ — composes via bpf_mprog with other pod-side
-          # BPF (cilium-agent, aws-network-policy-agent). Set to
-          # "clsact-podside" for older kernels.
+          # veths. Empty (default) → auto-detect: tcx-hostside first
+          # (recommended on kernel 6.6+, composes via bpf_mprog with
+          # cilium / aws-network-policy-agent), falling back through
+          # tcx-podside → clsact-hostside → clsact-podside on each
+          # failure. Set explicitly to "clsact-podside" etc. to pin
+          # a single mode with no fallback.
+          #
+          # NATRA_EDT_PACING={1,true,yes,on} enables EDT pacing on
+          # egress. natra installs an fq qdisc on each pod's eth0 at
+          # CNI ADD so above-rate packets get skb->tstamp instead of
+          # being dropped — no TCP retransmit, no bystander softirq
+          # bleed. Forces pod-side egress attach. Off by default
+          # because some environments already have a non-noqueue
+          # root qdisc on pod veths that natra shouldn't clobber.
           env:
             - name: NATRA_ATTACH_MODE
+              value: ""
+            - name: NATRA_EDT_PACING
               value: ""
           command:
             - /bin/sh
