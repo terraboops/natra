@@ -33,20 +33,29 @@ spec:
           image: ghcr.io/terraboops/natra:latest
           imagePullPolicy: IfNotPresent
           # NATRA_ATTACH_MODE controls how natra hooks BPF onto pod
-          # veths. Empty (default) → auto-detect: tcx-hostside first
-          # (recommended on kernel 6.6+, composes via bpf_mprog with
-          # cilium / aws-network-policy-agent), falling back through
-          # tcx-podside → clsact-hostside → clsact-podside on each
-          # failure. Set explicitly to "clsact-podside" etc. to pin
-          # a single mode with no fallback.
+          # veths. Empty (default) → auto, which expands to an
+          # ordered fallback chain whose head depends on the resolved
+          # EDT mode:
+          #   - edtPacing=off:  tcx-host → tcx-pod → clsact-host → clsact-pod
+          #     (host-side first matches cilium / aws-network-policy-agent's
+          #     coexistence shape; composes via bpf_mprog on kernel 6.6+).
+          #   - edtPacing=auto (default): tcx-pod → clsact-pod →
+          #     tcx-host → clsact-host (pod-side first so an fq install
+          #     on pod-eth0 sits downstream of the BPF program).
+          #   - edtPacing=on: tcx-pod → clsact-pod only (host-side drops
+          #     out — EDT requires pod-side).
+          # Set explicitly to one of {tcx-hostside, tcx-podside,
+          # clsact-hostside, clsact-podside} to pin a single attempt
+          # with no fallback.
           #
-          # NATRA_EDT_PACING={1,true,yes,on} enables EDT pacing on
-          # egress. natra installs an fq qdisc on each pod's eth0 at
-          # CNI ADD so above-rate packets get skb->tstamp instead of
-          # being dropped — no TCP retransmit, no bystander softirq
-          # bleed. Forces pod-side egress attach. Off by default
-          # because some environments already have a non-noqueue
-          # root qdisc on pod veths that natra shouldn't clobber.
+          # NATRA_EDT_PACING={auto,on,off}. Default is auto: natra
+          # probes `fq` install on pod-eth0 at CNI ADD and uses the
+          # EDT path on success, falling back to drop semantics on
+          # failure. `on` requires fq (attach errors if install
+          # fails); `off` never installs fq and always drops after
+          # ECN-mark — pick `off` if cilium/NPA on the host already
+          # owns the qdisc layout you'd rather not perturb. The legacy
+          # {1,true,yes} forms map to `on`; {0,false,no} map to `off`.
           env:
             - name: NATRA_ATTACH_MODE
               value: ""
