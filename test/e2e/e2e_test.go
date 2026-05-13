@@ -670,12 +670,21 @@ var _ = Describe("Topology G — proxy-like simultaneous bidirectional", func() 
 
 // Topology F — no-plugin regression. Tears down natra, runs an
 // unannotated workload to capture baseline, reinstates natra, runs
-// the same workload, asserts delta < 10%.
+// the same workload, asserts the delta is below `tolerance`.
+//
+// The point of this test is structural: catch a regression where
+// natra starts charging unannotated pods (e.g. attaching BPF when
+// neither annotation is present, or burning softirq cycles per
+// packet on the unannotated path). Such a regression would show up
+// as a multi-tens-of-percent throughput drop, not a single-digit
+// one. `tolerance` is wide enough to absorb GH-runner jitter
+// (observed 13.8% on a docs-only commit) while still tripping on
+// the structural regressions this test exists to detect.
 //
 // Runs after the others so its DS-uninstall doesn't perturb them.
 // AfterAll restores the DS even on failure.
 var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
-	const tolerance = 0.10
+	const tolerance = 0.20
 	const podName = "iperf-server-noplugin"
 	const manifest = "iperf-server-noplugin.yaml"
 
@@ -713,7 +722,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 			"baseline should produce a real number")
 	})
 
-	It("re-measures with natra installed and asserts delta < 10%", func() {
+	It("re-measures with natra installed and asserts delta within tolerance", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 		defer cancel()
 

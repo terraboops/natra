@@ -129,7 +129,7 @@ Topologies asserted:
 | C        | both annotations throttle forward then reverse, sequential                   |
 | D        | mixed: only annotated pods throttled; unannotated pods on the same node free |
 | E        | no-annotation case: natra in path, no throttling                             |
-| F        | no-plugin regression: with-natra delta vs. no-natra baseline < 10%           |
+| F        | no-plugin regression: with-natra delta vs. no-natra baseline < 20%           |
 | G        | proxy-like: both directions throttle independently under concurrent traffic  |
 
 Run:
