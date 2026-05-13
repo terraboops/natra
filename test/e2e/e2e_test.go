@@ -64,10 +64,13 @@ const (
 	throttleDurationCeiling = 30
 	// throttleCapFloorRatio is a floor on the dynamic cap: even if
 	// calibration measures an unusually-tight steady-state, we don't
-	// let the cap drop below 1.20× rate. Without this a low-jitter
+	// let the cap drop below 1.30× rate. Without this a low-jitter
 	// runner could end up with a brittle 1.05× cap that catches
-	// nothing.
-	throttleCapFloorRatio = 1.20
+	// nothing. 1.30 chosen empirically: GH-runner kindnet jitter on
+	// the second leg of a sequential bidi run (Topology C reverse)
+	// settles around 1.20-1.25× rate; floor needs daylight above the
+	// measured upper tail.
+	throttleCapFloorRatio = 1.30
 	// throttleCapMargin is added on top of measured mean + 2σ as a
 	// final safety pad. 5% covers minor between-test noise that the
 	// 3-sample calibration window won't see.
@@ -741,8 +744,8 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 // logThrottled writes the human-readable summary line that the
 // existing tests depend on for log inspection.
 func logThrottled(direction string, bps int64) {
-	GinkgoWriter.Printf("[%s] throttled throughput: %.2f Mbps (cap %.2f Mbps with +20%% slack)\n",
-		direction, float64(bps)/1e6, float64(bandwidthBps)/1e6)
+	GinkgoWriter.Printf("[%s] throttled throughput: %.2f Mbps (cap rate %.2f Mbps; effective cap %.2f Mbps)\n",
+		direction, float64(bps)/1e6, float64(bandwidthBps)/1e6, float64(throttledCap)/1e6)
 }
 
 func requireBinary(name string) {

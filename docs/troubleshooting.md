@@ -128,7 +128,7 @@ suffixes.
 
 ### Throughput exceeds the annotation
 
-iperf measured at the receiver should fall within +20% of the
+iperf measured at the receiver should fall within ~30% of the
 annotation. If it's wildly higher (e.g. line-rate Gbps under a 10 Mbps
 annotation), natra is fail-open: it loaded but the attach failed. See
 "CNI ADD path" above to find the underlying error.
@@ -156,9 +156,11 @@ fast pass take effect; raise it to give more flows the fast pass.
 
 ## L4 e2e on the local rig
 
-The L4 test brings up a kind cluster and asserts iperf throughput is
-within +20% of the annotated rate. Bringup logs are in the test's
-output; on failure the test dumps:
+The L4 test brings up a k3d cluster and asserts iperf throughput is
+within a calibrated cap (μ + 2σ + 5% margin, floored at 1.30× rate).
+The runner's measured jitter sets the effective cap; the floor only
+binds on low-jitter runners. Bringup logs are in the test's output;
+on failure the test dumps:
 
 - `kubectl describe pod` for the iperf pods
 - The natra install container log
