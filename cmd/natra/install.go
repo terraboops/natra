@@ -87,17 +87,19 @@ func writeChainedSibling(src, dst string) error {
 		"capabilities": map[string]any{"bandwidth": true},
 	}
 	// NATRA_ATTACH_MODE on the install init container surfaces here.
-	// Empty (default) → omit, the binary picks tcx-hostside. Any of
-	// the four modes is also accepted. Reject anything else loudly so
-	// a typo in the DaemonSet env doesn't silently fall through to
-	// a default that was wrong for this node.
+	// Empty (default) → omit; the binary auto-detects (tcx then
+	// clsact, hostside then podside). "auto" is accepted explicitly.
+	// Any of the four exact-mode strings also passes through and
+	// disables auto-detection. Reject anything else loudly so a typo
+	// in the DaemonSet env doesn't silently fall through to a
+	// default that was wrong for this node.
 	if mode := os.Getenv("NATRA_ATTACH_MODE"); mode != "" {
 		switch mode {
-		case "tcx-hostside", "tcx-podside", "clsact-hostside", "clsact-podside":
+		case "auto", "tcx-hostside", "tcx-podside", "clsact-hostside", "clsact-podside":
 			natraEntry["attachMode"] = mode
 		default:
 			return fmt.Errorf(
-				"NATRA_ATTACH_MODE=%q is not recognized (want one of: %s)",
+				"NATRA_ATTACH_MODE=%q is not recognized (want one of: auto, %s)",
 				mode, "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside",
 			)
 		}

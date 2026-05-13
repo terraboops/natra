@@ -91,24 +91,51 @@ type NetConfDefaults struct {
 	BurstRatio float64 `json:"burstRatio,omitempty"`
 }
 
-// resolveAttachMode parses NetConf.AttachMode into a (hook, side)
-// pair. Empty string defaults to tcx-hostside — same attach surface
-// Cilium and the AWS network-policy-agent use, which is the most
-// portable choice for coexistence with other BPF stacks on EKS-style
-// nodes.
-func resolveAttachMode(s string) (bpf.Hook, bpf.Side, error) {
+// attachAttempt is a single (hook, side) pair to try.
+type attachAttempt struct {
+	hook bpf.Hook
+	side bpf.Side
+}
+
+func (a attachAttempt) String() string {
+	return fmt.Sprintf("%s-%s", a.hook, a.side)
+}
+
+// resolveAttachStrategy parses NetConf.AttachMode into the ordered
+// list of attempts to make. Empty string ("" or "auto") expands to
+// the default fallback chain:
+//
+//	tcx-hostside → tcx-podside → clsact-hostside → clsact-podside
+//
+// The chain prefers tcx (multi-program friendly, the cilium / AWS
+// NPA shape) and host-side (peer of pod's eth0, same surface other
+// BPF stacks use). Real-world fallbacks: old kernels (< 6.6) skip
+// every tcx step and land on clsact; locked-down host netns skips
+// hostside and lands on podside.
+//
+// Explicit values ("tcx-hostside", etc.) produce a single-attempt
+// list with no fallback — the operator asked for exactly that
+// combination, so honor it.
+func resolveAttachStrategy(s string) ([]attachAttempt, error) {
 	switch s {
-	case "", "tcx-hostside":
-		return bpf.HookTCX, bpf.SideHost, nil
+	case "", "auto":
+		return []attachAttempt{
+			{bpf.HookTCX, bpf.SideHost},
+			{bpf.HookTCX, bpf.SidePod},
+			{bpf.HookClsact, bpf.SideHost},
+			{bpf.HookClsact, bpf.SidePod},
+		}, nil
+	case "tcx-hostside":
+		return []attachAttempt{{bpf.HookTCX, bpf.SideHost}}, nil
 	case "tcx-podside":
-		return bpf.HookTCX, bpf.SidePod, nil
+		return []attachAttempt{{bpf.HookTCX, bpf.SidePod}}, nil
 	case "clsact-hostside":
-		return bpf.HookClsact, bpf.SideHost, nil
+		return []attachAttempt{{bpf.HookClsact, bpf.SideHost}}, nil
 	case "clsact-podside":
-		return bpf.HookClsact, bpf.SidePod, nil
+		return []attachAttempt{{bpf.HookClsact, bpf.SidePod}}, nil
 	default:
-		return 0, 0, fmt.Errorf(
-			"unknown attachMode %q (want one of: %s)",
+		return nil, fmt.Errorf(
+			"unknown attachMode %q (want one of: auto, %s)",
 			s, "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside",
 		)
 	}
@@ -181,7 +208,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	hook, side, err := resolveAttachMode(conf.AttachMode)
+	strategy, err := resolveAttachStrategy(conf.AttachMode)
 	if err != nil {
 		return fmt.Errorf("attachMode: %w", err)
 	}
@@ -192,10 +219,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logf("no rate limit on either direction, passing through")
 		return passthrough(args, conf)
 	}
-	logf("config resolved: ingress=%v egress=%v hook=%s side=%s",
-		describeCfg(ingressCfg), describeCfg(egressCfg), hook, side)
+	logf("config resolved: ingress=%v egress=%v strategy=%v",
+		describeCfg(ingressCfg), describeCfg(egressCfg), strategy)
 
-	if err := attachBPF(args, ingressCfg, egressCfg, hook, side); err != nil {
+	if err := attachBPF(args, ingressCfg, egressCfg, strategy); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
@@ -381,41 +408,56 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 	return nil
 }
 
-// attachBPF resolves the chosen veth-side's ifindex, loads the BPF
-// object, configures each direction that has a rate, and attaches.
-// At least one of ingress or egress is non-nil when this is called.
+// attachBPF tries each attempt in `strategy` in order until one
+// succeeds. For each attempt:
+//   - resolve the right side's ifindex (entering pod netns if podside)
+//   - load + configure a fresh BPF Program
+//   - attach every requested direction
+//   - on success: pin maps, announce, return nil
+//   - on failure: close program, remove any pins this attempt wrote,
+//     fall through to the next attempt
 //
-// The ifindex resolution depends on side:
-//   - SidePod: enter the pod netns, look up args.IfName (typically
-//     "eth0"), attach inside the netns. Cleanup is automatic when
-//     the pod terminates and the netns is destroyed.
-//   - SideHost: visit the pod netns just long enough to read eth0's
-//     veth peer ifindex via netlink, exit the netns, attach in the
-//     host netns. Cleanup relies on cmdDel removing the pin files.
+// Loading BPF per failed attempt is wasteful but bounded — the
+// strategy is at most 4 long and in practice the first attempt
+// succeeds on every modern kernel. The simplicity wins.
 //
-// We have to leave the calling OS thread in the same netns we entered
-// with. CNI's skel framework checks after the plugin returns and
-// exits "code 8" if the plugin's netns matches CNI_NETNS, regardless
-// of what stdout said. The restore is deferred immediately after the
-// switch so any error path returns us to origin.
+// netns handling: each attempt may need a different netns (pod-side
+// vs host-side), so the netns switch and restore live inside the
+// per-attempt helper. The outer LockOSThread is what guarantees the
+// thread stays put through each switch.
 //
-// We don't close prog on success. For HookTCX, each direction's link
-// is pinned to bpffs and the kernel holds the program reference via
-// the link until the pin is removed (cmdDel). For HookClsact, the
-// kernel holds the program reference via the qdisc tree.
-//
-// If one direction's attach succeeds and the other fails, the
-// successful side is rolled back (link closed, pin removed) and the
-// whole call returns an error. The fail-open contract at the caller
-// level then lets traffic flow unrate-limited rather than half-applied.
-func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bpf.Hook, side bpf.Side) error {
-	// netns.Set switches the calling thread, so a goroutine migration
-	// mid-flow would leave us in a different namespace than we think.
-	// Lock the thread for the duration of the netns dance.
+// We don't close the chosen attempt's prog on success. For HookTCX,
+// each direction's link is pinned to bpffs and the kernel holds the
+// program reference via the link until the pin is removed (cmdDel).
+// For HookClsact, the kernel holds the program reference via the
+// qdisc tree.
+func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, strategy []attachAttempt) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	ifIndex, restore, err := resolveIfIndex(args.Netns, args.IfName, side)
+	if err := os.MkdirAll(pinDir, 0o755); err != nil {
+		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
+	}
+
+	attemptErrs := make([]string, 0, len(strategy))
+	for _, attempt := range strategy {
+		err := tryAttachOne(args, ingressCfg, egressCfg, attempt)
+		if err == nil {
+			return nil
+		}
+		attemptErrs = append(attemptErrs, fmt.Sprintf("%s: %v", attempt, err))
+		logf("attach attempt %s failed: %v (continuing fallback)", attempt, err)
+	}
+	return fmt.Errorf("all attach attempts failed:\n  %s", strings.Join(attemptErrs, "\n  "))
+}
+
+// tryAttachOne does a single end-to-end attach attempt: resolve
+// ifindex, load BPF, configure, attach every requested direction,
+// pin maps. On any error it tears down anything it wrote (links,
+// pin files, the loaded Program) and returns the error to the
+// caller, who decides whether to fall through to the next attempt.
+func tryAttachOne(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, attempt attachAttempt) error {
+	ifIndex, restore, err := resolveIfIndex(args.Netns, args.IfName, attempt.side)
 	if err != nil {
 		return err
 	}
@@ -424,12 +466,6 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bp
 	prog, err := bpf.Load()
 	if err != nil {
 		return fmt.Errorf("load BPF: %w", err)
-	}
-	// Note: we don't defer prog.Close() — see attachBPF docstring.
-
-	if err := os.MkdirAll(pinDir, 0o755); err != nil {
-		_ = prog.Close()
-		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
 
 	type attachStep struct {
@@ -444,13 +480,9 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bp
 		steps = append(steps, attachStep{bpf.DirectionEgress, egressCfg})
 	}
 
-	// rollback removes pin files from previously-attached directions
-	// when a later step fails. The link itself gets closed by
-	// prog.Close(); this just keeps bpffs clean so the next ADD
-	// doesn't see stale pins.
 	rollback := func(upto int) {
 		for j := 0; j < upto; j++ {
-			path := pinPathFor(args.ContainerID, side, steps[j].dir)
+			path := pinPathFor(args.ContainerID, attempt.side, steps[j].dir)
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				fmt.Fprintf(os.Stderr, "natra: rollback remove %s: %v\n", path, err)
 			}
@@ -469,10 +501,10 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bp
 		}
 		opts := bpf.AttachOptions{
 			Direction: step.dir,
-			Side:      side,
-			Hook:      hook,
+			Side:      attempt.side,
+			Hook:      attempt.hook,
 			IfIndex:   ifIndex,
-			PinPath:   pinPathFor(args.ContainerID, side, step.dir),
+			PinPath:   pinPathFor(args.ContainerID, attempt.side, step.dir),
 		}
 		if err := prog.Attach(opts); err != nil {
 			rollback(i)
@@ -481,16 +513,11 @@ func attachBPF(args *skel.CmdArgs, ingressCfg, egressCfg *config.Config, hook bp
 		}
 	}
 
-	// Pin the maps so `natra dump-stats <containerID>` can read live
-	// stats and CMS counters from a separate process. Best-effort —
-	// pinning failure (EPERM in some environments) doesn't tear down
-	// the attachment.
 	if err := prog.PinMaps(pinDir, args.ContainerID); err != nil {
 		fmt.Fprintf(os.Stderr, "natra: map pin failed (%v) — continuing without debug pins\n", err)
 	}
-
 	for _, step := range steps {
-		announce(ifIndex, side, step.dir, step.cfg)
+		announce(ifIndex, attempt.side, step.dir, step.cfg)
 	}
 	return nil
 }
