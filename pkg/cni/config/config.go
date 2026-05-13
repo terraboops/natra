@@ -26,33 +26,41 @@ import (
 const maxRate = math.MaxInt64 / 2
 
 // Config is what the BPF program needs per Pod: token-bucket refill
-// rate, bucket capacity, and the CMS count above which a flow is
-// classified heavy (and so subject to the bucket).
+// rate, bucket capacity, and the CMS byte-volume above which a flow
+// is classified heavy (and so subject to the bucket).
 type Config struct {
 	Rate                 int64 // bytes/sec; 0 disables rate limiting
 	Burst                int64 // bytes; bucket capacity, also the largest single skb that can be admitted
-	HeavyHitterThreshold int64 // CMS estimate above which a flow goes through the bucket
+	HeavyHitterThreshold int64 // CMS byte estimate above which a flow goes through the bucket
 }
+
+// DefaultHHThresholdBytes is the static fallback for the heavy-hitter
+// threshold when no rate-scaled value is computed by the caller.
+// 256 KiB is well above any reasonable HTTP request body and below
+// what even a brief sustained TCP elephant accumulates (10 Mbps at
+// MTU = ~840 packets/s × ~150 ms to cross). The threshold's unit is
+// bytes since the BPF CMS counts byte volume per flow, not packets,
+// so the meaning is invariant to GRO super-packet coalescing.
+const DefaultHHThresholdBytes int64 = 256 * 1024
 
 // DefaultConfig returns the zero-rate baseline. Callers overwrite
 // Rate (and optionally Burst) from the parsed annotation.
 //
-// HeavyHitterThreshold defaults to 50. The threshold has to clear
-// not just a single flow's packet count but the noise floor of CMS
-// hash collisions — every cell accumulates fragments of every
-// flow that hashes to it. Profile data from realistic mixed-workload
-// traffic (~45K distinct flows in 30s) showed nonzero cells settling
-// at a mean of ~20 increments each; with threshold 10, most cells
-// trigger "heavy" by mid-test, and mice get false-positive classified
-// as heavy on their first packet.
+// HeavyHitterThreshold defaults to 256 KiB. The CMS counts BYTES so
+// a flow's estimate is its byte volume, GRO-invariant. The threshold
+// has to clear two things:
 //
-// 50 stays above the typical collision-noise floor while remaining
-// well below what a real elephant flow accumulates (~5000 cell-hits
-// in the same workload). GRO superpackets at the BPF layer can be
-// 5-30 TCP segments each, so 50 skbs corresponds to 250-1500 actual
-// packets — about 3ms of line-rate traffic at 1Gbps. Real elephants
-// cross that in their first burst; mice (a few skbs per HTTP
-// request) stay well under.
+//   - The CMS hash-collision noise floor. With CMS_WIDTH=32768 cells ×
+//     CMS_DEPTH=4 rows, the min-across-rows is robust to occasional
+//     collisions; the threshold doesn't need to be huge for that.
+//   - Real workload tail mice: HTTP requests up to several hundred KB
+//     of body, WebSocket frames, mid-sized API responses. 256 KiB is
+//     above the ~99th percentile of real HTTP request sizes.
+//
+// Above the threshold, a real elephant flow accumulates byte volume
+// rapidly — at 10 Mbps any single sustained flow crosses 256 KiB in
+// ~200 ms. The threshold catches them quickly while leaving tail
+// mice intact.
 //
 // Tunable per-pod via the extended JSON annotation form's
 // `heavyHitterThreshold` field, or cluster-wide via the conflist
@@ -60,7 +68,7 @@ type Config struct {
 // NATRA_DEFAULT_HH_THRESHOLD.
 func DefaultConfig() *Config {
 	return &Config{
-		HeavyHitterThreshold: 50,
+		HeavyHitterThreshold: DefaultHHThresholdBytes,
 	}
 }
 

@@ -57,7 +57,7 @@ func loadNatra(t *testing.T) (*ebpf.Collection, natraConfig, *ebpf.Program) {
 		t.Fatalf("instantiate: %v", err)
 	}
 	t.Cleanup(coll.Close)
-	cfg := natraConfig{RateBps: 1_250_000, BurstBytes: 64_000, HHThreshold: 10}
+	cfg := natraConfig{RateBps: 1_250_000, BurstBytes: 64_000, HHThreshold: 640} // 10 × 64-byte packets
 	zero := uint32(0)
 	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
@@ -81,7 +81,7 @@ func TestEdgePacketBiggerThanBurst(t *testing.T) {
 
 	// Override config: tiny burst (32 bytes), tiny rate (1 byte/sec).
 	// All "large" packets will be too big.
-	cfg := natraConfig{RateBps: 1, BurstBytes: 32, HHThreshold: 5}
+	cfg := natraConfig{RateBps: 1, BurstBytes: 32, HHThreshold: 320} // 5 × 64-byte packets
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny)
@@ -181,13 +181,14 @@ func TestEdgeIPv4WithOptions(t *testing.T) {
 func TestEdgeBurstZero(t *testing.T) {
 	coll, _, prog := loadNatra(t)
 
-	cfg := natraConfig{RateBps: 1_000_000, BurstBytes: 0, HHThreshold: 5}
+	cfg := natraConfig{RateBps: 1_000_000, BurstBytes: 0, HHThreshold: 320} // 5 × 64-byte packets
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{}, ebpf.UpdateAny)
 
 	pkt := edgeMkPkt(0x0A000001, 0x0A000002, 12345, 5201)
-	for i := 0; i < int(cfg.HHThreshold); i++ {
+	// Send enough packets to push the cell past threshold (5 × 64 = 320 = threshold).
+	for i := 0; i < 5; i++ {
 		_, _, _ = prog.Test(pkt)
 	}
 	ret, _, err := prog.Test(pkt)
@@ -210,14 +211,14 @@ func TestEdgeRapidConfigChange(t *testing.T) {
 	pkt := edgeMkPkt(0x0A000001, 0x0A000002, 12345, 5201)
 
 	// Step 1: high rate, low threshold. All packets pass.
-	cfg1 := natraConfig{RateBps: 1_000_000_000, BurstBytes: 1 << 30, HHThreshold: 5}
+	cfg1 := natraConfig{RateBps: 1_000_000_000, BurstBytes: 1 << 30, HHThreshold: 320} // 5 × 64
 	_ = cfgMap.Update(&zero, &cfg1, ebpf.UpdateAny)
 	for i := 0; i < 50; i++ {
 		_, _, _ = prog.Test(pkt)
 	}
 
 	// Step 2: zero burst, mid-flow. Any heavy hitter now drops.
-	cfg2 := natraConfig{RateBps: 1, BurstBytes: 0, HHThreshold: 5}
+	cfg2 := natraConfig{RateBps: 1, BurstBytes: 0, HHThreshold: 320} // 5 × 64
 	if err := cfgMap.Update(&zero, &cfg2, ebpf.UpdateAny); err != nil {
 		t.Fatalf("cfgMap update mid-flow: %v", err)
 	}
@@ -243,7 +244,7 @@ func TestEdgeRapidConfigChange(t *testing.T) {
 func TestEdgeBucketTokensClamp(t *testing.T) {
 	coll, _, prog := loadNatra(t)
 
-	cfg := natraConfig{RateBps: 1, BurstBytes: 100, HHThreshold: 1}
+	cfg := natraConfig{RateBps: 1, BurstBytes: 100, HHThreshold: 1} // 1 byte → every packet heavy
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	// Force tokens >> burst — should be clamped on first packet.
@@ -293,13 +294,13 @@ func TestEdgeCMSGrowsUnderTraffic(t *testing.T) {
 		}()
 	}
 
-	var lastMaxes []uint32
+	var lastMaxes []uint64
 	for sample := 0; sample < 20; sample++ {
-		var curMax uint32
+		var curMax uint64
 		for k := uint32(0); k < 131072; k++ {
 			var cell cmsCell
-			if err := cmsMap.Lookup(&k, &cell); err == nil && cell.Count > curMax {
-				curMax = cell.Count
+			if err := cmsMap.Lookup(&k, &cell); err == nil && cell.Bytes > curMax {
+				curMax = cell.Bytes
 			}
 		}
 		lastMaxes = append(lastMaxes, curMax)
@@ -315,10 +316,12 @@ func TestEdgeCMSGrowsUnderTraffic(t *testing.T) {
 }
 
 // cmsCell mirrors `struct cms_cell` in bpf/natra.bpf.c. The Linux
-// CMS map value is the 8-byte (count, last_decay_idx) tuple.
+// CMS map value is the 16-byte (bytes, last_decay_idx + 4 bytes
+// trailing pad) struct.
 type cmsCell struct {
-	Count        uint32
+	Bytes        uint64
 	LastDecayIdx uint32
+	_            uint32 // BPF struct alignment pad for u64 first field
 }
 
 // TestEdgeJumboPacket — modern Linux paths produce GRO superpackets up
@@ -331,7 +334,7 @@ type cmsCell struct {
 // to an actual qdisc and packet length isn't capped by the test harness.
 func TestEdgeJumboPacket(t *testing.T) {
 	coll, _, prog := loadNatra(t)
-	cfg := natraConfig{RateBps: 100_000_000, BurstBytes: 200_000, HHThreshold: 5}
+	cfg := natraConfig{RateBps: 100_000_000, BurstBytes: 200_000, HHThreshold: 15000} // 5 × 3000-byte jumbo packets
 	zero := uint32(0)
 	_ = coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny)
 	_ = coll.Maps["natra_bucket_map"].Update(&zero, &tokenBucket{Tokens: cfg.BurstBytes}, ebpf.UpdateAny)
@@ -357,10 +360,11 @@ func TestEdgeJumboPacket(t *testing.T) {
 	}
 }
 
-// TestEdgeCounterOverflow — drive a CMS cell to wrap around u32 max.
-// The cell counts in u32; after 2^32 increments it wraps to 0. We
-// can't realistically send 4 billion packets in a test, but we CAN
-// pre-set a cell to near-max via cmsMap.Update and watch it wrap.
+// TestEdgeCounterOverflow — drive a CMS cell to wrap around u64 max.
+// The cell counts bytes in u64; after 2^64 bytes (16 exabytes) it
+// wraps to 0. We can't realistically transfer 16 EB in a test, but
+// we CAN pre-set a cell to near-max via cmsMap.Update and watch it
+// wrap.
 //
 // Asserts: BPF program doesn't panic and STAT_HH_HITS reflects the
 // truth (a wrapped flow correctly stays heavy because at least one
@@ -372,13 +376,13 @@ func TestEdgeCounterOverflow(t *testing.T) {
 	coll, _, prog := loadNatra(t)
 	cmsMap := coll.Maps["natra_cms_map"]
 
-	// Pre-set every CMS cell to (max - 5) so 6 increments wrap.
+	// Pre-set every CMS cell to (max - 320) so 6 64-byte packets wrap.
 	// last_decay_idx is set to a far-future value (uint32 max - 1)
 	// so the lazy-decay check `now_idx > cell->last_decay_idx`
 	// evaluates false and decay does not fire — otherwise the
 	// first packet would reset the count to 0 and we'd never see
 	// wraparound.
-	preset := cmsCell{Count: 0xFFFFFFFF - 5, LastDecayIdx: 0xFFFFFFFE}
+	preset := cmsCell{Bytes: 0xFFFFFFFFFFFFFFFF - 320, LastDecayIdx: 0xFFFFFFFE}
 	for k := uint32(0); k < 131072; k++ {
 		if err := cmsMap.Update(&k, &preset, ebpf.UpdateAny); err != nil {
 			t.Fatalf("cms[%d] preset: %v", k, err)

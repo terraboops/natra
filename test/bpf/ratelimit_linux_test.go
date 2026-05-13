@@ -379,12 +379,13 @@ func TestNatraCMSMiceFlowsBypassTokenBucket(t *testing.T) {
 	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
 	for _, dc := range directionCases(progIngress, progEgress) {
 		t.Run(dc.name, func(t *testing.T) {
-			// Threshold = 100 means the first 100 packets of any single flow
-			// pass for free; only the 101st onward go through the token bucket.
+			// Threshold = 6400 bytes (≈100 × 64-byte packets) means the
+			// first 100 packets of any single flow pass for free; only the
+			// 101st onward go through the token bucket.
 			cfg := natraConfig{
 				RateBps:     1, // crippled rate — if any mouse traffic hits the
 				BurstBytes:  1, // bucket, it would be throttled. None should.
-				HHThreshold: 100,
+				HHThreshold: 6400,
 			}
 			key := dc.mapKey
 			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
@@ -432,8 +433,8 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 		t.Run(dc.name, func(t *testing.T) {
 			cfg := natraConfig{
 				RateBps:     1,
-				BurstBytes:  64, // exactly one packet's worth
-				HHThreshold: 10, // 11th packet onward is "heavy"
+				BurstBytes:  64,  // exactly one packet's worth
+				HHThreshold: 640, // 10 × 64-byte packets fits; 11th crosses
 			}
 			key := dc.mapKey
 			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
@@ -448,7 +449,7 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 			beforeThrottled := readPerCPUStat(t, statsMap, dc.statKey(statThrottled))
 
 			pkt := synthEthIPpktFromFlow(0x0A000001, 0x0A000002, 12345, 5201)
-			// First 10 packets: count goes 1..10, none > threshold(10) → mice.
+			// First 10 packets: cumulative bytes 64..640, all ≤ threshold → mice.
 			for i := 0; i < 10; i++ {
 				ret, _, err := dc.prog.Test(pkt)
 				if err != nil {
@@ -462,8 +463,8 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 				t.Errorf("after first 10 packets STAT_HH_HITS delta=%d, want 0", got)
 			}
 
-			// 11th packet (count=11 > 10): heavy. Burst=64 admits this packet,
-			// so it's logged as a heavy-hitter PASS.
+			// 11th packet (cumulative=704 > 640): heavy. Burst=64 admits
+			// this packet, so it's logged as a heavy-hitter PASS.
 			ret, _, err := dc.prog.Test(pkt)
 			if err != nil {
 				t.Fatalf("packet 11: %v", err)
@@ -472,10 +473,10 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 				t.Errorf("11th packet ret=%d, want 0 (TC_ACT_OK; bucket has 64 tokens)", ret)
 			}
 
-			// 12th packet (count=12, still heavy): bucket empty (one packet
-			// drained it), rate is 1 byte/sec so micro-second elapsed adds
-			// nothing. Over-rate verdict differs per direction — egress
-			// paces via EDT, ingress drops.
+			// 12th packet (cumulative=768, still heavy): bucket empty
+			// (one packet drained it), rate is 1 byte/sec so micro-second
+			// elapsed adds nothing. Over-rate verdict differs per
+			// direction — egress paces via EDT, ingress drops.
 			wantRet, wantStat := throttleVerdict(dc.dir)
 			beforeDisp := readPerCPUStat(t, statsMap, dc.statKey(wantStat))
 

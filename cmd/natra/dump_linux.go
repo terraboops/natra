@@ -100,20 +100,21 @@ func dumpStats(args []string) error {
 	// a single histogram summary across both halves; per-direction
 	// breakdown isn't worth the verbosity here.
 	//
-	// Each cell is `struct cms_cell { u32 count; u32 last_decay_idx; }`
-	// — see bpf/natra.bpf.c. We only summarize count; last_decay_idx
-	// is debugging detail and not interesting in aggregate.
+	// Each cell is `struct cms_cell { u64 bytes; u32 last_decay_idx; }`
+	// — see bpf/natra.bpf.c. We only summarize the byte counter;
+	// last_decay_idx is debugging detail and not interesting in aggregate.
 	cmsMap, err := open("cms")
 	if err == nil {
 		defer func() { _ = cmsMap.Close() }()
 		var (
 			zeros, nonZero int
-			max, total     uint32
+			max, total     uint64
 		)
 		for i := uint32(0); ; i++ {
 			var cell struct {
-				Count        uint32
+				Bytes        uint64
 				LastDecayIdx uint32
+				_            uint32
 			}
 			if err := cmsMap.Lookup(&i, &cell); err != nil {
 				if strings.Contains(err.Error(), "no such key") || strings.Contains(err.Error(), "no such file") {
@@ -121,17 +122,17 @@ func dumpStats(args []string) error {
 				}
 				return fmt.Errorf("cms[%d]: %w", i, err)
 			}
-			if cell.Count == 0 {
+			if cell.Bytes == 0 {
 				zeros++
 			} else {
 				nonZero++
-				if cell.Count > max {
-					max = cell.Count
+				if cell.Bytes > max {
+					max = cell.Bytes
 				}
-				total += cell.Count
+				total += cell.Bytes
 			}
 		}
-		fmt.Printf("cms: zeros=%d nonzero=%d max_count=%d total_increments=%d\n", zeros, nonZero, max, total)
+		fmt.Printf("cms: zeros=%d nonzero=%d max_bytes=%d total_bytes=%d\n", zeros, nonZero, max, total)
 	}
 
 	// Self-check: pin path stats can drift from /sys/fs/bpf/natra layout.

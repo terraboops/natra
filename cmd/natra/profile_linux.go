@@ -61,10 +61,10 @@ type podSnapshot struct {
 	ContainerID   string                  `json:"container_id"`
 	Configs       map[string]configRecord `json:"configs"`   // keyed by "ingress"/"egress"
 	Stats         map[string]statRecord   `json:"stats"`     // keyed by "ingress"/"egress"
-	CMSZeros      int                     `json:"cms_zeros"` // cells with count=0
+	CMSZeros      int                     `json:"cms_zeros"` // cells with bytes=0
 	CMSNonZero    int                     `json:"cms_nonzero"`
-	CMSMaxCount   uint32                  `json:"cms_max_count"`
-	CMSTotalCount uint64                  `json:"cms_total_count"`
+	CMSMaxBytes   uint64                  `json:"cms_max_bytes"`
+	CMSTotalBytes uint64                  `json:"cms_total_bytes"`
 	BucketTokens  map[string]uint64       `json:"bucket_tokens"` // keyed by direction
 }
 
@@ -307,13 +307,15 @@ func readPodMaps(containerID string, paths map[string]string) podSnapshot {
 
 	if p, ok := paths["cms"]; ok {
 		if m, err := ebpf.LoadPinnedMap(p, nil); err == nil {
-			// Each cell is `struct cms_cell { u32 count; u32 last_decay_idx; }`
-			// per bpf/natra.bpf.c. We summarize count; last_decay_idx
-			// is per-cell aging state, not aggregated here.
+			// Each cell is `struct cms_cell { u64 bytes; u32 last_decay_idx; }`
+			// per bpf/natra.bpf.c (total 16 bytes after u64 alignment).
+			// We summarize the byte counter; last_decay_idx is per-cell
+			// aging state, not aggregated here.
 			for i := uint32(0); ; i++ {
 				var cell struct {
-					Count        uint32
+					Bytes        uint64
 					LastDecayIdx uint32
+					_            uint32
 				}
 				err := m.Lookup(&i, &cell)
 				if err != nil {
@@ -322,14 +324,14 @@ func readPodMaps(containerID string, paths map[string]string) podSnapshot {
 					}
 					break
 				}
-				if cell.Count == 0 {
+				if cell.Bytes == 0 {
 					snap.CMSZeros++
 				} else {
 					snap.CMSNonZero++
-					if cell.Count > snap.CMSMaxCount {
-						snap.CMSMaxCount = cell.Count
+					if cell.Bytes > snap.CMSMaxBytes {
+						snap.CMSMaxBytes = cell.Bytes
 					}
-					snap.CMSTotalCount += uint64(cell.Count)
+					snap.CMSTotalBytes += cell.Bytes
 				}
 			}
 			_ = m.Close()

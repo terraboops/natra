@@ -102,7 +102,7 @@ func TestMalformedPackets(t *testing.T) {
 
 	// Even with a real config (not the fail-open path), malformed
 	// packets must pass through.
-	cfg := natraConfig{RateBps: 1_250_000, BurstBytes: 64_000, HHThreshold: 10}
+	cfg := natraConfig{RateBps: 1_250_000, BurstBytes: 64_000, HHThreshold: 640} // 10 × 64-byte packets
 	zero := uint32(0)
 	if err := coll.Maps["natra_config_map"].Update(&zero, &cfg, ebpf.UpdateAny); err != nil {
 		t.Fatalf("config: %v", err)
@@ -297,21 +297,22 @@ func TestMapCapacityOOM(t *testing.T) {
 
 	// Sanity: the CMS map is still queryable (no kernel-side corruption)
 	// and contains values within u32 range (no overflow). Cells are
-	// `struct cms_cell { u32 count; u32 last_decay_idx; }` — see
-	// bpf/natra.bpf.c.
+	// `struct cms_cell { u64 bytes; u32 last_decay_idx; }` — see
+	// bpf/natra.bpf.c. Total 16 bytes per cell after u64-alignment pad.
 	cmsMap := coll.Maps["natra_cms_map"]
-	var maxV uint32
+	var maxV uint64
 	// 131072 = CMS_WIDTH (32768) × CMS_DEPTH (4) cells per direction.
 	for i := uint32(0); i < 131072; i++ {
 		var cell struct {
-			Count        uint32
+			Bytes        uint64
 			LastDecayIdx uint32
+			_            uint32
 		}
 		if err := cmsMap.Lookup(&i, &cell); err != nil {
 			t.Fatalf("cms[%d]: %v", i, err)
 		}
-		if cell.Count > maxV {
-			maxV = cell.Count
+		if cell.Bytes > maxV {
+			maxV = cell.Bytes
 		}
 	}
 	if maxV == 0 {

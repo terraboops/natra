@@ -182,14 +182,14 @@ func scenarioOneElephant(t *testing.T, dir bpf.Direction) {
 			collMapNames(coll), collProgNames(coll))
 	}
 
-	// 10 Mbps = 1.25 MB/s in BPF units. hh_threshold=10 so the elephant
-	// goes heavy almost immediately. Burst sized to one second of
-	// throughput so a 100k-iteration loop can't satisfy itself from
-	// burst alone.
+	// 10 Mbps = 1.25 MB/s in BPF units. hh_threshold=640 bytes (10 ×
+	// 64-byte packets) so the elephant goes heavy almost immediately.
+	// Burst sized to one second of throughput so a 100k-iteration loop
+	// can't satisfy itself from burst alone.
 	cfg := natraConfig{
 		RateBps:     1_250_000,
 		BurstBytes:  1_250_000,
-		HHThreshold: 10,
+		HHThreshold: 640,
 	}
 	key := uint32(dir)
 	if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
@@ -318,7 +318,7 @@ func TestScenarioThousandMice(t *testing.T) {
 	cfg := natraConfig{
 		RateBps:     1, // crippled — any mouse hitting the bucket would drop
 		BurstBytes:  1,
-		HHThreshold: 100, // generous; 5 packets per flow stays well under
+		HHThreshold: 6400, // 100 × 64-byte packets; 5 packets/flow well under
 	}
 	dir := bpf.DirectionIngress
 	key := uint32(dir)
@@ -387,13 +387,14 @@ func TestScenarioMixed(t *testing.T) {
 	}
 	t.Cleanup(coll.Close)
 
-	// Real natra rate, real burst. Threshold low enough that the
-	// elephant crosses it within the first few packets but high enough
-	// that 5-packet mice never approach it.
+	// Real natra rate, real burst. Threshold (640 B = 10 × 64-byte
+	// packets) low enough that the elephant crosses it within the first
+	// few packets but high enough that 5-packet mice (320 B) never
+	// approach it.
 	cfg := natraConfig{
 		RateBps:     1_250_000, // 10 Mbps in bytes/sec
 		BurstBytes:  64_000,    // small enough that elephant exhausts it
-		HHThreshold: 10,
+		HHThreshold: 640,
 	}
 	dir := bpf.DirectionIngress
 	key := uint32(dir)
@@ -538,7 +539,7 @@ func runMixed(t *testing.T, bpfObject string, isNatra bool, dir bpf.Direction) m
 	// does with each packet.
 	const rateBps = 1_250_000 // 10 Mbps in bytes/sec
 	const burstBytes = 64_000 // small bucket → elephant exhausts it quickly
-	const hhThreshold = 10    // ignored by vanilla; natra uses it
+	const hhThreshold = 640   // 10 × 64-byte packets; ignored by vanilla
 	key := uint32(dir)
 
 	if isNatra {

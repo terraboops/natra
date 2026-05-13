@@ -132,37 +132,44 @@ struct {
 	__uint(max_entries, DIR_MAX);
 } natra_bucket_map SEC(".maps");
 
-// CMS cell holds a count plus a decay-interval index. Lazy aging:
-// each cell-access reads the cell's last_decay_idx, computes how
-// many decay intervals have elapsed since, right-shifts the count by
-// that many (capped at 32 to avoid UB), and updates last_decay_idx
-// to the current time. Recent elephants keep climbing faster than
-// decay reduces (they re-increment on every packet); dormant cells
-// fade lazily the next time they're touched.
+// CMS cell holds a byte counter plus a decay-interval index. Lazy
+// aging: each cell-access reads the cell's last_decay_idx, computes
+// how many decay intervals have elapsed since, right-shifts the
+// counter by that many (capped at 63 to avoid UB), and updates
+// last_decay_idx to the current time. Recent elephants keep climbing
+// faster than decay reduces (they re-increment on every packet);
+// dormant cells fade lazily the next time they're touched.
 //
-// last_decay_idx uses CMS_DECAY_INTERVAL_NS as its unit and stores as
-// u32, wrapping every ~hundreds of years at the chosen interval —
-// fine.
+// We count BYTES, not packets, so the heavy-hitter threshold is in
+// bytes and GRO-invariant — packet-count CMS classified differently
+// depending on whether GRO had coalesced packets into 64 KB super-
+// packets (host-side attach) vs raw 1500-byte packets (pod-side
+// egress). With bytes the threshold means the same thing regardless
+// of attach mode. ACK-only flows correctly stay mice (tiny byte
+// volume) instead of crossing threshold from sheer packet count.
 //
-// Cost vs the prior u32-only cell: doubles memory (32 KiB → 64 KiB
-// per pod) and adds ~10 extra instructions per cell hit. Per packet
-// (4 rows × 1 cell each) that's ~40 instructions. Negligible.
+// u64 counter handles 4 GB+ accumulation without wraparound; u32
+// would wrap in ~4 seconds at 10 Gbps line rate (faster than the
+// decay window), corrupting classification mid-flow.
 //
-// We intentionally don't use atomics on the count anymore. The CMS
-// is approximate by design; lost increments under cross-CPU race
-// give slightly conservative classification (an elephant takes one
-// extra packet to be marked heavy), which is the safe direction.
+// last_decay_idx uses CMS_DECAY_INTERVAL_NS as its unit and stores
+// as u32, wrapping every ~hundreds of years at the chosen interval.
+//
+// CMS counters are non-atomic by design. Lost increments under
+// cross-CPU race give slightly conservative classification (an
+// elephant takes one extra packet to be marked heavy), which is the
+// safe direction.
 //
 // CMS_DECAY_INTERVAL_NS is intentionally a power of two so the
 // `now_ns / CMS_DECAY_INTERVAL_NS` reduces to a right-shift in the
-// BPF JIT. (1 << 36) ns ≈ 68.7 s — close enough to the prior 60 s
-// decay window that the behavior is indistinguishable; the trade is
-// one shift instead of an integer division per packet. Stays well
+// BPF JIT. (1 << 36) ns ≈ 68.7 s — close enough to a 60 s decay
+// window that the behavior is indistinguishable; the trade is one
+// shift instead of an integer division per packet. Stays well
 // inside u32 wrap (2^32 ticks × 68.7 s ≈ 9300 years).
 #define CMS_DECAY_INTERVAL_NS (1ULL << 36)
 
 struct cms_cell {
-	__u32 count;
+	__u64 bytes;
 	__u32 last_decay_idx;
 };
 
@@ -240,22 +247,25 @@ static __always_inline __u32 cms_hash(const struct flow_key *k, __u32 seed)
 }
 
 // Update all CMS_DEPTH counters in `dir`'s half of the array and
-// return the post-increment min across rows (CMS estimator).
+// return the post-increment min across rows (CMS estimator). The
+// counter unit is BYTES — callers pass skb->len so a flow's CMS
+// estimate accumulates its byte volume, not its packet count.
 //
 // Lazy aging: before incrementing, fade the cell by 2^elapsed (where
-// elapsed is in CMS_DECAY_INTERVAL_NS units). cell->count >> elapsed
-// is the post-decay value; we cap shift at 32 because >>32 on u32 is
+// elapsed is in CMS_DECAY_INTERVAL_NS units). cell->bytes >> elapsed
+// is the post-decay value; we cap shift at 63 because >=64 on u64 is
 // undefined behavior. last_decay_idx advances to now_idx so the next
 // access measures from here, not from the original last-seen.
 //
 // `now_idx` is computed once per packet (callers pass it in) so all
 // four cells see a consistent timestamp.
-static __always_inline __u32 cms_update_and_min(__u32 dir,
+static __always_inline __u64 cms_update_and_min(__u32 dir,
 						const struct flow_key *k,
-						__u32 now_idx)
+						__u32 now_idx,
+						__u64 bytes)
 {
 	__u32 base = dir * (CMS_WIDTH * CMS_DEPTH);
-	__u32 mn = 0xffffffffu;
+	__u64 mn = 0xffffffffffffffffULL;
 	#pragma unroll
 	for (int row = 0; row < CMS_DEPTH; row++) {
 		__u32 h = cms_hash(k, cms_seeds[row]);
@@ -269,14 +279,14 @@ static __always_inline __u32 cms_update_and_min(__u32 dir,
 		if (now_idx > cell->last_decay_idx)
 			elapsed = now_idx - cell->last_decay_idx;
 
-		__u32 next = cell->count;
-		if (elapsed >= 32)
+		__u64 next = cell->bytes;
+		if (elapsed >= 64)
 			next = 0;
 		else if (elapsed > 0)
 			next >>= elapsed;
-		next += 1;
+		next += bytes;
 
-		cell->count = next;
+		cell->bytes = next;
 		if (elapsed > 0)
 			cell->last_decay_idx = now_idx;
 
@@ -454,8 +464,9 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 	__u64 now_ns = bpf_ktime_get_ns();
 	__u32 now_idx = (__u32)(now_ns / CMS_DECAY_INTERVAL_NS);
 
-	__u32 count = cms_update_and_min(dir, &k, now_idx);
-	if (count <= cfg->hh_threshold) {
+	__u64 len = skb->len;
+	__u64 bytes_est = cms_update_and_min(dir, &k, now_idx, len);
+	if (bytes_est <= cfg->hh_threshold) {
 		// Mouse: fast pass with no lock. Low-volume traffic stays
 		// at line rate even when an elephant exists on the same pod.
 		bump_stat(dir, STAT_PASSED);
@@ -464,7 +475,6 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 
 	// Heavy hitter — token bucket gate.
 	bump_stat(dir, STAT_HH_HITS);
-	__u64 len = skb->len;
 	if (consume_tokens(dir, len, cfg->rate_bps, cfg->burst_bytes, now_ns)) {
 		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
