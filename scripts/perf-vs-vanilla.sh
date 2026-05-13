@@ -424,6 +424,24 @@ run_mixed_workload() {
         stop_profile_collector "$cluster" "$tag"
     fi
 
+    # Sanity-fence every output value: if any kubectl exec died and
+    # produced a non-numeric token (e.g. "OCI runtime exec failed:
+    # container is not running"), the caller's `read` would treat
+    # the multi-word error as field separators and corrupt every
+    # downstream variable — a single error reads as "OCI runtime
+    # exec failed: ..." spilled across 10 variables. Validate each
+    # is a number; emit 0 + a stderr warning if not, so the caller's
+    # echo prints zeros instead of fragments of an error message.
+    is_num() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; }
+    local v
+    for v in iperf_ing iperf_eg pod_rps pod_p50 pod_p99 pod_total \
+             by_rps by_p50 by_p99 by_total; do
+        if ! is_num "${!v}"; then
+            echo "warn: $tag mixed: $v not numeric (${!v}) — defaulting to 0" >&2
+            printf -v "$v" 0
+        fi
+    done
+
     echo "$iperf_ing $iperf_eg $pod_rps $pod_p50 $pod_p99 $pod_total $by_rps $by_p50 $by_p99 $by_total"
 }
 
