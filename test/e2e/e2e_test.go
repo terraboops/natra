@@ -198,9 +198,16 @@ var _ = BeforeSuite(func() {
 			GinkgoWriter.Printf("%s\n", out)
 		}
 		dump("kubectl get pods", "kubectl", "get", "pods", "-n", namespace, "-o", "wide")
+		dump("kubectl describe pod iperf-server (CNI Warnings here)", "kubectl", "describe", "pod", "iperf-server", "-n", namespace)
+		dump("kubectl events -n natra-e2e", "kubectl", "get", "events", "-n", namespace,
+			"--sort-by=.lastTimestamp", "-o", "wide")
 		dump("install init-container logs", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "-c", "install", "--tail=80")
 		dump("conflist on agent node", "docker", "exec", "k3d-"+clusterName+"-agent-0", "sh", "-c",
 			"ls /var/lib/rancher/k3s/agent/etc/cni/net.d && cat /var/lib/rancher/k3s/agent/etc/cni/net.d/*.conflist 2>/dev/null")
+		dump("natra CNI log on agent node", "docker", "exec", "k3d-"+clusterName+"-agent-0", "sh", "-c",
+			"tail -100 /var/log/natra-cni.log 2>/dev/null || echo '(no natra log)'")
+		dump("natra binary caps", "docker", "exec", "k3d-"+clusterName+"-agent-0", "sh", "-c",
+			"ls -l /var/lib/rancher/k3s/data/cni/natra && getcap /var/lib/rancher/k3s/data/cni/natra 2>&1 || true")
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
 
