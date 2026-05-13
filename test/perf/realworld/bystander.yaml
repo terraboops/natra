@@ -1,0 +1,34 @@
+# Bystander pod for the mixed workload: an unannotated nginx that
+# shares the worker node (and thus the worker veth + uplink) with
+# perf-server. Captures the "real" production scenario where only
+# the elephant is annotated — small request-response workloads on
+# neighboring pods should be unaffected by either plugin.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bystander
+  namespace: natra-e2e
+  labels:
+    app: bystander
+  # Intentionally no kubernetes.io/{ingress,egress}-bandwidth here.
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: PERF_WORKER_NODE
+  containers:
+    - name: nginx
+      image: nginx:1.27-alpine
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bystander
+  namespace: natra-e2e
+spec:
+  selector:
+    app: bystander
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

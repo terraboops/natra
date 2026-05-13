@@ -1,23 +1,29 @@
 # natra vs. upstream bandwidth — head-to-head
 
-Real-cluster comparison between natra and the upstream
-`containernetworking/plugins/bandwidth` plugin. Two workloads are run
-against each plugin:
+Real-cluster comparison across three configurations:
 
-1. **iperf-only** — characterizes elephant-flow rate-limiting in both
-   directions.
-2. **realistic mixed** — runs an iperf3 `--bidir` elephant alongside
-   concurrent `hey` HTTP load against an nginx in the same server
-   pod. Each hey request is a fresh TCP connection (no keep-alive),
-   so it stays under natra's heavy-hitter threshold. This is the
-   workload natra is designed for; it's what exercises CMS fast-pass
-   against vanilla HTB's flow-agnostic bucket.
+1. **baseline** — kindnet alone, no rate-limiting plugin chained.
+   The bandwidth annotations on `perf-server` are present but
+   nothing acts on them; this is the "unaided cluster" floor.
+2. **natra** — kindnet + natra chained.
+3. **upstream `bandwidth`** — kindnet + `containernetworking/plugins`
+   bandwidth plugin chained.
+
+Two workloads are run against each:
+
+1. **iperf-only** — characterizes elephant-flow rate-limiting in
+   both directions.
+2. **mixed** — an iperf3 `--bidir` elephant against an annotated
+   pod, plus two parallel `hey` HTTP runs: one against the same
+   annotated pod (annotated mice — share the bucket), one against
+   a separate unannotated bystander pod on the same node
+   (bystander mice — should be untouched by either plugin).
 
 Run with:
 
 ```bash
 make perf-vs-vanilla
-# ~15 min, two kind clusters in sequence
+# ~18-22 min, three kind clusters in sequence
 cat docs/perf-vs-vanilla-result.txt
 ```
 
@@ -26,15 +32,17 @@ mode for the comparison via `NATRA_PERF_ATTACH_MODE=clsact-podside`.
 
 ## Setup
 
-Two kind clusters, identical config:
+Three kind clusters, identical topology:
 
 - 2 nodes (control-plane + worker), kindnet as main CNI
-- Server pinned to worker with both
-  `kubernetes.io/ingress-bandwidth: "10M"` and
-  `kubernetes.io/egress-bandwidth: "10M"`; client on control-plane
-  (cross-node traffic over kindnet's bridge + tunnel)
-- Cluster A chains natra after kindnet; Cluster B chains the upstream
-  `bandwidth` plugin after kindnet
+- `perf-server` pinned to worker, annotated
+  `kubernetes.io/ingress-bandwidth: "10M"` + `egress-bandwidth: "10M"`;
+  runs iperf3 + nginx
+- `bystander` pinned to worker, **no annotations**; runs nginx only
+- `perf-client` on control-plane (cross-node traffic over kindnet's
+  bridge + tunnel)
+- Cluster 0: kindnet only. Cluster A chains natra; cluster B chains
+  the upstream `bandwidth` plugin.
 
 For Cluster B, the test fetches the upstream `bandwidth` binary from
 the `containernetworking/plugins` v1.5.1 release (kind nodes ship a
@@ -70,14 +78,17 @@ iperf3 against an iperf3-only server, four phases per cluster:
 Receiver-side aggregate goodput from
 `end.sum_received.bits_per_second`.
 
-### Most recent run (colima 6.8.0-64-generic, aarch64)
+Numbers from the latest run live in `docs/perf-vs-vanilla-result.txt`;
+this doc explains what each column is measuring rather than carrying
+a snapshot that drifts on every rerun.
 
-| Direction | Plugin                | Elephant     | Mice (20× parallel)  |
-|-----------|-----------------------|--------------|----------------------|
-| ingress   | natra                 | 12.14 Mbps   | 36.79 Mbps           |
-| ingress   | upstream `bandwidth`  | 10.04 Mbps   |  9.59 Mbps           |
-| egress    | natra                 | 12.16 Mbps   | 38.99 Mbps           |
-| egress    | upstream `bandwidth`  | 10.12 Mbps   |  9.61 Mbps           |
+For Workload 1, expect roughly:
+
+- baseline: elephant and 20-parallel mice both at kindnet line rate
+  (hundreds of Mbps; whatever the runner allows)
+- vanilla: elephant ~10 Mbps, mice ~10 Mbps (HTB shares the bucket)
+- natra: elephant ~12 Mbps, mice ~30-40 Mbps (CMS fast-passes new
+  streams until each one's per-flow count crosses threshold)
 
 The single-stream elephant lands within ~21% of the 10 Mbps cap
 under natra and exactly at cap under vanilla.
@@ -96,56 +107,59 @@ classify as heavy and hit the bucket. Twenty parallel iperf streams
 is neither real mice nor a real elephant; this column is a synthetic
 in-between case kept around to document the threshold trade-off.
 
-## Workload 2: realistic mixed (elephant + HTTP mice)
+## Workload 2: mixed (elephant + annotated mice + bystander mice)
 
-One server pod runs both iperf3 (port 5201) and nginx (port 80,
-default ~600B index). Client (a pod with both iperf3 and `hey`
-installed) runs:
+Three pods on the same kind cluster:
 
-- `iperf3 --bidir` for 30s — one elephant flow in each direction.
-  Drains the ingress and egress buckets.
-- After 5s of warmup, `hey -c 50 -z 20s -disable-keepalive
-  http://server/` — each request opens a fresh TCP connection
-  (new 5-tuple → new flow_key) with ~5-7 packets total. Stays well
-  under natra's heavy-hitter threshold of 10.
+- `perf-server` (annotated 10M/10M, runs iperf3 + nginx, pinned
+  to worker)
+- `bystander` (no annotations, runs nginx, pinned to worker)
+- `perf-client` (iperf3 + hey, pinned to control-plane)
 
-### Most recent run
+Client traffic, concurrent for `MIXED_HEY_DURATION` (~20s):
 
-| Plugin               | Iperf ingress | Iperf egress | Hey RPS | Hey p50 | Hey p99 |
-|----------------------|---------------|--------------|---------|---------|---------|
-| natra                |  9.23 Mbps    |  5.13 Mbps   | **4426**|  1.1 ms |  208 ms |
-| upstream `bandwidth` | 10.59 Mbps    |  8.32 Mbps   |     12  |  4.8 s  |  5.0 s  |
+- `iperf3 --bidir` for 30s against `perf-server` — one elephant flow
+  in each direction. Drains the ingress and egress buckets.
+- After 5s of warmup, two parallel `hey -c 50 -z 20s
+  -disable-keepalive` runs — one to `perf-server`, one to
+  `bystander`. Each request opens a fresh TCP connection (new
+  5-tuple → new flow_key) with ~5-7 packets total. Well under
+  natra's heavy-hitter threshold of 50.
 
-**Hey RPS 369× higher under natra, p99 24× lower, p50 4400× lower.**
+Three things to read out of the result table:
 
-Both plugins land at-or-below 10 Mbps for the iperf elephant in
-both directions — bandwidth annotation honored.
+1. **Elephant ingress/egress.** The headline rate-limit guarantee.
+   Baseline shows kindnet line rate; both plugins land at-or-below
+   10 Mbps.
+2. **Annotated mice (perf-server) RPS / p99.** What the plugin does
+   to small flows *sharing the elephant's pod budget*. This is
+   natra's design wedge: CMS classification lets the mice fast-pass
+   the bucket. Under vanilla HTB, everything queues together so
+   hey latency tracks the elephant. Baseline is the un-throttled
+   ceiling.
+3. **Bystander mice (unannotated, same node) RPS / p99.** What the
+   plugin does to a neighboring unannotated pod. Both natra and
+   vanilla leave unannotated pods alone (no BPF / no HTB attached),
+   so the bystander row should look ≈ baseline under all three
+   configurations. This is the "natra is a no-op for the rest of
+   the cluster" assertion; if natra ever regresses to charging
+   every pod, this column drops.
 
-The difference is what they do to the small HTTP requests competing
-for that same 10 Mbps budget:
+Numbers from the latest run are in `docs/perf-vs-vanilla-result.txt`.
+The qualitative shape to expect:
 
-- **369× more requests/sec under natra** (4426 vs 12). Each hey
-  request that arrives uses a new 5-tuple, so its per-flow CMS
-  count stays below the heavy-hitter threshold and the bucket is
-  bypassed entirely. Under vanilla every packet — large iperf
-  payload or tiny HTTP request — enters the same HTB queue, so
-  hey waits its turn behind the elephant.
-- **p50 ≈ instant under natra, 4.8 seconds under vanilla**. The
-  natra p50 of 1.1 ms is essentially "as fast as the network can
-  go"; vanilla's 4.8 s is the time a request spends sitting in
-  HTB's queue waiting for token-rationed bandwidth ahead of it.
-- **p99 ~208 ms under natra** because there are tail events — a
-  hey burst can briefly inflate a flow's CMS estimate via
-  collisions with the elephant's flow_key, and those tail requests
-  do hit the bucket. Vanilla's p99 of 5.0 s is the queue reaching
-  its drop limit.
+- Elephant: ~line rate under baseline, ~10 Mbps under natra and
+  vanilla.
+- Annotated mice: ~line rate under baseline, very high (thousands
+  of RPS, sub-second p99) under natra, very low (single-digit RPS,
+  multi-second p99) under vanilla.
+- Bystander mice: ~line rate under all three.
 
-natra's iperf throughput under mixed comes in below 10 Mbps because
-when hey *does* hit the bucket (CMS collisions, occasional
+The mixed iperf throughput under natra comes in below 10 Mbps
+because when hey *does* hit the bucket (CMS collisions, occasional
 above-threshold bursts on a connection), it consumes tokens iperf
-would otherwise have. That's the right trade-off for this design —
-the headline guarantee is "annotated rate is the ceiling," not
-"the annotated rate is always reached."
+would otherwise have. The headline guarantee is "annotated rate is
+the ceiling," not "the annotated rate is always reached."
 
 ## Reproduce
 

@@ -1,28 +1,30 @@
 #!/usr/bin/env bash
-# Real-cluster head-to-head: natra vs upstream containernetworking/plugins/bandwidth.
+# Real-cluster head-to-head: baseline (no plugin) vs natra vs upstream
+# containernetworking/plugins/bandwidth.
 #
-# Spins up two kind clusters in sequence (one with natra chained behind
-# kindnet, one with the upstream bandwidth plugin chained behind
-# kindnet). Runs two workloads per cluster:
+# Spins up three kind clusters in sequence:
+#   - Phase 0: kindnet alone, no rate-limiting plugin (baseline floor)
+#   - Phase A: kindnet + natra chained
+#   - Phase B: kindnet + upstream bandwidth chained
+#
+# Two workloads per cluster:
 #
 #   1. iperf-only (legacy). Four phases: ingress/egress × elephant/mice.
 #      The "mice" here are iperf3 -P 20 — 20 parallel long-lived TCP
-#      flows. Useful to characterize bucket behavior under parallel
-#      elephants, but doesn't exercise natra's CMS fast-pass (every
-#      flow eventually crosses the heavy-hitter threshold).
+#      flows. Characterizes bucket behavior under parallel elephants.
 #
-#   2. realistic mixed (CMS fast-pass demo). One phase: iperf3 --bidir
-#      elephant (drains both direction buckets) plus concurrent `hey`
-#      HTTP load against an nginx in the same server pod
-#      (-disable-keepalive so each request is a brand-new TCP flow,
-#      well under threshold → natra fast-passes; vanilla HTB queues
-#      everything in the same bucket). Measures hey RPS and p99
-#      latency. Under natra hey should run at near-line-rate; under
-#      vanilla the elephant starves it.
+#   2. mixed (CMS fast-pass demo). iperf3 --bidir elephant against
+#      perf-server (annotated 10M/10M), plus two parallel `hey` HTTP
+#      runs — one against perf-server (annotated mice) and one against
+#      bystander (unannotated nginx on the same worker). The annotated-
+#      pod-mice column shows whether the plugin can isolate small flows
+#      sharing the elephant's bucket; the bystander column shows
+#      whether the plugin adds any overhead to neighboring unannotated
+#      pods.
 #
 # Output: docs/perf-vs-vanilla-result.txt with the raw numbers.
 #
-# Run time: ~12-15 minutes. Docker required on macOS (colima or Docker
+# Run time: ~18-22 minutes. Docker required on macOS (colima or Docker
 # Desktop).
 
 set -euo pipefail
@@ -30,6 +32,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RESULT_FILE="${REPO_ROOT}/docs/perf-vs-vanilla-result.txt"
 
+BASELINE_CLUSTER="natra-vs-vanilla-baseline"
 NATRA_CLUSTER="natra-vs-vanilla-natra"
 VANILLA_CLUSTER="natra-vs-vanilla-vanilla"
 NATRA_IMAGE="ghcr.io/terraboops/natra:vsperf"
@@ -51,6 +54,7 @@ MIXED_HEY_DURATION=20
 MIXED_HEY_CONCURRENCY=50
 
 cleanup() {
+    kind delete cluster --name "$BASELINE_CLUSTER" 2>/dev/null || true
     kind delete cluster --name "$NATRA_CLUSTER" 2>/dev/null || true
     kind delete cluster --name "$VANILLA_CLUSTER" 2>/dev/null || true
 }
@@ -128,7 +132,8 @@ fix_vanilla_htb_burst() {
 }
 
 # Render the mixed-workload manifests (perf-server with iperf3+nginx,
-# perf-client with iperf3+hey).
+# perf-client with iperf3+hey, bystander with nginx only and no
+# bandwidth annotations).
 render_mixed_manifests() {
     local cluster_name="$1" outdir="$2"
     sed -e "s|PERF_WORKER_NODE|${cluster_name}-worker|" \
@@ -137,6 +142,9 @@ render_mixed_manifests() {
     sed -e "s|PERF_CONTROL_NODE|${cluster_name}-control-plane|" \
         "${REPO_ROOT}/test/perf/realworld/perf-client.yaml" \
         > "$outdir/perf-client.yaml"
+    sed -e "s|PERF_WORKER_NODE|${cluster_name}-worker|" \
+        "${REPO_ROOT}/test/perf/realworld/bystander.yaml" \
+        > "$outdir/bystander.yaml"
 }
 
 # warmup_pod drains a freshly-attached qdisc's initial burst-token
@@ -198,19 +206,35 @@ run_workload() {
     echo "$ing_elephant $ing_mice $eg_elephant $eg_mice"
 }
 
-# run_mixed_workload runs an iperf3 --bidir elephant concurrently with
-# hey HTTP load, both targeting the perf-server pod. Prints six values:
-#   iperf_ing_bps iperf_eg_bps hey_rps hey_p50_secs hey_p99_secs hey_total
-# hey_p50_secs and hey_p99_secs are floats (seconds). Empty string for
-# any value that couldn't be parsed (e.g., hey crashed) — caller
-# decides what to do.
+# parse_hey extracts (rps p50 p99 total) from a hey log. Defaults
+# zero on any missing field. hey emits "%%" literally in its latency
+# distribution block, so the awk pattern matches that.
+parse_hey() {
+    local log="$1" rps p50 p99 total
+    rps=$(awk -F: '/Requests\/sec:/ {gsub(/^ */, "", $2); print $2; exit}' "$log")
+    p50=$(awk '/50%% in/ {print $3; exit}' "$log")
+    p99=$(awk '/99%% in/ {print $3; exit}' "$log")
+    total=$(awk '/Total:/ {gsub(/^ */, "", $2); print $2; exit}' "$log")
+    : "${rps:=0}"; : "${p50:=0}"; : "${p99:=0}"; : "${total:=0}"
+    echo "$rps $p50 $p99 $total"
+}
+
+# run_mixed_workload runs an iperf3 --bidir elephant against perf-
+# server (annotated 10M/10M) and two parallel hey HTTP runs — one
+# against perf-server (annotated mice; shares the elephant's bucket),
+# one against bystander (unannotated; on the same node, sharing only
+# the physical uplink). Prints ten values:
+#   iperf_ing_bps iperf_eg_bps \
+#   pod_rps pod_p50 pod_p99 pod_total \
+#   by_rps by_p50 by_p99 by_total
 run_mixed_workload() {
     local namespace="natra-e2e" tag="$1" cluster="$2"
     local iperf_log="$TMPDIR/iperf-mixed-${tag}.json"
-    local hey_log="$TMPDIR/hey-mixed-${tag}.txt"
+    local hey_pod_log="$TMPDIR/hey-pod-${tag}.txt"
+    local hey_by_log="$TMPDIR/hey-bystander-${tag}.txt"
 
     # Profile collector runs on the worker node only when natra is
-    # under test (tag == natra). The vanilla cluster has no natra
+    # under test. The vanilla and baseline clusters have no natra
     # binary on /opt/cni/bin.
     local profile_started=0
     if [ "$tag" = "natra" ]; then
@@ -218,70 +242,71 @@ run_mixed_workload() {
         profile_started=1
     fi
 
-    echo "==> warming up perf-server (draining initial burst)" >&2
-    warmup_pod perf-server perf-client
+    # Skip the warmup for the baseline phase: there's no bucket to
+    # drain, and the warmup itself would just be 40s of stalling
+    # traffic with no signal.
+    if [ "$tag" != "baseline" ]; then
+        echo "==> warming up perf-server (draining initial burst)" >&2
+        warmup_pod perf-server perf-client
+    fi
 
     # Start the elephant in the background. --bidir drains both
-    # ingress and egress buckets simultaneously, so hey traffic
-    # (request: ingress, response: egress) finds both buckets empty
-    # under vanilla. Under natra, hey is classified as mice and skips
-    # the bucket entirely.
+    # ingress and egress buckets simultaneously, so the annotated-pod
+    # hey traffic finds both buckets engaged.
     kubectl exec -n "$namespace" perf-client -- \
         iperf3 -c perf-server -t "$MIXED_IPERF_DURATION" --bidir -J \
         > "$iperf_log" 2>/dev/null &
     local iperf_pid=$!
 
-    # Give the elephant time to fully drain the bucket before we
-    # start measuring hey. Without this, hey's first few requests
-    # would see a partially-full bucket and inflate the natra-vs-
-    # vanilla gap artificially.
+    # Give the elephant time to fully drain the bucket before hey
+    # starts. Without this, the first few requests would see a
+    # partially-full bucket and inflate the gap.
     sleep "$MIXED_HEY_LAG"
 
-    # -disable-keepalive: each request opens a fresh TCP connection.
-    # Each connection has its own 5-tuple (new source port) → its own
-    # CMS flow_key → stays well under heavy-hitter threshold → natra
-    # fast-passes it around the bucket. That's the design natra is
-    # built around; this measures how much it's worth in practice.
+    # Two parallel hey runs from the same client pod:
+    #   - against perf-server (annotated): exercises CMS fast-pass
+    #     under natra, queues behind the elephant under vanilla.
+    #   - against bystander (unannotated, same node): should be a no-op
+    #     under both plugins (no BPF / no HTB attached) and identical
+    #     to the baseline.
+    # -disable-keepalive means each request is a fresh 5-tuple → new
+    # CMS flow_key → stays under the heavy-hitter threshold.
     kubectl exec -n "$namespace" perf-client -- \
         hey -z "${MIXED_HEY_DURATION}s" -c "$MIXED_HEY_CONCURRENCY" \
         -disable-keepalive \
         http://perf-server/ \
-        > "$hey_log" 2>&1 || true
+        > "$hey_pod_log" 2>&1 &
+    local hey_pod_pid=$!
 
+    kubectl exec -n "$namespace" perf-client -- \
+        hey -z "${MIXED_HEY_DURATION}s" -c "$MIXED_HEY_CONCURRENCY" \
+        -disable-keepalive \
+        http://bystander/ \
+        > "$hey_by_log" 2>&1 &
+    local hey_by_pid=$!
+
+    wait "$hey_pod_pid" || true
+    wait "$hey_by_pid" || true
     wait "$iperf_pid" || true
 
-    # Parse iperf3 --bidir output. With --bidir there are TWO streams:
-    # streams[0] is the forward (client→server, server's ingress);
-    # streams[1] is the reverse (server→client, server's egress).
-    # NOTE: .end.sum_sent and .end.sum_received in --bidir mode
-    # aggregate ACROSS both streams, so they reflect total combined
-    # throughput — not per-direction. We pull each stream's
-    # .sender.bits_per_second instead.
+    # Parse iperf3 --bidir output. streams[0] is forward (server's
+    # ingress); streams[1] is reverse (server's egress). .end.sum_*
+    # aggregates across both streams in --bidir mode so we pull each
+    # stream's sender.bits_per_second separately.
     local iperf_ing iperf_eg
     iperf_ing=$(jq '.end.streams[0].sender.bits_per_second // 0' "$iperf_log" 2>/dev/null || echo 0)
     iperf_eg=$(jq '.end.streams[1].sender.bits_per_second // 0' "$iperf_log" 2>/dev/null || echo 0)
 
-    # Parse hey output. hey prints a human-readable summary; we grep
-    # the lines we care about. "Requests/sec:" gives RPS, the latency
-    # distribution block has "50%% in <X> secs" / "99%% in <X> secs"
-    # — hey emits a literal "%%" (double percent) in its latency
-    # distribution lines, so the regex matches that.
-    local rps p50 p99 total
-    rps=$(awk -F: '/Requests\/sec:/ {gsub(/^ */, "", $2); print $2; exit}' "$hey_log")
-    p50=$(awk '/50%% in/ {print $3; exit}' "$hey_log")
-    p99=$(awk '/99%% in/ {print $3; exit}' "$hey_log")
-    total=$(awk '/Total:/ {gsub(/^ */, "", $2); print $2; exit}' "$hey_log")
-
-    : "${rps:=0}"
-    : "${p50:=0}"
-    : "${p99:=0}"
-    : "${total:=0}"
+    local pod_rps pod_p50 pod_p99 pod_total
+    read -r pod_rps pod_p50 pod_p99 pod_total < <(parse_hey "$hey_pod_log")
+    local by_rps by_p50 by_p99 by_total
+    read -r by_rps by_p50 by_p99 by_total < <(parse_hey "$hey_by_log")
 
     if [ "$profile_started" = 1 ]; then
         stop_profile_collector "$cluster" "$tag"
     fi
 
-    echo "$iperf_ing $iperf_eg $rps $p50 $p99 $total"
+    echo "$iperf_ing $iperf_eg $pod_rps $pod_p50 $pod_p99 $pod_total $by_rps $by_p50 $by_p99 $by_total"
 }
 
 # Profile collector: runs `natra profile` on the worker node as a
@@ -423,6 +448,51 @@ docker build -q -t "$NATRA_IMAGE" -f "${REPO_ROOT}/deploy/docker/Dockerfile.cni"
 echo "==> building perfclient image: $PERFCLIENT_IMAGE"
 docker build -q -t "$PERFCLIENT_IMAGE" -f "${REPO_ROOT}/deploy/docker/Dockerfile.perfclient" "$REPO_ROOT" >/dev/null
 
+# ---- Phase 0: baseline (kindnet only, no rate-limiting) ----
+echo
+echo "===================================================================="
+echo "Phase 0: baseline (kindnet, no rate-limiting plugin chained)"
+echo "===================================================================="
+mkdir -p "$TMPDIR/baseline"
+render_manifests "$BASELINE_CLUSTER" "$TMPDIR/baseline"
+render_mixed_manifests "$BASELINE_CLUSTER" "$TMPDIR/baseline"
+
+kind create cluster --name "$BASELINE_CLUSTER" \
+    --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
+kind load docker-image "$PERFCLIENT_IMAGE" --name "$BASELINE_CLUSTER"
+
+kubectl apply -f "$TMPDIR/baseline/namespace.yaml"
+# No plugin DaemonSet here — kindnet's conflist alone, so the
+# kubernetes.io/{ingress,egress}-bandwidth annotations on perf-server
+# are present but not processed by any chained plugin. Traffic flows
+# at line rate; this row is the "what does the cluster do unaided"
+# floor for the comparison.
+
+kubectl apply -f "$TMPDIR/baseline/iperf-server.yaml"
+kubectl apply -f "$TMPDIR/baseline/iperf-client.yaml"
+kubectl apply -f "$TMPDIR/baseline/perf-server.yaml"
+kubectl apply -f "$TMPDIR/baseline/perf-client.yaml"
+kubectl apply -f "$TMPDIR/baseline/bystander.yaml"
+kubectl wait --for=condition=Ready \
+    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
+    -n natra-e2e --timeout=180s
+
+echo "==> running iperf-only workload (phase 0)"
+read -r baseline_ing_elephant baseline_ing_mice baseline_eg_elephant baseline_eg_mice < <(run_workload)
+echo "  baseline ingress elephant=$baseline_ing_elephant bps  mice=$baseline_ing_mice bps"
+echo "  baseline egress  elephant=$baseline_eg_elephant bps  mice=$baseline_eg_mice bps"
+
+echo "==> running mixed workload (phase 0)"
+read -r baseline_mixed_iperf_ing baseline_mixed_iperf_eg \
+        baseline_mixed_pod_rps baseline_mixed_pod_p50 baseline_mixed_pod_p99 baseline_mixed_pod_total \
+        baseline_mixed_by_rps baseline_mixed_by_p50 baseline_mixed_by_p99 baseline_mixed_by_total \
+    < <(run_mixed_workload baseline "$BASELINE_CLUSTER")
+echo "  baseline mixed iperf ingress=$baseline_mixed_iperf_ing bps  egress=$baseline_mixed_iperf_eg bps"
+echo "  baseline mixed pod hey  rps=$baseline_mixed_pod_rps  p50=$baseline_mixed_pod_p50  p99=$baseline_mixed_pod_p99"
+echo "  baseline mixed bystander rps=$baseline_mixed_by_rps  p50=$baseline_mixed_by_p50  p99=$baseline_mixed_by_p99"
+
+kind delete cluster --name "$BASELINE_CLUSTER"
+
 # ---- Phase A: natra ----
 echo
 echo "===================================================================="
@@ -452,8 +522,9 @@ kubectl apply -f "$TMPDIR/natra/iperf-server.yaml"
 kubectl apply -f "$TMPDIR/natra/iperf-client.yaml"
 kubectl apply -f "$TMPDIR/natra/perf-server.yaml"
 kubectl apply -f "$TMPDIR/natra/perf-client.yaml"
+kubectl apply -f "$TMPDIR/natra/bystander.yaml"
 kubectl wait --for=condition=Ready \
-    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client \
+    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
 echo "==> running iperf-only workload (phase A)"
@@ -463,10 +534,12 @@ echo "  natra egress  elephant=$natra_eg_elephant bps  mice=$natra_eg_mice bps"
 
 echo "==> running mixed workload (phase A)"
 read -r natra_mixed_iperf_ing natra_mixed_iperf_eg \
-        natra_mixed_rps natra_mixed_p50 natra_mixed_p99 natra_mixed_total \
+        natra_mixed_pod_rps natra_mixed_pod_p50 natra_mixed_pod_p99 natra_mixed_pod_total \
+        natra_mixed_by_rps natra_mixed_by_p50 natra_mixed_by_p99 natra_mixed_by_total \
     < <(run_mixed_workload natra "$NATRA_CLUSTER")
 echo "  natra mixed iperf ingress=$natra_mixed_iperf_ing bps  egress=$natra_mixed_iperf_eg bps"
-echo "  natra mixed hey rps=$natra_mixed_rps  p50=$natra_mixed_p50  p99=$natra_mixed_p99  total=$natra_mixed_total"
+echo "  natra mixed pod hey  rps=$natra_mixed_pod_rps  p50=$natra_mixed_pod_p50  p99=$natra_mixed_pod_p99"
+echo "  natra mixed bystander rps=$natra_mixed_by_rps  p50=$natra_mixed_by_p50  p99=$natra_mixed_by_p99"
 
 kind delete cluster --name "$NATRA_CLUSTER"
 
@@ -501,8 +574,9 @@ kubectl apply -f "$TMPDIR/vanilla/iperf-server.yaml"
 kubectl apply -f "$TMPDIR/vanilla/iperf-client.yaml"
 kubectl apply -f "$TMPDIR/vanilla/perf-server.yaml"
 kubectl apply -f "$TMPDIR/vanilla/perf-client.yaml"
+kubectl apply -f "$TMPDIR/vanilla/bystander.yaml"
 kubectl wait --for=condition=Ready \
-    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client \
+    pod/iperf-server pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
 # Patch HTB burst on every veth/ifb the bandwidth plugin created.
@@ -518,10 +592,12 @@ echo "  vanilla egress  elephant=$vanilla_eg_elephant bps  mice=$vanilla_eg_mice
 
 echo "==> running mixed workload (phase B)"
 read -r vanilla_mixed_iperf_ing vanilla_mixed_iperf_eg \
-        vanilla_mixed_rps vanilla_mixed_p50 vanilla_mixed_p99 vanilla_mixed_total \
+        vanilla_mixed_pod_rps vanilla_mixed_pod_p50 vanilla_mixed_pod_p99 vanilla_mixed_pod_total \
+        vanilla_mixed_by_rps vanilla_mixed_by_p50 vanilla_mixed_by_p99 vanilla_mixed_by_total \
     < <(run_mixed_workload vanilla "$VANILLA_CLUSTER")
 echo "  vanilla mixed iperf ingress=$vanilla_mixed_iperf_ing bps  egress=$vanilla_mixed_iperf_eg bps"
-echo "  vanilla mixed hey rps=$vanilla_mixed_rps  p50=$vanilla_mixed_p50  p99=$vanilla_mixed_p99  total=$vanilla_mixed_total"
+echo "  vanilla mixed pod hey  rps=$vanilla_mixed_pod_rps  p50=$vanilla_mixed_pod_p50  p99=$vanilla_mixed_pod_p99"
+echo "  vanilla mixed bystander rps=$vanilla_mixed_by_rps  p50=$vanilla_mixed_by_p50  p99=$vanilla_mixed_by_p99"
 
 kind delete cluster --name "$VANILLA_CLUSTER"
 
@@ -550,6 +626,9 @@ fmt_secs() {
 cat <<EOF | tee "$RESULT_FILE"
 natra vs upstream containernetworking/plugins/bandwidth — kind cluster head-to-head
 ====================================================================================
+Three configurations: baseline (kindnet alone, no rate-limiting), natra, upstream
+containernetworking/plugins/bandwidth. Same workloads against each.
+
 Workload 1: iperf-only (legacy). Same iperf3 client/server, ${RATE} annotation each direction.
   - ingress: forward iperf3 (client → server, charged to server's ingress)
   - egress:  reverse iperf3 -R (server → client, charged to server's egress)
@@ -559,46 +638,77 @@ Iperf goodput, receiver-side aggregate (sum_received.bits_per_second).
 
 Direction  Plugin                          Elephant            Mice (${MICE_PARALLEL}× parallel)
 -------------------------------------------------------------------------------------------
+ingress    baseline (no plugin)            $(fmt_bps "$baseline_ing_elephant")        $(fmt_bps "$baseline_ing_mice")
 ingress    natra                           $(fmt_bps "$natra_ing_elephant")        $(fmt_bps "$natra_ing_mice")
 ingress    upstream bandwidth              $(fmt_bps "$vanilla_ing_elephant")        $(fmt_bps "$vanilla_ing_mice")
+egress     baseline (no plugin)            $(fmt_bps "$baseline_eg_elephant")        $(fmt_bps "$baseline_eg_mice")
 egress     natra                           $(fmt_bps "$natra_eg_elephant")        $(fmt_bps "$natra_eg_mice")
 egress     upstream bandwidth              $(fmt_bps "$vanilla_eg_elephant")        $(fmt_bps "$vanilla_eg_mice")
 
 
-Workload 2: realistic mixed (elephant + hey HTTP mice). Same server pod runs iperf3 +
-nginx; client runs iperf3 --bidir for ${MIXED_IPERF_DURATION}s and (starting ${MIXED_HEY_LAG}s later) hey -c
-${MIXED_HEY_CONCURRENCY} -disable-keepalive -z ${MIXED_HEY_DURATION}s against the nginx. Each hey request is a
-fresh TCP connection → distinct CMS flow_key → stays under heavy-hitter
-threshold. Under natra, hey fast-passes the bucket; under vanilla HTB, hey
-shares the bucket with the elephant.
+Workload 2: mixed (elephant + HTTP mice on annotated pod + HTTP mice on unannotated
+bystander). perf-server (annotated 10M/10M) runs iperf3 + nginx; bystander
+(unannotated, same node) runs nginx. Client runs iperf3 --bidir against perf-server
+for ${MIXED_IPERF_DURATION}s and (starting ${MIXED_HEY_LAG}s later) two parallel
+hey runs (-c ${MIXED_HEY_CONCURRENCY} -disable-keepalive -z ${MIXED_HEY_DURATION}s)
+against perf-server and bystander. Each hey request is a fresh TCP connection →
+distinct flow_key → stays under heavy-hitter threshold.
 
-Plugin                Elephant ingress    Elephant egress    Hey RPS         Hey p50     Hey p99
--------------------------------------------------------------------------------------------------
-natra                 $(fmt_bps "$natra_mixed_iperf_ing")        $(fmt_bps "$natra_mixed_iperf_eg")       $(fmt_rps "$natra_mixed_rps")      $(fmt_secs "$natra_mixed_p50")  $(fmt_secs "$natra_mixed_p99")
-upstream bandwidth    $(fmt_bps "$vanilla_mixed_iperf_ing")        $(fmt_bps "$vanilla_mixed_iperf_eg")       $(fmt_rps "$vanilla_mixed_rps")      $(fmt_secs "$vanilla_mixed_p50")  $(fmt_secs "$vanilla_mixed_p99")
+The annotated-pod-mice column shows whether the plugin can isolate small flows
+inside an annotated pod's budget. The bystander column shows whether the plugin
+adds any overhead to neighboring unannotated pods.
+
+                       │ Elephant flows           │ Annotated mice (perf-server) │ Bystander mice (unannotated)
+Plugin                 │ ingress       egress     │ RPS          p50      p99    │ RPS          p50      p99
+---------------------------------------------------------------------------------------------------------------------
+baseline (no plugin)   │ $(fmt_bps "$baseline_mixed_iperf_ing")  $(fmt_bps "$baseline_mixed_iperf_eg")  │ $(fmt_rps "$baseline_mixed_pod_rps")   $(fmt_secs "$baseline_mixed_pod_p50")  $(fmt_secs "$baseline_mixed_pod_p99") │ $(fmt_rps "$baseline_mixed_by_rps")   $(fmt_secs "$baseline_mixed_by_p50")  $(fmt_secs "$baseline_mixed_by_p99")
+natra                  │ $(fmt_bps "$natra_mixed_iperf_ing")  $(fmt_bps "$natra_mixed_iperf_eg")  │ $(fmt_rps "$natra_mixed_pod_rps")   $(fmt_secs "$natra_mixed_pod_p50")  $(fmt_secs "$natra_mixed_pod_p99") │ $(fmt_rps "$natra_mixed_by_rps")   $(fmt_secs "$natra_mixed_by_p50")  $(fmt_secs "$natra_mixed_by_p99")
+upstream bandwidth     │ $(fmt_bps "$vanilla_mixed_iperf_ing")  $(fmt_bps "$vanilla_mixed_iperf_eg")  │ $(fmt_rps "$vanilla_mixed_pod_rps")   $(fmt_secs "$vanilla_mixed_pod_p50")  $(fmt_secs "$vanilla_mixed_pod_p99") │ $(fmt_rps "$vanilla_mixed_by_rps")   $(fmt_secs "$vanilla_mixed_by_p50")  $(fmt_secs "$vanilla_mixed_by_p99")
 
 
 Raw numbers:
+  baseline_ingress_elephant=$baseline_ing_elephant
+  baseline_ingress_mice=$baseline_ing_mice
+  baseline_egress_elephant=$baseline_eg_elephant
+  baseline_egress_mice=$baseline_eg_mice
+  baseline_mixed_iperf_ingress=$baseline_mixed_iperf_ing
+  baseline_mixed_iperf_egress=$baseline_mixed_iperf_eg
+  baseline_mixed_pod_rps=$baseline_mixed_pod_rps
+  baseline_mixed_pod_p50=$baseline_mixed_pod_p50
+  baseline_mixed_pod_p99=$baseline_mixed_pod_p99
+  baseline_mixed_pod_total=$baseline_mixed_pod_total
+  baseline_mixed_bystander_rps=$baseline_mixed_by_rps
+  baseline_mixed_bystander_p50=$baseline_mixed_by_p50
+  baseline_mixed_bystander_p99=$baseline_mixed_by_p99
+  baseline_mixed_bystander_total=$baseline_mixed_by_total
   natra_ingress_elephant=$natra_ing_elephant
   natra_ingress_mice=$natra_ing_mice
   natra_egress_elephant=$natra_eg_elephant
   natra_egress_mice=$natra_eg_mice
+  natra_mixed_iperf_ingress=$natra_mixed_iperf_ing
+  natra_mixed_iperf_egress=$natra_mixed_iperf_eg
+  natra_mixed_pod_rps=$natra_mixed_pod_rps
+  natra_mixed_pod_p50=$natra_mixed_pod_p50
+  natra_mixed_pod_p99=$natra_mixed_pod_p99
+  natra_mixed_pod_total=$natra_mixed_pod_total
+  natra_mixed_bystander_rps=$natra_mixed_by_rps
+  natra_mixed_bystander_p50=$natra_mixed_by_p50
+  natra_mixed_bystander_p99=$natra_mixed_by_p99
+  natra_mixed_bystander_total=$natra_mixed_by_total
   vanilla_ingress_elephant=$vanilla_ing_elephant
   vanilla_ingress_mice=$vanilla_ing_mice
   vanilla_egress_elephant=$vanilla_eg_elephant
   vanilla_egress_mice=$vanilla_eg_mice
-  natra_mixed_iperf_ingress=$natra_mixed_iperf_ing
-  natra_mixed_iperf_egress=$natra_mixed_iperf_eg
-  natra_mixed_hey_rps=$natra_mixed_rps
-  natra_mixed_hey_p50=$natra_mixed_p50
-  natra_mixed_hey_p99=$natra_mixed_p99
-  natra_mixed_hey_total=$natra_mixed_total
   vanilla_mixed_iperf_ingress=$vanilla_mixed_iperf_ing
   vanilla_mixed_iperf_egress=$vanilla_mixed_iperf_eg
-  vanilla_mixed_hey_rps=$vanilla_mixed_rps
-  vanilla_mixed_hey_p50=$vanilla_mixed_p50
-  vanilla_mixed_hey_p99=$vanilla_mixed_p99
-  vanilla_mixed_hey_total=$vanilla_mixed_total
+  vanilla_mixed_pod_rps=$vanilla_mixed_pod_rps
+  vanilla_mixed_pod_p50=$vanilla_mixed_pod_p50
+  vanilla_mixed_pod_p99=$vanilla_mixed_pod_p99
+  vanilla_mixed_pod_total=$vanilla_mixed_pod_total
+  vanilla_mixed_bystander_rps=$vanilla_mixed_by_rps
+  vanilla_mixed_bystander_p50=$vanilla_mixed_by_p50
+  vanilla_mixed_bystander_p99=$vanilla_mixed_by_p99
+  vanilla_mixed_bystander_total=$vanilla_mixed_by_total
 
 Generated by scripts/perf-vs-vanilla.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
