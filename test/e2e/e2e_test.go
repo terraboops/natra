@@ -213,16 +213,22 @@ var _ = AfterSuite(func() {
 // Topology F's reinstatement step.
 func installNatraDaemon() {
 	// NATRA_E2E_ATTACH_MODE picks the attach path the test rig
-	// exercises. Default is "tcx-hostside" (production default). Set
+	// exercises. Default is "" which the binary treats as auto. Set
 	// to any of {tcx-hostside, tcx-podside, clsact-hostside,
-	// clsact-podside} to exercise that combination explicitly.
+	// clsact-podside, auto} to exercise that combination explicitly.
 	attachMode := os.Getenv("NATRA_E2E_ATTACH_MODE")
-	if attachMode == "tcx-hostside" {
-		attachMode = "" // empty in the manifest = default (tcx-hostside)
-	}
+	// awk targets the specific env var by name so we don't replace
+	// both NATRA_ATTACH_MODE and NATRA_EDT_PACING with the same
+	// value (a global s|value: ""$|...| sed would do that).
 	mustExec("bash", "-c",
-		fmt.Sprintf(`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' -e 's|value: ""$|value: "%s"|' %s | kubectl apply -f -`,
-			natraImage, attachMode, repoFile("..", "..", "deploy", "cni-installer.yaml")),
+		fmt.Sprintf(
+			`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' %s | `+
+				`awk -v am=%q '/name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next } { print }' | `+
+				`kubectl apply -f -`,
+			natraImage,
+			repoFile("..", "..", "deploy", "cni-installer.yaml"),
+			attachMode,
+		),
 	)
 	mustExec("kubectl", "rollout", "status", "daemonset/natra-installer",
 		"-n", "kube-system", "--timeout=120s")
