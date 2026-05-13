@@ -94,6 +94,94 @@ require docker
 require kind
 require kubectl
 require jq
+require curl
+require tar
+
+# BPFTOOL_HOST_PATH is populated once by ensure_bpftool() and reused
+# across phases. The binary is cached under ${REPO_ROOT}/bin/ so repeat
+# script runs don't redownload it.
+BPFTOOL_HOST_PATH=""
+
+# Pinned bpftool version. v7.7.0 ships with `features: llvm, skeletons`
+# (the build was done with clang ≥ 10), which is the prerequisite for
+# `bpftool prog profile`. Earlier versions and distro packages
+# (notably debian bookworm's bpftool 7.1.0) are built without llvm
+# support and refuse `prog profile` with "Please build bpftool with
+# clang >= 10.0.0". Static linkage means it runs on any glibc ≥ 2.x
+# kindest/node ships.
+BPFTOOL_VERSION="v7.7.0"
+BPFTOOL_RELEASE_URL_BASE="https://github.com/libbpf/bpftool/releases/download"
+
+# ensure_bpftool downloads a statically-linked bpftool from the official
+# libbpf/bpftool release and caches it under bin/. The kindest/node
+# image's own apt can't install bpftool: it ships as part of
+# linux-tools-$(uname -r), and on colima's LinuxKit kernel (~6.8.x) no
+# matching kernel package exists. Debian's own bpftool package, while
+# kernel-independent, is built without llvm support, so `prog profile`
+# (the whole reason we want bpftool here) refuses to run.
+#
+# The upstream release bundles a static binary with llvm+skeletons
+# enabled, which gives us cycles/instructions/cache_refs/cache_misses
+# counters per BPF program invocation.
+#
+# Sets BPFTOOL_HOST_PATH on success; leaves it empty on failure so the
+# caller can decide whether to skip profile capture.
+ensure_bpftool() {
+    if [ -n "$BPFTOOL_HOST_PATH" ] && [ -x "$BPFTOOL_HOST_PATH" ]; then
+        return 0
+    fi
+    local arch
+    case "$(uname -m)" in
+        arm64|aarch64) arch="arm64" ;;
+        x86_64|amd64)  arch="amd64" ;;
+        *) echo "==> ensure_bpftool: unsupported arch $(uname -m)" >&2; return 1 ;;
+    esac
+    local cache="${REPO_ROOT}/bin/bpftool-${BPFTOOL_VERSION}-${arch}"
+    if [ -x "$cache" ]; then
+        BPFTOOL_HOST_PATH="$cache"
+        echo "==> bpftool cached at $BPFTOOL_HOST_PATH" >&2
+        return 0
+    fi
+    mkdir -p "${REPO_ROOT}/bin"
+    local url="${BPFTOOL_RELEASE_URL_BASE}/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-${arch}.tar.gz"
+    local tmp_tgz="$TMPDIR/bpftool.tar.gz"
+    local extract="$TMPDIR/bpftool-extract"
+    mkdir -p "$extract"
+    echo "==> downloading bpftool ${BPFTOOL_VERSION} (${arch}) from libbpf/bpftool release" >&2
+    if ! curl -fsSL --retry 3 --retry-delay 2 -o "$tmp_tgz" "$url"; then
+        echo "==> ensure_bpftool: curl from $url failed" >&2
+        return 1
+    fi
+    if ! tar -xzf "$tmp_tgz" -C "$extract"; then
+        echo "==> ensure_bpftool: tar extract failed" >&2
+        return 1
+    fi
+    if [ ! -f "$extract/bpftool" ]; then
+        echo "==> ensure_bpftool: archive missing bpftool binary" >&2
+        return 1
+    fi
+    mv "$extract/bpftool" "$cache"
+    chmod 0755 "$cache"
+    BPFTOOL_HOST_PATH="$cache"
+    echo "==> bpftool cached at $BPFTOOL_HOST_PATH" >&2
+}
+
+# install_bpftool_in_node docker-cps the staged bpftool into the kind
+# node at /usr/local/bin/bpftool. Idempotent — re-copy is cheap. Returns
+# nonzero if bpftool isn't staged or the copy fails, so the caller can
+# skip prog-profile capture without aborting the whole run.
+install_bpftool_in_node() {
+    local node="$1"
+    if [ -z "$BPFTOOL_HOST_PATH" ] || [ ! -x "$BPFTOOL_HOST_PATH" ]; then
+        return 1
+    fi
+    if ! docker cp "$BPFTOOL_HOST_PATH" "$node:/usr/local/bin/bpftool" >&2; then
+        echo "==> install_bpftool_in_node: docker cp to $node failed" >&2
+        return 1
+    fi
+    docker exec "$node" chmod 0755 /usr/local/bin/bpftool >/dev/null 2>&1 || true
+    return 0
+}
 
 # Render iperf manifests with the cluster-specific node names. kind
 # names nodes <cluster>-{control-plane,worker}; the source manifests
@@ -364,47 +452,128 @@ start_profile_collector() {
     # so this overlaps the steady-state phase. Captures land at
     # ${profile_dir}/bpftool-prog-profile.txt.
     #
-    # bpftool isn't in the kindest/node image by default. Install
-    # bpfcc-tools (which pulls in bpftool on debian) on demand. The
-    # install is cached on the image layer for subsequent runs in
-    # the same script invocation.
-    docker exec "${cluster}-worker" bash -c '
-        if ! command -v bpftool >/dev/null 2>&1; then
-            apt-get update -qq >/dev/null 2>&1 && \
-                apt-get install -y -qq bpfcc-tools linux-tools-generic >/dev/null 2>&1 || true
-            # Some kindest/node variants ship bpftool only under
-            # /usr/lib/linux-tools-*/bpftool — link it if so.
+    # bpftool isn't in the kindest/node image by default and the
+    # node's own apt can't install it (linux-tools-* is kernel-versioned
+    # and no package matches colima's LinuxKit kernel). Even debian's
+    # plain bpftool package is built without llvm support, so `prog
+    # profile` refuses to run. ensure_bpftool() downloads the official
+    # static binary from libbpf/bpftool releases (built with clang ≥ 10,
+    # so `features: llvm, skeletons` is set) and caches it under bin/.
+    # install_bpftool_in_node copies that staged binary into the kind
+    # node at /usr/local/bin/bpftool.
+    if ensure_bpftool && install_bpftool_in_node "${cluster}-worker"; then
+        # Loosen perf paranoia and enable BPF stats so the in-kernel
+        # runtime_ns / run_cnt counters update for `bpftool prog show`.
+        # Both knobs are netns-root-scoped and idempotent.
+        docker exec "${cluster}-worker" bash -c '
+            sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
+            sysctl -w kernel.bpf_stats_enabled=1   >/dev/null 2>&1 || true
+        ' || true
+        docker exec "${cluster}-worker" bash -c '
+            set +e
             if ! command -v bpftool >/dev/null 2>&1; then
-                bp=$(ls /usr/lib/linux-tools-*/bpftool 2>/dev/null | head -1)
-                if [ -n "$bp" ]; then ln -sf "$bp" /usr/local/bin/bpftool; fi
+                echo "bpftool not on PATH after install; skipping prog profile" > /var/log/natra-profile/bpftool.txt
+                exit 0
             fi
-        fi
-        if ! command -v bpftool >/dev/null 2>&1; then
-            echo "bpftool not installable; skipping prog profile" > /var/log/natra-profile/bpftool.txt
-            exit 0
-        fi
-        # Resolve natra prog IDs by name. There may be multiple if
-        # several pods are attached; capture each separately so we
-        # can spot per-pod variance.
-        ids=$(bpftool prog show 2>/dev/null \
-            | awk -F"[ :]+" "/name (natra_ingress|natra_egress)/ {print \$1\":\"\$5}")
-        if [ -z "$ids" ]; then
-            echo "no natra programs loaded yet" > /var/log/natra-profile/bpftool.txt
-            exit 0
-        fi
-        : > /var/log/natra-profile/bpftool.txt
-        for entry in $ids; do
-            pid="${entry%%:*}"
-            pname="${entry##*:}"
-            (
-                echo "=== prog id=$pid name=$pname ==="
-                bpftool prog profile id "$pid" duration 25 \
-                    cycles instructions cache_references cache_misses 2>&1
-                echo
-            ) >> /var/log/natra-profile/bpftool.txt &
-        done
-        wait
-    ' >/dev/null 2>&1 &
+            # Resolve natra prog IDs by name. There may be multiple if
+            # several pods are attached; capture each separately so we
+            # can spot per-pod variance. `bpftool prog show` lines look
+            # like "<id>: <type>  name <name>  tag …" — split on the
+            # name keyword to pull (id, name) reliably.
+            ids=$(bpftool prog show 2>/dev/null | \
+                awk "/ name (natra_ingress|natra_egress) / {
+                    id=\$1; sub(/:\$/, \"\", id);
+                    for(i=1;i<=NF;i++) if(\$i==\"name\"){ print id\":\"\$(i+1); break }
+                }")
+            if [ -z "$ids" ]; then
+                echo "no natra programs loaded yet" > /var/log/natra-profile/bpftool.txt
+                exit 0
+            fi
+            : > /var/log/natra-profile/bpftool.txt
+            : > /var/log/natra-profile/bpftool.stderr
+            # Phase 1: capture per-prog run_time_ns / run_cnt at the
+            # start of the workload. These are kernel-side counters that
+            # need no hardware PMU and work in any VM.
+            for entry in $ids; do
+                pid="${entry%%:*}"
+                bpftool prog show id "$pid" -j > /var/log/natra-profile/before-$pid.json 2>/dev/null
+            done
+            # Phase 2: try `bpftool prog profile` (cycles/instructions/
+            # cache_*). Requires PERF_TYPE_HARDWARE counters; works on
+            # bare-metal Linux and most KVM setups. Apple Virtualization.
+            # framework (colima `vm-type vz`) does NOT expose hw PMUs to
+            # guests, and bpftool will fail with "failed to create event
+            # cycles on cpu N". The fallback (phase 3) records the run-
+            # time delta from `bpftool prog show` so the artifact is
+            # still meaningful in that environment.
+            for entry in $ids; do
+                pid="${entry%%:*}"
+                pname="${entry##*:}"
+                (
+                    echo "=== prog id=$pid name=$pname ==="
+                    # v7.7.0 metric names: cycles, instructions,
+                    # llc_misses, l1d_loads, dtlb_misses, itlb_misses.
+                    # All are PERF_TYPE_HARDWARE; perf_event_open fails
+                    # if the host kernel has no PMU exposed.
+                    bpftool prog profile id "$pid" duration 25 \
+                        cycles instructions llc_misses l1d_loads 2>>/var/log/natra-profile/bpftool.stderr
+                    echo
+                ) >> /var/log/natra-profile/bpftool.txt &
+            done
+            wait
+            # Phase 3: snapshot run_time_ns/run_cnt again and append a
+            # delta block. Even when prog profile fails, this gives us
+            # actual per-program kernel time per call.
+            echo "" >> /var/log/natra-profile/bpftool.txt
+            echo "=== run_time_ns / run_cnt deltas ===" >> /var/log/natra-profile/bpftool.txt
+            for entry in $ids; do
+                pid="${entry%%:*}"
+                pname="${entry##*:}"
+                after=$(bpftool prog show id "$pid" -j 2>/dev/null)
+                before=$(cat /var/log/natra-profile/before-$pid.json 2>/dev/null)
+                if [ -n "$before" ] && [ -n "$after" ]; then
+                    # bpftool may return either a bare object or a
+                    # single-element array for `prog show id N -j`
+                    # depending on version. Normalize to a bare object
+                    # with `if type == array then .[0] else . end` so
+                    # the delta math works either way.
+                    printf "%s\n%s\n" "$before" "$after" | jq -s "
+                        map(if type == \"array\" then .[0] else . end) |
+                        {
+                            prog_id: $pid,
+                            name: \"$pname\",
+                            run_time_ns_delta: ((.[1].run_time_ns // 0) - (.[0].run_time_ns // 0)),
+                            run_cnt_delta:     ((.[1].run_cnt     // 0) - (.[0].run_cnt     // 0)),
+                            ns_per_op: (if ((.[1].run_cnt // 0) - (.[0].run_cnt // 0)) > 0
+                                then (((.[1].run_time_ns // 0) - (.[0].run_time_ns // 0)) / ((.[1].run_cnt // 0) - (.[0].run_cnt // 0)))
+                                else 0 end)
+                        }
+                    " >> /var/log/natra-profile/bpftool.txt 2>>/var/log/natra-profile/bpftool.stderr || \
+                    echo "{\"prog_id\": $pid, \"name\": \"$pname\", \"error\": \"jq merge failed\"}" >> /var/log/natra-profile/bpftool.txt
+                fi
+            done
+            # If `prog profile` recorded errors but never produced data
+            # rows, append the stderr so the diagnosis is in the file.
+            if [ -s /var/log/natra-profile/bpftool.stderr ]; then
+                echo "" >> /var/log/natra-profile/bpftool.txt
+                echo "=== bpftool prog profile stderr ===" >> /var/log/natra-profile/bpftool.txt
+                cat /var/log/natra-profile/bpftool.stderr >> /var/log/natra-profile/bpftool.txt
+                echo "" >> /var/log/natra-profile/bpftool.txt
+                echo "Note: hardware PMU unavailable in this VM. The Apple" >> /var/log/natra-profile/bpftool.txt
+                echo "Virtualization.framework backend used by colima --vm-type=vz" >> /var/log/natra-profile/bpftool.txt
+                echo "does not expose PERF_TYPE_HARDWARE counters to the guest." >> /var/log/natra-profile/bpftool.txt
+                echo "Use colima --vm-type=qemu or run on bare-metal Linux for" >> /var/log/natra-profile/bpftool.txt
+                echo "real cycles/instructions/cache_* per BPF invocation. The" >> /var/log/natra-profile/bpftool.txt
+                echo "run_time_ns/run_cnt block above still reflects real kernel" >> /var/log/natra-profile/bpftool.txt
+                echo "time per invocation, just without PMU breakdown." >> /var/log/natra-profile/bpftool.txt
+            fi
+        ' >/dev/null 2>&1 &
+    else
+        echo "==> bpftool unavailable; skipping prog profile" >&2
+        docker exec "${cluster}-worker" bash -c \
+            'echo "bpftool unavailable on host (ensure_bpftool failed); skipping prog profile" > /var/log/natra-profile/bpftool.txt' \
+            >/dev/null 2>&1 || true
+    fi
     # Diagnostic: dump state of /var/log/natra-profile/ so a missing
     # snapshot or a startup error in the profile binary shows up
     # immediately rather than as a silent "no snapshots written".
