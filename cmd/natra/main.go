@@ -54,9 +54,10 @@ var (
 // RuntimeConfig.Bandwidth is what kubelet populates when the conflist
 // declares `capabilities.bandwidth: true`. PodAnnotations is the
 // older direct path; if both channels are present, Bandwidth wins.
-// AttachMode is the top-level natra-specific knob — one of
-// "tcx-hostside" (default), "tcx-podside", "clsact-hostside",
-// "clsact-podside".
+// AttachMode is the top-level natra-specific knob — one of "auto"
+// (default; expands to an EDT-dependent fallback chain — see
+// resolveAttachStrategy), "tcx-hostside", "tcx-podside",
+// "clsact-hostside", "clsact-podside".
 //
 // Defaults is the cluster-wide knob block, written by the installer
 // from NATRA_DEFAULT_* env vars. Lets an operator change natra's
