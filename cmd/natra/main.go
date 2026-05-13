@@ -86,7 +86,7 @@ type NetConfDefaults struct {
 	// when present. When absent (zero) the threshold is computed
 	// per-pod via the FastPassTimeConstantMs formula:
 	//   threshold = max(MinHHThresholdBytes, rate_bps × time_constant / 1000)
-	// so a 10 Mbps pod gets ~128 KiB threshold and a 1 Gbps pod
+	// so a 10 Mbps pod gets ~125 KiB threshold and a 1 Gbps pod
 	// gets ~12.5 MiB. Lower = stricter shaping (mice become
 	// elephants faster); higher = more mice protection.
 	HHThreshold int64 `json:"hhThreshold,omitempty"`
