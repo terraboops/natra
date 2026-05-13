@@ -437,10 +437,26 @@ run_mixed_workload() {
     for v in iperf_ing iperf_eg pod_rps pod_p50 pod_p99 pod_total \
              by_rps by_p50 by_p99 by_total; do
         if ! is_num "${!v}"; then
-            echo "warn: $tag mixed: $v not numeric (${!v}) — defaulting to 0" >&2
-            printf -v "$v" 0
+            echo "warn: $tag mixed: $v not numeric ('${!v}') — defaulting to 0" >&2
+            printf -v "$v" "%s" "0"
         fi
     done
+
+    # Debug: dump every var to stderr right before emit, so we can
+    # see if downstream parsing breakage is at this layer or above.
+    {
+        echo "=== run_mixed_workload($tag) final vars ==="
+        echo "iperf_ing=$iperf_ing"
+        echo "iperf_eg=$iperf_eg"
+        echo "pod_rps=$pod_rps"
+        echo "pod_p50=$pod_p50"
+        echo "pod_p99=$pod_p99"
+        echo "pod_total=$pod_total"
+        echo "by_rps=$by_rps"
+        echo "by_p50=$by_p50"
+        echo "by_p99=$by_p99"
+        echo "by_total=$by_total"
+    } >&2
 
     echo "$iperf_ing $iperf_eg $pod_rps $pod_p50 $pod_p99 $pod_total $by_rps $by_p50 $by_p99 $by_total"
 }
