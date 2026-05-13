@@ -234,7 +234,7 @@ render_manifests() {
 fix_vanilla_htb_burst() {
     local cluster="$1"
     for node in $(nodes_for "$cluster"); do
-        docker exec "$node" bash -c '
+        docker exec "$node" sh -c '
             for dev in $(tc qdisc show 2>/dev/null | awk "/htb/ {print \$5}" | sort -u); do
                 # class 1:30 (hex) = ShapedClassMinorID 48 in the
                 # bandwidth plugin. The unshaped class 1:1 has rate
@@ -482,7 +482,7 @@ start_profile_collector() {
     # on exec-shell teardown was killing the collector before its
     # first snapshot landed).
     docker exec "k3d-${cluster}-agent-0" mkdir -p /var/log/natra-profile
-    docker exec "k3d-${cluster}-agent-0" bash -c '
+    docker exec "k3d-${cluster}-agent-0" sh -c '
         setsid nohup /opt/cni/bin/natra profile \
             -interval 2s \
             -output /var/log/natra-profile/snapshots.jsonl \
@@ -516,11 +516,11 @@ start_profile_collector() {
         # Loosen perf paranoia and enable BPF stats so the in-kernel
         # runtime_ns / run_cnt counters update for `bpftool prog show`.
         # Both knobs are netns-root-scoped and idempotent.
-        docker exec "k3d-${cluster}-agent-0" bash -c '
+        docker exec "k3d-${cluster}-agent-0" sh -c '
             sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
             sysctl -w kernel.bpf_stats_enabled=1   >/dev/null 2>&1 || true
         ' || true
-        docker exec "k3d-${cluster}-agent-0" bash -c '
+        docker exec "k3d-${cluster}-agent-0" sh -c '
             set +e
             if ! command -v bpftool >/dev/null 2>&1; then
                 echo "bpftool not on PATH after install; skipping prog profile" > /var/log/natra-profile/bpftool.txt
@@ -621,14 +621,14 @@ start_profile_collector() {
         ' >/dev/null 2>&1 &
     else
         echo "==> bpftool unavailable; skipping prog profile" >&2
-        docker exec "k3d-${cluster}-agent-0" bash -c \
+        docker exec "k3d-${cluster}-agent-0" sh -c \
             'echo "bpftool unavailable on host (ensure_bpftool failed); skipping prog profile" > /var/log/natra-profile/bpftool.txt' \
             >/dev/null 2>&1 || true
     fi
     # Diagnostic: dump state of /var/log/natra-profile/ so a missing
     # snapshot or a startup error in the profile binary shows up
     # immediately rather than as a silent "no snapshots written".
-    docker exec "k3d-${cluster}-agent-0" bash -c '
+    docker exec "k3d-${cluster}-agent-0" sh -c '
         echo "  profile pid: $(cat /var/log/natra-profile/profile.pid 2>/dev/null)";
         echo "  profile process: $(ps -p $(cat /var/log/natra-profile/profile.pid 2>/dev/null) -o comm= 2>/dev/null || echo NOT_RUNNING)";
         echo "  profile dir:";
@@ -642,7 +642,7 @@ stop_profile_collector() {
     local cluster="$1" tag="$2"
     local profile_dir="$TMPDIR/profile-${tag}"
 
-    docker exec "k3d-${cluster}-agent-0" bash -c '
+    docker exec "k3d-${cluster}-agent-0" sh -c '
         pid=$(cat /var/log/natra-profile/profile.pid 2>/dev/null || true)
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
