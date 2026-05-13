@@ -161,7 +161,24 @@ func writeChainedSibling(src, dst string) error {
 	if len(defaults) > 0 {
 		natraEntry["defaults"] = defaults
 	}
-	chained["plugins"] = append(append([]any{}, plugins...), natraEntry)
+	// Strip any existing 'type: bandwidth' plugin from the chain. k3s
+	// (and some other distros) ship the upstream containernetworking
+	// bandwidth plugin in their default conflist; leaving it in means
+	// both it and natra would try to enforce the same annotation,
+	// and the upstream one will silently fail when ifb isn't loaded
+	// on the node — which blocks the whole CNI ADD chain and stalls
+	// pod creation with "ContainerCreating". natra owns the
+	// bandwidth capability now; drop the redundant plugin.
+	filtered := make([]any, 0, len(plugins))
+	for _, p := range plugins {
+		if m, ok := p.(map[string]any); ok {
+			if t, _ := m["type"].(string); t == "bandwidth" {
+				continue
+			}
+		}
+		filtered = append(filtered, p)
+	}
+	chained["plugins"] = append(filtered, natraEntry)
 
 	out, err := json.MarshalIndent(chained, "", "  ")
 	if err != nil {
