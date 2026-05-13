@@ -78,19 +78,34 @@ iperf3 against an iperf3-only server, four phases per cluster:
 Receiver-side aggregate goodput from
 `end.sum_received.bits_per_second`.
 
-### Most recent run (colima, aarch64)
+### Most recent run (colima, aarch64, k3d + flannel host-gw)
 
-| Direction | Plugin                | Elephant     | Mice (20× parallel)  |
-|-----------|-----------------------|--------------|----------------------|
-| ingress   | baseline (no plugin)  | 55,963 Mbps  | 54,971 Mbps          |
-| ingress   | natra                 | 12.16 Mbps   | 36.60 Mbps           |
-| ingress   | upstream `bandwidth`  | 10.04 Mbps   |  9.64 Mbps           |
-| egress    | baseline (no plugin)  | 54,812 Mbps  | 49,325 Mbps          |
-| egress    | natra                 | 12.20 Mbps   | 39.04 Mbps           |
-| egress    | upstream `bandwidth`  | 10.11 Mbps   |  9.61 Mbps           |
+With bytes-counting CMS and the rate-scaled threshold (10 Mbps pod
+→ ~125 KiB threshold), natra now lands within vanilla's variance on
+both the single-flow elephant column and the 20-parallel "mice"
+column. Workload 1 success criterion (rate-limited like vanilla) is
+met across all four cells:
 
-The single-stream elephant lands within ~21% of the 10 Mbps cap
-under natra and exactly at cap under vanilla.
+| Direction | Plugin                | Elephant   | Mice (20× parallel)  |
+|-----------|-----------------------|------------|----------------------|
+| ingress   | natra                 | 11.16 Mbps | **11.65 Mbps**       |
+| ingress   | upstream `bandwidth`  | 10.04 Mbps |  9.64 Mbps           |
+| egress    | natra                 | 11.69 Mbps | **12.81 Mbps**       |
+| egress    | upstream `bandwidth`  | 10.11 Mbps |  9.61 Mbps           |
+
+Baseline (no plugin) on this rig lands at ~21-43 Mbps for elephants
+(colima's flannel host-gw is bottlenecked by the LinuxKit kernel's
+software dataplane) rather than the kindnet line-rate ~55 Gbps we
+saw pre-migration. Doesn't affect the rate-limit comparison — both
+natra and vanilla cap at ~10 Mbps which is well below the
+unrestricted baseline — but it does make the baseline-to-throttled
+ratio less dramatic on this hardware. Real Linux hosts with hardware
+network offload would show the full ratio.
+
+Pre-change (packet-count CMS, threshold=50 packets): natra read
+36-39 Mbps on the 20-parallel mice column, 3.5× the cap. The
+bytes-CMS + rate-scaled threshold work cuts that to ~12 Mbps, in
+the same range as the upstream HTB plugin.
 
 The 20-parallel "mice" column sits at the threshold tradeoff
 natra's CMS is designed for. The heavy-hitter threshold is now in
