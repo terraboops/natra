@@ -72,17 +72,21 @@ type Config struct {
 }
 
 type TokenBucket struct {
-	_            uint32 // bpf_spin_lock
-	_            uint32 // alignment
-	Tokens       uint64
-	LastUpdateNs uint64
+	_             uint32 // bpf_spin_lock
+	_             uint32 // alignment
+	Tokens        uint64
+	LastUpdateNs  uint64
+	NextReleaseNs uint64
 }
 
 const (
-	StatPassed    uint32 = 0
-	StatThrottled uint32 = 1
-	StatHHHits    uint32 = 2
-	StatPerDir    uint32 = 3
+	StatPassed     uint32 = 0
+	StatThrottled  uint32 = 1
+	StatHHHits     uint32 = 2
+	StatECNMarked  uint32 = 3
+	StatEDTDelayed uint32 = 4
+	StatDropped    uint32 = 5
+	StatPerDir     uint32 = 6
 )
 
 func StatKey(dir Direction, slot uint32) uint32 {

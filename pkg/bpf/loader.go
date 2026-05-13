@@ -121,21 +121,32 @@ type Config struct {
 // TokenBucket mirrors `struct token_bucket`. The first u32 is the
 // kernel's bpf_spin_lock; the second is alignment padding before the
 // 8-byte fields. Both are kernel-managed — userspace must include
-// them in the layout but never reads them.
+// them in the layout but never reads them. NextReleaseNs is the EDT
+// pacing cursor; the BPF program advances it past now+packet-delay
+// each time it stamps skb->tstamp for an above-rate egress packet.
 type TokenBucket struct {
-	_            uint32 // bpf_spin_lock
-	_            uint32 // alignment
-	Tokens       uint64
-	LastUpdateNs uint64
+	_             uint32 // bpf_spin_lock
+	_             uint32 // alignment
+	Tokens        uint64
+	LastUpdateNs  uint64
+	NextReleaseNs uint64
 }
 
 // Stat slot indices match the per-direction enum in bpf/natra.bpf.c.
 // Userspace key into natra_stats_map = direction * StatPerDir + slot.
+//
+// StatThrottled is the cardinality of all bucket-overflow events;
+// the three disposition slots break it down by what natra actually
+// did with each overflow packet (ECN-mark, EDT-delay, drop) — their
+// sum equals StatThrottled.
 const (
-	StatPassed    uint32 = 0
-	StatThrottled uint32 = 1
-	StatHHHits    uint32 = 2
-	StatPerDir    uint32 = 3
+	StatPassed     uint32 = 0
+	StatThrottled  uint32 = 1
+	StatHHHits     uint32 = 2
+	StatECNMarked  uint32 = 3
+	StatEDTDelayed uint32 = 4
+	StatDropped    uint32 = 5
+	StatPerDir     uint32 = 6
 )
 
 // StatKey returns the natra_stats_map key for (direction, slot).

@@ -79,6 +79,9 @@ func dumpStats(args []string) error {
 			{"passed", bpf.StatPassed},
 			{"throttled", bpf.StatThrottled},
 			{"hh_hits", bpf.StatHHHits},
+			{"ecn_marked", bpf.StatECNMarked},
+			{"edt_delayed", bpf.StatEDTDelayed},
+			{"dropped", bpf.StatDropped},
 		} {
 			statKey := bpf.StatKey(dir, slot.idx)
 			var values []uint64

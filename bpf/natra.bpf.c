@@ -103,10 +103,18 @@ struct {
 	__uint(max_entries, DIR_MAX);
 } natra_config_map SEC(".maps");
 
+// token_bucket tracks (1) the classic rate-limit bucket (tokens +
+// last_update_ns for refill) and (2) the next-release timestamp used
+// for EDT pacing. When the bucket is depleted, natra advances
+// next_release_ns by (packet_bytes * 8e9 / rate_bps) ns per packet
+// and stamps skb->tstamp = next_release_ns. The fq qdisc downstream
+// then holds the skb until that time. No drop → no TCP retransmit →
+// no per-packet softirq amplifier on neighboring pods.
 struct token_bucket {
 	struct bpf_spin_lock lock;
 	__u64 tokens;
 	__u64 last_update_ns;
+	__u64 next_release_ns;
 };
 
 struct {
@@ -153,10 +161,24 @@ struct {
 
 // Stat slots per direction. Total slots = STAT_PER_DIR * DIR_MAX.
 // Userspace key = dir * STAT_PER_DIR + slot.
+//
+// STAT_THROTTLED is bumped for every above-rate packet regardless of
+// whether the eventual disposition was ECN-mark, EDT-delay, or drop —
+// so STAT_THROTTLED is the cardinality of all bucket-overflow events.
+// The disposition-specific stats below break it down:
+//
+//   STAT_ECN_MARKED   ≤ STAT_THROTTLED  (ECN-capable, marked CE, passed)
+//   STAT_EDT_DELAYED  ≤ STAT_THROTTLED  (egress non-ECN, paced via skb->tstamp)
+//   STAT_DROPPED      ≤ STAT_THROTTLED  (ingress non-ECN, TC_ACT_SHOT)
+//
+// Their sum equals STAT_THROTTLED.
 enum {
-	STAT_PASSED    = 0,
-	STAT_THROTTLED = 1,
-	STAT_HH_HITS   = 2,
+	STAT_PASSED      = 0,
+	STAT_THROTTLED   = 1,
+	STAT_HH_HITS     = 2,
+	STAT_ECN_MARKED  = 3,
+	STAT_EDT_DELAYED = 4,
+	STAT_DROPPED     = 5,
 	STAT_PER_DIR,
 };
 
@@ -295,8 +317,9 @@ static __always_inline int parse_flow(struct __sk_buff *skb, struct flow_key *ou
 
 // consume_tokens charges `bytes` against `dir`'s bucket. Returns 1 if
 // the charge succeeded (caller passes the packet), 0 if the bucket
-// lacks tokens (caller drops). Refill is computed lazily from elapsed
-// time so the lock is held for ~tens of ns per packet.
+// lacks tokens (caller falls through to ECN-mark / EDT-pace / drop).
+// Refill is computed lazily from elapsed time so the lock is held for
+// ~tens of ns per packet.
 static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps, __u64 burst, __u64 now)
 {
 	struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &dir);
@@ -334,6 +357,63 @@ static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps
 	return allowed;
 }
 
+// throttle_disposition returns the TC verdict for an above-rate packet
+// and bumps the matching stat. Preference order:
+//
+//   1. ECN-mark via bpf_skb_ecn_set_ce. Helper returns 1 on an
+//      ECN-capable packet (ECT(0) or ECT(1) in IP TOS bits 0-1) and
+//      sets the CE bit. Receiver's TCP backs off without retrans.
+//      Works on both ingress and egress.
+//
+//   2. EDT pacing (egress only). When the packet isn't ECN-capable,
+//      compute a release time per bytes/rate_bps, advance the
+//      bucket's next_release_ns past it, and stamp skb->tstamp.
+//      The downstream fq qdisc holds the skb until that time. No
+//      drop → no retrans. Ingress has no transmission-side qdisc to
+//      honor skb->tstamp, so this path is egress-only.
+//
+//   3. Drop (TC_ACT_SHOT). Only reached for ingress non-ECN traffic
+//      that nothing else can pace.
+//
+// `bytes` and `rate_bps` come from the caller; passed in so the helper
+// is independent of the natra_config / skb layout.
+static __always_inline int throttle_disposition(struct __sk_buff *skb,
+						__u32 dir,
+						__u64 now_ns,
+						__u64 rate_bps,
+						__u64 bytes)
+{
+	if (bpf_skb_ecn_set_ce(skb) > 0) {
+		bump_stat(dir, STAT_ECN_MARKED);
+		return TC_ACT_OK;
+	}
+
+	if (dir == DIR_EGRESS) {
+		struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &dir);
+		if (tb && rate_bps > 0) {
+			// add_ns = bytes * 8 * 1e9 / rate_bps. Split so the
+			// multiply stays inside u64 for MTU-sized packets at
+			// modest rates (e.g., 1500 B at 1 Mbps → 12 ms).
+			__u64 add_ns = (bytes * 8000ULL) * 1000000ULL / rate_bps;
+			__u64 release_at;
+			bpf_spin_lock(&tb->lock);
+			__u64 base = tb->next_release_ns;
+			if (base < now_ns)
+				base = now_ns;
+			release_at = base + add_ns;
+			tb->next_release_ns = release_at;
+			bpf_spin_unlock(&tb->lock);
+
+			skb->tstamp = release_at;
+			bump_stat(dir, STAT_EDT_DELAYED);
+			return TC_ACT_OK;
+		}
+	}
+
+	bump_stat(dir, STAT_DROPPED);
+	return TC_ACT_SHOT;
+}
+
 static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 {
 	struct natra_config *cfg = bpf_map_lookup_elem(&natra_config_map, &dir);
@@ -367,12 +447,17 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 
 	// Heavy hitter — token bucket gate.
 	bump_stat(dir, STAT_HH_HITS);
-	if (consume_tokens(dir, skb->len, cfg->rate_bps, cfg->burst_bytes, now_ns)) {
+	__u64 len = skb->len;
+	if (consume_tokens(dir, len, cfg->rate_bps, cfg->burst_bytes, now_ns)) {
 		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
+	// Above the rate: prefer ECN-mark, fall back to EDT pacing on
+	// egress, drop only if nothing else applies. STAT_THROTTLED is
+	// the cardinality of all overflow events; the disposition stat
+	// (ECN_MARKED / EDT_DELAYED / DROPPED) records the outcome.
 	bump_stat(dir, STAT_THROTTLED);
-	return TC_ACT_SHOT;
+	return throttle_disposition(skb, dir, now_ns, cfg->rate_bps, len);
 }
 
 SEC("tc")

@@ -30,10 +30,27 @@ type (
 )
 
 const (
-	statPassed    = bpf.StatPassed
-	statThrottled = bpf.StatThrottled
-	statHHHits    = bpf.StatHHHits
+	statPassed     = bpf.StatPassed
+	statThrottled  = bpf.StatThrottled
+	statHHHits     = bpf.StatHHHits
+	statECNMarked  = bpf.StatECNMarked
+	statEDTDelayed = bpf.StatEDTDelayed
+	statDropped    = bpf.StatDropped
 )
+
+// throttleVerdict returns the TC verdict and matching disposition stat
+// slot that natra produces for an above-rate non-ECN packet. The two
+// directions differ: egress paces via EDT (TC_ACT_OK, STAT_EDT_DELAYED);
+// ingress has no transmission-side qdisc to honor skb->tstamp, so it
+// falls back to drop (TC_ACT_SHOT, STAT_DROPPED). ECN-capable packets
+// land in STAT_ECN_MARKED in either direction; the synthetic packets
+// used by these tests don't set ECT bits so they never take that path.
+func throttleVerdict(dir bpf.Direction) (verdict uint32, stat uint32) {
+	if dir == bpf.DirectionEgress {
+		return 0, statEDTDelayed // TC_ACT_OK
+	}
+	return 2, statDropped // TC_ACT_SHOT
+}
 
 // directionCases lists the per-direction setup the headline tests
 // iterate over. Each case binds together a program FD, the matching
@@ -220,6 +237,73 @@ func synthEthIPpktFromFlow(srcIP, dstIP uint32, srcPort, dstPort uint16) []byte 
 	return pkt
 }
 
+// withECT marks the packet as ECN-capable (ECT(0) — TOS bits = 10).
+// bpf_skb_ecn_set_ce only sets CE on packets that already have ECT;
+// non-ECT packets go down the EDT-or-drop path.
+func withECT(pkt []byte) []byte {
+	pkt[15] = 0x02
+	return pkt
+}
+
+// TestNatraECNMarkOnAboveRate confirms that an ECN-capable above-rate
+// packet returns TC_ACT_OK with STAT_ECN_MARKED bumped instead of
+// being dropped or EDT-delayed. The bucket stays empty (no token
+// deduction in the disposition path); the contract is "marked CE,
+// peer's TCP will back off".
+func TestNatraECNMarkOnAboveRate(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
+	for _, dc := range directionCases(progIngress, progEgress) {
+		t.Run(dc.name, func(t *testing.T) {
+			cfg := natraConfig{
+				RateBps:     1,
+				BurstBytes:  64, // one packet's worth
+				HHThreshold: 0,  // every packet is "heavy"
+			}
+			key := dc.mapKey
+			if err := cfgMap.Update(&key, &cfg, ebpf.UpdateAny); err != nil {
+				t.Fatalf("config: %v", err)
+			}
+			tb := tokenBucket{Tokens: 64} // exactly one packet of credit
+			if err := bucketMap.Update(&key, &tb, ebpf.UpdateAny); err != nil {
+				t.Fatalf("bucket: %v", err)
+			}
+
+			beforeECN := readPerCPUStat(t, statsMap, dc.statKey(statECNMarked))
+			beforeDrop := readPerCPUStat(t, statsMap, dc.statKey(statDropped))
+			beforeEDT := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed))
+
+			pkt := withECT(synthEthIPpkt())
+
+			// Packet 1: bucket has tokens, passes via the normal path.
+			ret, _, err := dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("packet 1: %v", err)
+			}
+			if ret != 0 {
+				t.Fatalf("packet 1 ret=%d, want 0 (bucket admits one packet)", ret)
+			}
+
+			// Packet 2: bucket empty, ECN-capable → mark CE, pass.
+			ret, _, err = dc.prog.Test(pkt)
+			if err != nil {
+				t.Fatalf("packet 2: %v", err)
+			}
+			if ret != 0 {
+				t.Errorf("packet 2 ret=%d, want 0 (ECN-marked, not dropped)", ret)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statECNMarked)) - beforeECN; got != 1 {
+				t.Errorf("STAT_ECN_MARKED delta=%d, want 1", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statDropped)) - beforeDrop; got != 0 {
+				t.Errorf("STAT_DROPPED delta=%d, want 0 (ECN preferred over drop)", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed)) - beforeEDT; got != 0 {
+				t.Errorf("STAT_EDT_DELAYED delta=%d, want 0 (ECN preferred over EDT)", got)
+			}
+		})
+	}
+}
+
 func TestNatraCMSMiceFlowsBypassTokenBucket(t *testing.T) {
 	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
 	for _, dc := range directionCases(progIngress, progEgress) {
@@ -319,13 +403,17 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 
 			// 12th packet (count=12, still heavy): bucket empty (one packet
 			// drained it), rate is 1 byte/sec so micro-second elapsed adds
-			// nothing. Should throttle.
+			// nothing. Over-rate verdict differs per direction — egress
+			// paces via EDT, ingress drops.
+			wantRet, wantStat := throttleVerdict(dc.dir)
+			beforeDisp := readPerCPUStat(t, statsMap, dc.statKey(wantStat))
+
 			ret, _, err = dc.prog.Test(pkt)
 			if err != nil {
 				t.Fatalf("packet 12: %v", err)
 			}
-			if ret != 2 {
-				t.Errorf("12th packet ret=%d, want 2 (TC_ACT_SHOT; bucket empty)", ret)
+			if uint32(ret) != wantRet {
+				t.Errorf("12th packet ret=%d, want %d (direction-specific throttle verdict)", ret, wantRet)
 			}
 
 			if got := readPerCPUStat(t, statsMap, dc.statKey(statHHHits)) - beforeHH; got != 2 {
@@ -333,6 +421,9 @@ func TestNatraCMSElephantHitsBucket(t *testing.T) {
 			}
 			if got := readPerCPUStat(t, statsMap, dc.statKey(statThrottled)) - beforeThrottled; got != 1 {
 				t.Errorf("STAT_THROTTLED delta=%d, want 1", got)
+			}
+			if got := readPerCPUStat(t, statsMap, dc.statKey(wantStat)) - beforeDisp; got != 1 {
+				t.Errorf("disposition stat delta=%d, want 1", got)
 			}
 		})
 	}
@@ -374,15 +465,23 @@ func TestNatraTokenBucketThrottlesOnceBurstSpent(t *testing.T) {
 			}
 
 			// Second packet: bucket is empty, rate is 1 byte/sec, microseconds
-			// since the first call → no refill → must throttle.
+			// since the first call → no refill → must throttle. Over-rate
+			// verdict differs per direction (EDT-paced on egress, dropped
+			// on ingress).
+			wantRet, wantStat := throttleVerdict(dc.dir)
+			beforeDisp := readPerCPUStat(t, statsMap, dc.statKey(wantStat))
+
 			ret, _, err = dc.prog.Test(pkt)
 			if err != nil {
 				t.Fatalf("BPF_PROG_RUN #2: %v", err)
 			}
-			if ret != 2 { // TC_ACT_SHOT
-				t.Errorf("second packet ret=%d, want 2 (TC_ACT_SHOT) — bucket should be empty", ret)
+			if uint32(ret) != wantRet {
+				t.Errorf("second packet ret=%d, want %d (direction-specific throttle verdict)", ret, wantRet)
 			}
 
+			if got := readPerCPUStat(t, statsMap, dc.statKey(wantStat)) - beforeDisp; got != 1 {
+				t.Errorf("disposition stat delta=%d, want 1", got)
+			}
 			if got := readPerCPUStat(t, statsMap, dc.statKey(statPassed)) - beforePassed; got != 1 {
 				t.Errorf("STAT_PASSED delta = %d, want 1", got)
 			}
