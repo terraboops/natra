@@ -32,6 +32,13 @@
 #         baseline   → base CNI alone, no rate-limiting plugin
 #     Run each separately, get three TSVs, compare post-hoc.
 #
+#   - Cilium as the base CNI, installed with kubeProxyReplacement +
+#     bpf.masquerade + native routing. Mirrors the AWS VPC CNI +
+#     Network Policy Agent dataplane shape: another eBPF program is
+#     already on clsact/tcx for every pod veth before our rate-
+#     limiter ever runs CNI ADD. Same adversarial coexistence that
+#     the upstream bandwidth plugin can't handle on AWS today.
+#
 # Output (per run, under --output):
 #
 #     metrics.tsv           one row per measurement, columns:
@@ -73,14 +80,16 @@ Usage: soak-test.sh [flags]
   --deep-interval <seconds>          Heap/bpf snapshot cadence. Default: 1800.
 
 Modes:
-  natra     — k3d (k3s default flannel) + natra chained after.
-  vanilla   — k3d (k3s default flannel) + upstream containernetworking bandwidth plugin.
-  baseline  — k3d (k3s default flannel) alone. The "no rate limiter" reference.
+  natra     — k3d + Cilium (NPA-shaped) + natra chained after.
+  vanilla   — k3d + Cilium (NPA-shaped) + upstream containernetworking bandwidth plugin.
+  baseline  — k3d + Cilium (NPA-shaped) alone. The "no rate limiter" reference.
 
-Note: the base CNI is currently k3s's default flannel. A Cilium- or
-Calico-eBPF base (to simulate AWS Network Policy Agent's clsact-eBPF
-coexistence with the bandwidth plugin) is on the TODO list — see
-the comment block around bootstrap_cluster() for context.
+The Cilium install mirrors AWS VPC CNI + Network Policy Agent: Cilium
+owns kube-proxy, owns masquerade, uses native (no-tunnel) routing,
+and attaches BPF programs at every clsact/tcx hook on every pod veth
+before any chained rate-limiter sees the pod. Same adversarial
+coexistence profile that the upstream bandwidth plugin can't handle
+on AWS today. CILIUM_VERSION env var pins the install (default 1.16.5).
 EOF
 }
 
@@ -110,6 +119,13 @@ require docker
 require k3d
 require kubectl
 require jq
+# cilium CLI installs Cilium as the base CNI on the k3d cluster. On
+# macOS: `brew install cilium-cli`. The cilium CLI handles CRDs,
+# RBAC, operator + agent DaemonSet, and the post-install readiness
+# probe — much less brittle than vendoring a rendered manifest.
+require cilium
+
+CILIUM_VERSION="${CILIUM_VERSION:-1.16.5}"
 
 mkdir -p "$OUTPUT_DIR/heap" "$OUTPUT_DIR/bpf"
 
@@ -165,15 +181,23 @@ bootstrap_cluster() {
     done
 
     log_event "bootstrap: creating k3d cluster $CLUSTER with $INITIAL_NODES workers"
-    # --no-lb: skip the load balancer container; soak doesn't need
-    # a service LB. --k3s-arg ... --disable=traefik,servicelb: drop
-    # addons we don't use. Default k3s networking (flannel) is left
-    # in place — Calico-eBPF as a separate base for NPA-style BPF
-    # coexistence is on the TODO list as a follow-up.
+    # k3s args:
+    #   --disable=traefik,servicelb: drop addons we don't use.
+    #   --disable=kube-proxy: Cilium replaces it (NPA-shape requires
+    #     Cilium to own as much of the dataplane as practical).
+    #   --disable-network-policy: don't run k3s's policy controller;
+    #     Cilium handles policy.
+    #   --flannel-backend=none: disable k3s's default flannel CNI so
+    #     Cilium can install as the base.
+    # Pods stay Pending until Cilium is up — handled by the
+    # cilium-status --wait below.
     k3d cluster create "$CLUSTER" \
         --agents "$INITIAL_NODES" \
         --no-lb \
         --k3s-arg "--disable=traefik,servicelb@server:0" \
+        --k3s-arg "--disable=kube-proxy@server:0" \
+        --k3s-arg "--disable-network-policy@server:0" \
+        --k3s-arg "--flannel-backend=none@server:0" \
         --wait
 
     log_event "bootstrap: importing pre-pulled images into $CLUSTER"
@@ -182,6 +206,38 @@ bootstrap_cluster() {
             k3d image import "$img" -c "$CLUSTER" 2>&1 | tail -1 || true
         fi
     done
+
+    log_event "bootstrap: installing Cilium $CILIUM_VERSION (NPA-shaped install)"
+    # NPA-shaped install: Cilium owns kube-proxy, owns masquerade,
+    # uses native routing (no tunnel — mirrors AWS VPC CNI's
+    # routable pod CIDR), and attaches BPF programs at every
+    # clsact/tcx hook on every pod veth. By the time natra (or the
+    # upstream bandwidth plugin) runs CNI ADD on a pod, Cilium's
+    # BPF program is already on the qdisc — same adversarial
+    # coexistence profile that breaks the upstream bandwidth plugin
+    # on AWS VPC CNI + NPA today.
+    #
+    # The k3sHostRoot setting points Cilium at k3s's data dir for
+    # cgroup discovery; without it, kubeProxyReplacement fails to
+    # find the cgroup2 mount on k3d nodes.
+    #
+    # ipam.mode=kubernetes uses k3s's PodCIDR allocations directly
+    # rather than Cilium's own pool; simpler on k3d.
+    cilium install --version "$CILIUM_VERSION" \
+        --set kubeProxyReplacement=true \
+        --set bpf.masquerade=true \
+        --set routingMode=native \
+        --set autoDirectNodeRoutes=true \
+        --set ipv4NativeRoutingCIDR=10.42.0.0/16 \
+        --set ipam.mode=kubernetes \
+        --set k8sServiceHost=auto \
+        --set k8sServicePort=6443 \
+        --set cgroup.autoMount.enabled=false \
+        --set cgroup.hostRoot=/sys/fs/cgroup \
+        --set operator.replicas=1 \
+        2>&1 | tail -5
+    log_event "bootstrap: waiting for Cilium to become Ready (3-5 min)"
+    cilium status --wait --wait-duration 5m 2>&1 | tail -10
 
     log_event "bootstrap: installing goldpinger"
     # Minimal goldpinger manifest. Upstream ships Helm charts, not
