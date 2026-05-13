@@ -695,12 +695,21 @@ trap 'rm -rf "$TMPDIR"; cleanup' EXIT
 # server, no LoadBalancer, drop traefik/servicelb addons we don't use.
 # Default flannel CNI stays in place; natra (Phase A) and the vanilla
 # bandwidth plugin (Phase B) chain after it.
+#
+# flannel backend forced to host-gw: VXLAN (k3s default) goes through
+# software encap which is brutally slow on colima/LinuxKit (no hw
+# offload). Observed: 30 Mbps baseline on VXLAN vs ~Gbps on host-gw,
+# making the "is natra limiting below the unlimited baseline?" test
+# meaningless because the unlimited baseline lands at the limit. The
+# k3d nodes share the same docker bridge network so host-gw direct
+# routing works without extra config.
 bootstrap_k3d() {
     local cluster="$1"
     k3d cluster create "$cluster" \
         --agents 1 \
         --no-lb \
         --k3s-arg "--disable=traefik,servicelb@server:0" \
+        --k3s-arg "--flannel-backend=host-gw@server:0" \
         --wait
 }
 

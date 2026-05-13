@@ -136,10 +136,16 @@ var _ = BeforeSuite(func() {
 	requireBinary("docker")
 
 	By("creating k3d cluster")
+	// flannel backend = host-gw: VXLAN encap is ~30 Mbps on colima
+	// (no hw offload in LinuxKit), which is below the rate-limit
+	// caps under test and makes throttle assertions meaningless.
+	// host-gw uses direct route entries between nodes on the same
+	// docker bridge; near-line-rate, matches kind+kindnet behavior.
 	mustExec("k3d", "cluster", "create", clusterName,
 		"--agents", "1",
 		"--no-lb",
 		"--k3s-arg", "--disable=traefik,servicelb@server:0",
+		"--k3s-arg", "--flannel-backend=host-gw@server:0",
 		"--wait",
 	)
 
