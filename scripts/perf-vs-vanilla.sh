@@ -363,9 +363,24 @@ start_profile_collector() {
     # 25s in the background; the natra mixed workload lasts ~30s,
     # so this overlaps the steady-state phase. Captures land at
     # ${profile_dir}/bpftool-prog-profile.txt.
+    #
+    # bpftool isn't in the kindest/node image by default. Install
+    # bpfcc-tools (which pulls in bpftool on debian) on demand. The
+    # install is cached on the image layer for subsequent runs in
+    # the same script invocation.
     docker exec "${cluster}-worker" bash -c '
         if ! command -v bpftool >/dev/null 2>&1; then
-            echo "bpftool not available; skipping prog profile" > /var/log/natra-profile/bpftool.txt
+            apt-get update -qq >/dev/null 2>&1 && \
+                apt-get install -y -qq bpfcc-tools linux-tools-generic >/dev/null 2>&1 || true
+            # Some kindest/node variants ship bpftool only under
+            # /usr/lib/linux-tools-*/bpftool — link it if so.
+            if ! command -v bpftool >/dev/null 2>&1; then
+                bp=$(ls /usr/lib/linux-tools-*/bpftool 2>/dev/null | head -1)
+                if [ -n "$bp" ]; then ln -sf "$bp" /usr/local/bin/bpftool; fi
+            fi
+        fi
+        if ! command -v bpftool >/dev/null 2>&1; then
+            echo "bpftool not installable; skipping prog profile" > /var/log/natra-profile/bpftool.txt
             exit 0
         fi
         # Resolve natra prog IDs by name. There may be multiple if
