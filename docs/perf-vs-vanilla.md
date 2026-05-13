@@ -87,7 +87,12 @@ from both plugins. Override on metal:
 RATE_SWEEP="100M 1G 10G 40G" make perf-vs-vanilla
 ```
 
-### Results (colima, aarch64, k3d + flannel host-gw, 10M rate)
+### Results
+
+Single-rig sample, single annotated rate. Rig: colima on aarch64
+macOS, LinuxKit kernel ~6.8.x, k3d v5.7.4 (k3s under containerd) on
+the docker bridge, flannel host-gw, no NIC offload (software
+dataplane). One run; numbers below are not averaged across runs.
 
 | Direction | Plugin                | Elephant   | Mice (20× parallel)  |
 |-----------|-----------------------|------------|----------------------|
@@ -98,7 +103,7 @@ RATE_SWEEP="100M 1G 10G 40G" make perf-vs-vanilla
 
 Both plugins land within their cap-plus-burst envelope; natra's
 single-flow elephant and 20-parallel mice columns sit in the same
-range as the upstream HTB plugin.
+range as the upstream HTB plugin on this rig.
 
 Baseline (no plugin) on this rig is ~21-43 Mbps for elephants —
 colima's flannel host-gw is bottlenecked by the LinuxKit kernel's
@@ -148,6 +153,9 @@ Three things to read out of the result table:
 
 ### Results
 
+Same rig as Workload 1 (colima, LinuxKit ~6.8.x, k3d, flannel
+host-gw, no NIC offload). Numbers from a single run.
+
 | Plugin                       | iperf ing | iperf eg  | Annotated mice (perf-server) RPS / p99 | Bystander RPS / p99 |
 |------------------------------|-----------|-----------|---------------------------------------:|--------------------:|
 | baseline (no plugin)         | ~8 Gbps   | ~27 Gbps  | 5283 / 71 ms                           | 6479 / 25 ms        |
@@ -160,12 +168,42 @@ is CMS classification: each hey request is a fresh flow_key that
 stays under the heavy-hitter threshold, fast-passes the bucket, and
 doesn't queue behind the elephant.
 
-Bystander numbers track vanilla: 43 ms p99 vs vanilla's 40 ms, RPS
-within run-to-run variance of both vanilla and baseline. The
-bystander p99 over baseline (25 ms → 43 ms) is the cost of having a
-paced elephant share a worker node — softirq time, NIC rings, cache
-pressure, bridge forwarding — and is structural to throttling an
-elephant on a shared NIC rather than specific to either plugin.
+Bystander numbers on this run are within a few percent of vanilla
+and baseline. The bystander p99 gap from baseline (25 ms → 43 ms)
+is consistent with the cost of having a paced elephant share a
+worker node — softirq time, NIC rings, cache pressure, bridge
+forwarding — which is structural to throttling an elephant on a
+shared NIC rather than specific to either plugin. Sample size is
+one; we haven't characterized the run-to-run distribution.
+
+## What hasn't been measured
+
+What the numbers above support is "on a single-kernel, single-bridge
+k3d rig with software dataplane, natra throttles within
+cap-plus-burst and lets unrelated flows fast-pass." That's the
+extent of the empirical claim. Specifically *not* yet validated:
+
+- **Real-NIC behavior.** No measurements on hardware NICs.
+  TSO/GRO/LRO offloads, hardware TX timestamping, real interrupt
+  coalescing — none of those are exercised by colima's software
+  dataplane. The BPF program sees whatever GRO shape colima
+  produces; on real hardware the shape will differ.
+- **Cross-kernel wire.** k3d's "nodes" are containers sharing one
+  Linux kernel. Inter-node packets cross a software bridge, not a
+  switch. ECN-CE is set but never observed as actual congestion;
+  real queueing and real wire latency aren't tested.
+- **Run-to-run variance.** Each cell is a single sample. We don't
+  yet have a distribution to report mean/p99/p100 over.
+- **High-rate accuracy.** The `RATE_SWEEP=10G` rows show plugin
+  behavior under a 10G annotation, but the wire on this rig is
+  ~1 Gbps single-stream, so we're observing "natra didn't make
+  things worse than wire speed," not "natra accurately throttles
+  to 10 Gbps."
+- **cilium / aws-network-policy-agent coexistence.** Composes via
+  `bpf_mprog` on kernel 6.6+ by construction; we haven't run a
+  composed stack in this rig.
+
+The plan to close those gaps is in `docs/test-environments.md`.
 
 ## Throttle disposition
 

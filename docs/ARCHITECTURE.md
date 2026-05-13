@@ -266,7 +266,9 @@ returned link to bpffs at
 `/sys/fs/bpf/natra/<containerID>-<side>-<direction>-link`. The
 kernel holds each program reference via its link until `cmdDel`
 removes the pin. Composes via `bpf_mprog` with anything else
-attaching at the same hook.
+attaching at the same hook — that's the contract bpf_mprog
+provides; we haven't run a composed stack (cilium / NPA + natra)
+end-to-end yet.
 
 ### Hook: clsact (kernel 5.x+)
 
@@ -309,9 +311,29 @@ host netns is locked down or already crowded with another BPF stack.
 
 ## Open ends
 
+Code-level gaps:
+
 - IPv6: `parse_flow` returns -1 for non-IPv4, so IPv6 flows pass
   through unrate-limited in either direction.
 - UDP: parsed for the 5-tuple, same fast path as TCP.
 - CO-RE: BPF program currently uses fixed kernel headers; CO-RE would
   help on heterogeneous kernels.
 - ebpf_exporter integration for the per-direction stats slots.
+
+Properties that are claimed by construction but not yet validated
+on a real rig (this list is what the test environments in
+`docs/test-environments.md` would close):
+
+- **cilium / aws-network-policy-agent coexistence.** The
+  bpf_mprog contract on TCX says natra composes; we haven't run a
+  loaded cilium cluster with natra chained alongside.
+- **Real-NIC offload behavior.** TSO, GRO, LRO, hardware TX
+  timestamping all reshape what the BPF program sees vs. what a
+  software bridge produces. The L3-L5 rig is software-only.
+- **CMS classification under saturated workloads.** Past ~50K
+  concurrent flows per direction, collisions dominate and every
+  flow looks heavy. The chaos test confirms the program survives
+  the condition, not that the classification stays meaningful.
+- **Above-1Gbps annotated rates on the wire.** The token-bucket
+  math is rate-agnostic, but we don't have a rig that can produce
+  >1 Gbps single-stream to confirm in-the-wild behavior.

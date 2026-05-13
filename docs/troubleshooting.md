@@ -136,8 +136,10 @@ annotation), natra is fail-open: it loaded but the attach failed. See
 ### Throughput is well below the annotation
 
 Most likely cause: the heavy-hitter threshold is wrong for the
-workload. natra rate-limits flows whose CMS estimate exceeds the
-threshold (default 50). Below threshold, mice take the fast pass and
+workload. natra rate-limits flows whose CMS byte count exceeds the
+threshold. The per-pod default is rate-scaled
+(`max(16 KiB, rate × 100 ms / 1000)`); a 10 Mbps pod gets ~125 KiB,
+a 1 Gbps pod ~12.5 MiB. Below threshold, mice take the fast pass and
 ignore the bucket. Above threshold, every packet pays tokens.
 
 A workload of many sustained TCP flows (each crossing threshold within
@@ -166,7 +168,7 @@ on failure the test dumps:
 - The natra install container log
 - The patched conflist on the worker node
 
-`NATRA_E2E_KEEP=1 make test-e2e` leaves the kind cluster up after the
+`NATRA_E2E_KEEP=1 make test-e2e` leaves the k3d cluster up after the
 test for inspection; otherwise the AfterSuite tears it down.
 
 ## Verify kernel

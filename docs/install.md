@@ -21,6 +21,13 @@ candidate paths because different k8s distros configure their
 container runtime with different `cni.bin_dir` values — installing
 everywhere is cheaper than introspecting per-distro.
 
+Coverage: the DaemonSet path is the one exercised by L4 e2e and
+`scripts/perf-vs-vanilla.sh` on k3d. The baked-image and manual
+paths are described mechanically — they don't have automated
+coverage because each requires a distro-specific image / config
+toolchain. The CNI behavior they produce is identical (same
+binary, same caps, same conflist shape).
+
 ## 1. DaemonSet (default)
 
 The `deploy/cni-installer.yaml` manifest creates a DaemonSet that

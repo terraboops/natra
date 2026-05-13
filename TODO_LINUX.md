@@ -12,7 +12,7 @@ to know when it goes red" reference.
 |     1 | Unit + Go-native fuzz + benchmarks            | _none_       |
 |     2 | CNI protocol — exec the binary in a netns     | `integration`|
 |     3 | BPF dataplane — `BPF_PROG_RUN` + verifier     | `bpf`        |
-|     4 | kind end-to-end with iperf assertions         | `e2e`        |
+|     4 | k3d end-to-end with iperf assertions          | `e2e`        |
 |     5 | Perf scenarios + synthetic vs-vanilla         | `perf`       |
 
 Plain `go test ./...` runs only L1.
@@ -98,10 +98,12 @@ Constraints to be aware of when extending L3 tests:
   inside `bpf_spin_lock`-protected regions. Read the timestamp first,
   then take the lock.
 
-## Layer 4 — kind end-to-end
+## Layer 4 — k3d end-to-end
 
 Files under `test/e2e/`:
-- `kind-config.yaml` — 2-node kind cluster, kindnet as main CNI.
+- `e2e_test.go::BeforeSuite` — creates a 2-node k3d cluster (1 server +
+  1 agent) with flannel host-gw forced (VXLAN is ~30 Mbps on colima's
+  LinuxKit kernel, below the rate-limit caps under test).
 - `manifests/iperf-server.yaml` — server with
   `kubernetes.io/ingress-bandwidth: "10M"` (Topology A).
 - `manifests/iperf-server-egress.yaml` — egress only (Topology B).
@@ -140,12 +142,12 @@ NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e
 
 Prerequisites:
 - Docker (colima or Docker Desktop on macOS, dockerd on Linux).
-- `kind`, `kubectl`.
+- `k3d` v5.7.4+, `kubectl`.
 - `iperf3` (in-pod, image `networkstatic/iperf3:latest`).
 
 Failure-mode dumps: on iperf-Ready timeout, BeforeSuite emits
 `kubectl describe pod`, the install init-container log, and the
-patched conflist. `NATRA_E2E_KEEP=1 make test-e2e` leaves the kind
+patched conflist. `NATRA_E2E_KEEP=1 make test-e2e` leaves the k3d
 cluster up after the test.
 
 ## Layer 5 — Perf
@@ -171,7 +173,7 @@ Files under `test/perf/`:
 Run:
 ```bash
 make test-perf            # synthetic, in-process, BPF_PROG_RUN
-make perf-vs-vanilla      # real-cluster, ~6 min
+make perf-vs-vanilla      # real-cluster, ~18-22 min, three k3d phases
 ```
 
 The mixed scenario is elephant-first by design: the elephant
@@ -229,7 +231,7 @@ schedule gating. Concurrency-cancel in-progress runs per ref.
 | `unit.yml`    | 1 (unit + fuzz + bench)      | <30s unit, <2m fuzz, <2m bench |
 | `cni.yml`     | 2 (CNI + chaos)              | <3m |
 | `bpf.yml`     | 3 (BPF, single kernel)       | <5m |
-| `e2e.yml`     | 4 (kind + chaos)             | <8m |
+| `e2e.yml`     | 4 (k3d + chaos)              | <8m |
 | `perf.yml`    | 5 (perf, single kernel)      | <5m |
 | `license.yml` | go-licenses + scancode       | <2m |
 | `ci.yml`      | aggregator (`needs:`)        | reads other jobs |
@@ -264,7 +266,14 @@ runs everything.
 - **Real-veth in L3.** `BPF_PROG_RUN`'s ~3,772 B input cap rules out
   jumbo behavior at the BPF unit level. Real-veth coverage is
   currently in L4 only.
-- **AWS VPC CNI coexistence.** natra and AWS's network-policy-agent
-  both operate at the same hook layer; tcx-mode coexistence is the
-  intended path. Validation needs a real EKS cluster.
+- **Single-kernel L4/L5 topology.** k3d's "nodes" are containers
+  sharing one Linux kernel and one docker bridge. Cross-kernel
+  network-stack behavior — real NIC offloads, real wire latency,
+  switch-side queueing, ECN at routers — isn't reached. See
+  `docs/test-environments.md` for the planned escalation
+  (multi-VM-on-host → cloud VMs → bare metal).
+- **Cilium / AWS NPA coexistence.** natra composes via bpf_mprog at
+  the TCX hook by construction; no end-to-end rig with a loaded
+  cilium / NPA cluster has been run yet. Validation needs a real
+  EKS-or-similar cluster.
 - **`linux/arm64` in CI.** Local Mac dev runs arm64; CI runs amd64.

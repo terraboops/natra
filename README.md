@@ -99,6 +99,8 @@ make ci            # full matrix (lint, licenses, L1-L5)
 - [CNI behavior](docs/cni-spec.md) — verbs, NetConf shape, attach modes
 - [Performance vs. vanilla](docs/perf-vs-vanilla.md) — head-to-head
   with the upstream bandwidth plugin
+- [Test environments](docs/test-environments.md) — what each test
+  layer validates and what's not yet covered
 - [Development](docs/development.md) — build, test, debug
 - [Troubleshooting](docs/troubleshooting.md) — common failure modes
 - [TODO_LINUX.md](TODO_LINUX.md) — per-layer test details

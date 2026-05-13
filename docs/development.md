@@ -69,7 +69,7 @@ A real-cluster head-to-head against the upstream
 on-demand:
 
 ```bash
-make perf-vs-vanilla   # ~6 min; two k3d clusters, real iperf
+make perf-vs-vanilla   # ~18-22 min; three k3d clusters in sequence
 ```
 
 See `docs/perf-vs-vanilla.md` for what it measures.
