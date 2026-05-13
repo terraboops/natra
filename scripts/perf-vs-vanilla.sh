@@ -186,6 +186,12 @@ install_bpftool_in_node() {
     if [ -z "$BPFTOOL_HOST_PATH" ] || [ ! -x "$BPFTOOL_HOST_PATH" ]; then
         return 1
     fi
+    # /usr/local/bin doesn't exist on rancher/k3s (busybox) by default.
+    # Create it inside the node container before copying so docker cp
+    # has somewhere to land. /bin is read-only on some images, /usr/
+    # local/bin is the standard "writable user binaries" directory and
+    # k3s nodes do support it once created.
+    docker exec "$node" mkdir -p /usr/local/bin >/dev/null 2>&1 || true
     if ! docker cp "$BPFTOOL_HOST_PATH" "$node:/usr/local/bin/bpftool" >&2; then
         echo "==> install_bpftool_in_node: docker cp to $node failed" >&2
         return 1
