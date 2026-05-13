@@ -81,10 +81,22 @@ type NetConf struct {
 // NetConfDefaults holds cluster-wide defaults. All fields are
 // optional; zero means "use natra's compiled-in default".
 type NetConfDefaults struct {
-	// HHThreshold overrides the heavy-hitter threshold default
-	// (compiled-in: 50). Lower = stricter shaping (mice become
+	// HHThreshold (bytes) overrides the heavy-hitter threshold
+	// when present. When absent (zero) the threshold is computed
+	// per-pod via the FastPassTimeConstantMs formula:
+	//   threshold = max(MinHHThresholdBytes, rate_bps × time_constant / 1000)
+	// so a 10 Mbps pod gets ~128 KiB threshold and a 1 Gbps pod
+	// gets ~12.5 MiB. Lower = stricter shaping (mice become
 	// elephants faster); higher = more mice protection.
 	HHThreshold int64 `json:"hhThreshold,omitempty"`
+	// FastPassTimeConstantMs sets how much "honeymoon" time each
+	// new flow gets at the pod's rate before classification:
+	//   threshold = rate_bps × FastPassTimeConstantMs / 1000
+	// Default 100 ms. Higher values give more headroom for tail
+	// mice (large API responses, file uploads) at the cost of
+	// looser rate-limit caps under bursty parallel-flow workloads.
+	// Per-pod HHThreshold annotation overrides this.
+	FastPassTimeConstantMs int64 `json:"fastPassTimeConstantMs,omitempty"`
 	// BurstRatio overrides the default burst-to-rate ratio
 	// (compiled-in: 2). A 10 Mbps annotation with ratio 2 gives a
 	// 2.5 MB token bucket (= 2 seconds of credit).
@@ -442,9 +454,7 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 		// Cluster-default heavy-hitter threshold. kubelet's
 		// runtimeConfig.bandwidth has no per-pod way to specify
 		// this, so the cluster default is the only knob.
-		if conf.Defaults != nil && conf.Defaults.HHThreshold > 0 {
-			out.HeavyHitterThreshold = conf.Defaults.HHThreshold
-		}
+		out.HeavyHitterThreshold = resolveHHThreshold(conf, out.Rate)
 		return out
 	}
 	if conf.RuntimeConfig.PodAnnotations != nil {
@@ -458,10 +468,10 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 				// Apply cluster defaults only where the annotation
 				// didn't (heuristically: value matches the library's
 				// compiled-in default). Explicit per-pod values win.
+				if parsed.HeavyHitterThreshold == config.DefaultConfig().HeavyHitterThreshold {
+					parsed.HeavyHitterThreshold = resolveHHThreshold(conf, parsed.Rate)
+				}
 				if conf.Defaults != nil {
-					if conf.Defaults.HHThreshold > 0 && parsed.HeavyHitterThreshold == config.DefaultConfig().HeavyHitterThreshold {
-						parsed.HeavyHitterThreshold = conf.Defaults.HHThreshold
-					}
 					if conf.Defaults.BurstRatio > 0 && parsed.Burst == parsed.Rate*2 {
 						parsed.Burst = int64(float64(parsed.Rate) * burstRatio)
 					}
@@ -471,6 +481,50 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 		}
 	}
 	return nil
+}
+
+// defaultFastPassTimeConstantMs is the per-pod honeymoon a new flow
+// gets at the pod's annotated rate before crossing the heavy-hitter
+// threshold. 100 ms is the experimentally validated value — short
+// enough that the 20-parallel iperf workload stays within the rate
+// cap, long enough that typical HTTP requests (a few hundred KB at
+// most) fast-pass cleanly. Tunable cluster-wide via
+// defaults.fastPassTimeConstantMs (NATRA_FASTPASS_TIME_CONSTANT_MS on
+// the installer DaemonSet).
+const defaultFastPassTimeConstantMs = 100
+
+// minHHThresholdBytes is the floor on the rate-scaled threshold.
+// Below this, every packet of every flow is classified heavy on the
+// first packet (since one MTU-sized packet exceeds the threshold),
+// which defeats the CMS fast-pass design.
+const minHHThresholdBytes = 16 * 1024
+
+// resolveHHThreshold picks the per-pod heavy-hitter threshold in
+// bytes. Precedence:
+//
+//  1. Cluster default defaults.hhThreshold set to a positive value
+//     (explicit override; the cluster operator wanted exactly this).
+//  2. Rate-scaled formula: rate_bps × time_constant_ms / 1000,
+//     floored at minHHThresholdBytes. Default time constant is 100 ms;
+//     cluster-wide override via defaults.fastPassTimeConstantMs.
+//
+// Both inputs flow from the conflist that the installer wrote at
+// startup; per-pod annotation form (heavyHitterThreshold in the JSON
+// extended form) is applied separately in the annotation parser.
+func resolveHHThreshold(conf *NetConf, rateBps int64) int64 {
+	if conf.Defaults != nil && conf.Defaults.HHThreshold > 0 {
+		return conf.Defaults.HHThreshold
+	}
+	timeConstMs := int64(defaultFastPassTimeConstantMs)
+	if conf.Defaults != nil && conf.Defaults.FastPassTimeConstantMs > 0 {
+		timeConstMs = conf.Defaults.FastPassTimeConstantMs
+	}
+	// rate (B/s) × ms / 1000 → bytes accumulated in that many ms.
+	scaled := rateBps * timeConstMs / 1000
+	if scaled < minHHThresholdBytes {
+		return minHHThresholdBytes
+	}
+	return scaled
 }
 
 // attachBPF tries each attempt in `strategy` in order until one

@@ -126,6 +126,19 @@ func writeChainedSibling(src, dst string) error {
 		}
 		defaults["burstRatio"] = v
 	}
+	// NATRA_FASTPASS_TIME_CONSTANT_MS tunes the rate-scaled heavy-
+	// hitter threshold: a new flow gets this many milliseconds of
+	// honeymoon at the pod's annotated rate before crossing into
+	// "heavy." Default 100 ms. Operators raise it for workloads
+	// dominated by larger HTTP responses / WebSocket frames; lower
+	// it for workloads with many parallel long-lived flows.
+	if t := os.Getenv("NATRA_FASTPASS_TIME_CONSTANT_MS"); t != "" {
+		v, err := strconv.ParseInt(t, 10, 64)
+		if err != nil || v <= 0 {
+			return fmt.Errorf("NATRA_FASTPASS_TIME_CONSTANT_MS=%q must be a positive integer", t)
+		}
+		defaults["fastPassTimeConstantMs"] = v
+	}
 	// NATRA_EDT_PACING={auto,on,off}. Tri-state:
 	//   auto (default if env unset): probe fq install at CNI ADD;
 	//     use EDT pacing when probe succeeds, fall back to drop

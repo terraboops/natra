@@ -52,6 +52,17 @@ spec:
               value: ""
             - name: NATRA_EDT_PACING
               value: ""
+            # NATRA_FASTPASS_TIME_CONSTANT_MS sets how long each new
+            # flow gets at the pod's annotated rate before crossing
+            # natra's heavy-hitter threshold. Default 100 ms. The
+            # per-pod threshold is computed as:
+            #   rate_bps × time_constant_ms / 1000   (bytes)
+            # so a 10 Mbps pod gets a ~125 KiB threshold and a 1 Gbps
+            # pod gets ~12.5 MiB. Floored at 16 KiB. Raise for
+            # workloads with larger HTTP responses; lower for
+            # workloads with many parallel long-lived flows.
+            - name: NATRA_FASTPASS_TIME_CONSTANT_MS
+              value: ""
           command:
             - /bin/sh
             - -ec
