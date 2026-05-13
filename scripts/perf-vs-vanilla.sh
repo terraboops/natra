@@ -58,6 +58,20 @@ cleanup() {
     kind delete cluster --name "$NATRA_CLUSTER" 2>/dev/null || true
     kind delete cluster --name "$VANILLA_CLUSTER" 2>/dev/null || true
 }
+
+# enable_ecn flips tcp_ecn=1 on every node of the named cluster.
+# Sets the netns-scoped sysctl in the kind node's root netns, which
+# pod netns created later inherit. iperf3 and hey traffic between
+# pods then negotiate ECN-capable connections at handshake time, so
+# natra's bpf_skb_ecn_set_ce path can fire on above-rate packets
+# instead of dropping them.
+enable_ecn() {
+    local cluster="$1"
+    for node in $(kind get nodes --name "$cluster"); do
+        docker exec "$node" sysctl -w net.ipv4.tcp_ecn=1 >/dev/null 2>&1 || \
+            echo "warn: tcp_ecn=1 on $node failed (continuing)"
+    done
+}
 trap cleanup EXIT
 
 # preserve_artifacts copies the profile-natra/ directory out of TMPDIR
@@ -460,6 +474,7 @@ render_mixed_manifests "$BASELINE_CLUSTER" "$TMPDIR/baseline"
 kind create cluster --name "$BASELINE_CLUSTER" \
     --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
 kind load docker-image "$PERFCLIENT_IMAGE" --name "$BASELINE_CLUSTER"
+enable_ecn "$BASELINE_CLUSTER"
 
 kubectl apply -f "$TMPDIR/baseline/namespace.yaml"
 # No plugin DaemonSet here — kindnet's conflist alone, so the
@@ -505,6 +520,7 @@ render_mixed_manifests "$NATRA_CLUSTER" "$TMPDIR/natra"
 kind create cluster --name "$NATRA_CLUSTER" \
     --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
 kind load docker-image "$NATRA_IMAGE" "$PERFCLIENT_IMAGE" --name "$NATRA_CLUSTER"
+enable_ecn "$NATRA_CLUSTER"
 
 kubectl apply -f "$TMPDIR/natra/namespace.yaml"
 # NATRA_PERF_ATTACH_MODE picks the attach path. Default is auto;
@@ -562,6 +578,7 @@ render_mixed_manifests "$VANILLA_CLUSTER" "$TMPDIR/vanilla"
 kind create cluster --name "$VANILLA_CLUSTER" \
     --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
 kind load docker-image "$PERFCLIENT_IMAGE" --name "$VANILLA_CLUSTER"
+enable_ecn "$VANILLA_CLUSTER"
 
 # Load ifb on each kind node — the upstream bandwidth plugin uses
 # HTB on an IFB device, and the kind base image ships the module but

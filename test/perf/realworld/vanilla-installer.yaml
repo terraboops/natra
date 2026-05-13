@@ -33,7 +33,7 @@ spec:
           effect: NoExecute
       initContainers:
         - name: install
-          image: alpine:3.20
+          image: mirror.gcr.io/library/alpine:3.20
           imagePullPolicy: IfNotPresent
           command:
             - /bin/sh
