@@ -10,13 +10,16 @@ The three supported paths:
 
 | Path                  | Binary placement              | Conflist chained by   | Node-image touched? |
 |-----------------------|-------------------------------|-----------------------|---------------------|
-| **DaemonSet**         | Init container `install`s the ELF onto the host at `/opt/cni/bin/natra` | Init container patches `/etc/cni/net.d/*.conflist` | No |
+| **DaemonSet**         | Init container `install`s the ELF onto every CNI bin dir the distro might use (`/opt/cni/bin/`, `/var/lib/rancher/k3s/data/cni/`, and `/bin/`) | Init container patches `/etc/cni/net.d/*.conflist` | No |
 | **Baked into image**  | Built into your node image at `/opt/cni/bin/natra` (e.g. via Packer / image-builder) | Static `/etc/cni/net.d/00-natra-*.conflist` shipped with the image | Yes |
 | **Manual**            | Operator scp's / configures via Ansible | Operator runs `natra install-cni-chain /etc/cni/net.d/` once per node | Yes |
 
-All three end up with the same on-node state: `/opt/cni/bin/natra`
-with file caps set, and a chained conflist next to the main CNI's.
-The only difference is *who* puts those files there.
+All three end up with natra at a path containerd's CNI search
+finds, file caps set, and a chained conflist next to the main
+CNI's. The DaemonSet path writes the binary to multiple
+candidate paths because different k8s distros configure their
+container runtime with different `cni.bin_dir` values — installing
+everywhere is cheaper than introspecting per-distro.
 
 ## 1. DaemonSet (default)
 
@@ -24,8 +27,9 @@ The `deploy/cni-installer.yaml` manifest creates a DaemonSet that
 runs a privileged init container on every node. The init container:
 
 - Mounts bpffs at `/sys/fs/bpf` (idempotent — skips if already mounted).
-- Copies `/usr/local/bin/natra` from the image to
-  `/host/opt/cni/bin/natra`.
+- Copies `/usr/local/bin/natra` from the image to every CNI bin
+  candidate path (`/opt/cni/bin/natra`,
+  `/var/lib/rancher/k3s/data/cni/natra`, `/bin/natra`).
 - Sets file caps with
   `setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep`.
 - Waits for at least one `*.conflist` to appear under

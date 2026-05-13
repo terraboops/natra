@@ -360,8 +360,13 @@ EOF
             # need to make sure the manifest's natra-image line
             # matches the imported tag — kubelet's default
             # IfNotPresent then uses the imported copy.
+            # Bin-dir sed dropped — the installer now declares
+            # /opt/cni/bin, /var/lib/rancher/k3s/data/cni, and /bin
+            # as separate hostPath volumes and writes natra to each.
+            # Whichever bin_dir containerd is configured for, finds
+            # natra. Conf-dir rewrite stays since k3s puts conflists
+            # in a non-standard path.
             sed -e "s|ghcr.io/terraboops/natra:latest|${natra_image}|" \
-                -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
                 -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
                 "${REPO_ROOT}/deploy/cni-installer.yaml" | kubectl apply -f -
             kubectl -n kube-system rollout status daemonset/natra-installer --timeout=180s
