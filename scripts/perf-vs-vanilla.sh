@@ -139,14 +139,14 @@ BPFTOOL_HOST_PATH=""
 # `bpftool prog profile`. Earlier versions and distro packages
 # (notably debian bookworm's bpftool 7.1.0) are built without llvm
 # support and refuse `prog profile` with "Please build bpftool with
-# clang >= 10.0.0". Static linkage means it runs on any glibc ≥ 2.x
-# kindest/node ships.
+# clang >= 10.0.0". Static linkage means it runs on any glibc the
+# k3d node image (rancher/k3s) ships.
 BPFTOOL_VERSION="v7.7.0"
 BPFTOOL_RELEASE_URL_BASE="https://github.com/libbpf/bpftool/releases/download"
 
 # ensure_bpftool downloads a statically-linked bpftool from the official
-# libbpf/bpftool release and caches it under bin/. The kindest/node
-# image's own apt can't install bpftool: it ships as part of
+# libbpf/bpftool release and caches it under bin/. The rancher/k3s
+# node image's own apt can't install bpftool: it ships as part of
 # linux-tools-$(uname -r), and on colima's LinuxKit kernel (~6.8.x) no
 # matching kernel package exists. Debian's own bpftool package, while
 # kernel-independent, is built without llvm support, so `prog profile`
@@ -198,7 +198,7 @@ ensure_bpftool() {
     echo "==> bpftool cached at $BPFTOOL_HOST_PATH" >&2
 }
 
-# install_bpftool_in_node docker-cps the staged bpftool into the kind
+# install_bpftool_in_node docker-cps the staged bpftool into the k3d
 # node at /usr/local/bin/bpftool. Idempotent — re-copy is cheap. Returns
 # nonzero if bpftool isn't staged or the copy fails, so the caller can
 # skip prog-profile capture without aborting the whole run.
@@ -325,7 +325,7 @@ render_mixed_manifests() {
 # allowance before measurements. Both rate-limiters under test have a
 # burst window — natra's is 2× rate (2.5 MB for a 10 Mbps annotation),
 # upstream bandwidth's HTB picks up kubelet's default IngressBurst,
-# which kubelet sets to a huge value (~193 MB observed on kind nodes,
+# which kubelet sets to a huge value (~193 MB observed on k3d nodes,
 # ~150 seconds of credit at 10 Mbps). Without a warmup, the first
 # elephant flow consumes that burst at line rate before the rate
 # limiter actually engages, inflating measurements by ~10× under
@@ -337,8 +337,8 @@ warmup_pod() {
     # 20s × ~100 Mbps line rate ≈ 250 MB transferred — enough to
     # fully drain vanilla's 193 MB HTB burst and natra's 2.5 MB
     # token bucket. -P 4 parallel streams to maximize throughput
-    # during the drain since kindnet vxlan single-stream peaks below
-    # line rate.
+    # during the drain since single-stream on colima's software
+    # dataplane peaks well below line rate.
     kubectl exec -n "$namespace" "$client" -- \
         iperf3 -c "$server" -t 20 -P 4 >/dev/null 2>&1 || true
     kubectl exec -n "$namespace" "$client" -- \
@@ -561,7 +561,7 @@ start_profile_collector() {
     local profile_dir="$TMPDIR/profile-${tag}"
     mkdir -p "$profile_dir"
 
-    # The profile process writes inside the kind node to a known path;
+    # The profile process writes inside the k3d node to a known path;
     # we copy out via docker cp at stop time. setsid + nohup so the
     # process survives the docker-exec shell exiting (default SIGHUP
     # on exec-shell teardown was killing the collector before its
@@ -588,15 +588,16 @@ start_profile_collector() {
     # so this overlaps the steady-state phase. Captures land at
     # ${profile_dir}/bpftool-prog-profile.txt.
     #
-    # bpftool isn't in the kindest/node image by default and the
-    # node's own apt can't install it (linux-tools-* is kernel-versioned
-    # and no package matches colima's LinuxKit kernel). Even debian's
-    # plain bpftool package is built without llvm support, so `prog
-    # profile` refuses to run. ensure_bpftool() downloads the official
-    # static binary from libbpf/bpftool releases (built with clang ≥ 10,
-    # so `features: llvm, skeletons` is set) and caches it under bin/.
-    # install_bpftool_in_node copies that staged binary into the kind
-    # node at /usr/local/bin/bpftool.
+    # bpftool isn't in the rancher/k3s node image by default and
+    # the node's own apt can't install it (linux-tools-* is
+    # kernel-versioned and no package matches colima's LinuxKit
+    # kernel). Even debian's plain bpftool package is built without
+    # llvm support, so `prog profile` refuses to run.
+    # ensure_bpftool() downloads the official static binary from
+    # libbpf/bpftool releases (built with clang ≥ 10, so
+    # `features: llvm, skeletons` is set) and caches it under bin/.
+    # install_bpftool_in_node copies that staged binary into the
+    # k3d node at /usr/local/bin/bpftool.
     if ensure_bpftool && install_bpftool_in_node "k3d-${cluster}-agent-0"; then
         # Loosen perf paranoia and enable BPF stats so the in-kernel
         # runtime_ns / run_cnt counters update for `bpftool prog show`.
@@ -907,7 +908,7 @@ kubectl apply -f "$TMPDIR/natra/namespace.yaml"
 #
 # k3s puts CNI under /var/lib/rancher/k3s/{data/cni,agent/etc/cni/
 # net.d}, so the installer's bin / conflist hostPaths get sed'd
-# from the kind-style defaults at apply time.
+# from the standard /opt/cni/bin defaults at apply time.
 ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
 if [ "$ATTACH_MODE" = "tcx-hostside" ]; then ATTACH_MODE=""; fi
 EDT_PACING="${NATRA_PERF_EDT_PACING:-}"
@@ -965,8 +966,8 @@ k3d image import "$PERFCLIENT_IMAGE" --cluster "$VANILLA_CLUSTER"
 enable_ecn "$VANILLA_CLUSTER"
 
 # Load ifb on each k3d node — the upstream bandwidth plugin uses
-# HTB on an IFB device, and the kindest/node image (which k3d also
-# uses under the hood) ships the module but doesn't auto-load it.
+# HTB on an IFB device, and the rancher/k3s node image ships the
+# module but doesn't auto-load it.
 # Doing this before the DaemonSet's install container patches the
 # conflist guarantees the bandwidth plugin can create the IFB
 # device when kubelet first invokes it.
@@ -976,8 +977,9 @@ for node in $(nodes_for "$VANILLA_CLUSTER"); do
 done
 
 kubectl apply -f "$TMPDIR/vanilla/namespace.yaml"
-# vanilla-installer.yaml's bin hostPath is /opt/cni/bin (kind);
-# k3s wants /var/lib/rancher/k3s/data/cni. sed at apply time.
+# vanilla-installer.yaml's bin hostPath is /opt/cni/bin (the
+# standard containernetworking default); k3s wants
+# /var/lib/rancher/k3s/data/cni. sed at apply time.
 sed -e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' \
     -e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' \
     "${REPO_ROOT}/test/perf/realworld/vanilla-installer.yaml" \

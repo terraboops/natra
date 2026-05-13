@@ -197,6 +197,6 @@ var _ = Describe("natra cluster chaos", func() {
 // from the suite roster.
 var _ = Describe("natra cluster chaos (deferred)", func() {
 	PIt("survives node drain — requires multi-node scheduling not exercised by current single-worker e2e", func() {})
-	PIt("recovers from CNI binary corruption — requires explicit corruption path on a kind node, covered semi-implicitly by fail-open elsewhere", func() {})
+	PIt("recovers from CNI binary corruption — requires explicit corruption path on a k3d node, covered semi-implicitly by fail-open elsewhere", func() {})
 	PIt("characterizes annotation update on running pod — kubernetes itself doesn't propagate annotation changes to running pods", func() {})
 })
