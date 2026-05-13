@@ -839,7 +839,6 @@ EDT_PACING="${NATRA_PERF_EDT_PACING:-}"
 # The natra-image-line regex escapes slashes for awk's BRE.
 natra_image_re=$(echo "$NATRA_IMAGE" | sed 's|/|\\/|g')
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
-    -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
     -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
     "${REPO_ROOT}/deploy/cni-installer.yaml" | \
     awk -v am="$ATTACH_MODE" -v ep="$EDT_PACING" -v nire="$natra_image_re" '

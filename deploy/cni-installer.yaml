@@ -76,19 +76,39 @@ spec:
                 echo "natra: mounted bpffs on /sys/fs/bpf"
               fi
 
-              install -m 0755 /usr/local/bin/natra /host/opt/cni/bin/natra
-              # File capabilities: kubelet/containerd exec the natra
-              # CNI plugin without CAP_BPF or CAP_PERFMON in the
-              # ambient set, so BPF_OBJ_PIN returns EPERM. setcap
-              # gives the binary ambient caps on every exec regardless
-              # of caller's cap_inheritable mask.
-              if command -v setcap >/dev/null 2>&1; then
-                setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep /host/opt/cni/bin/natra || true
-                echo "natra: file caps set"
-              else
+              # Install natra at every CNI bin path containerd might
+              # be configured to search. Different distros put the
+              # CNI bin dir in different places, and we'd rather pay a
+              # few extra MB of disk than ship a configuration that
+              # only works on the cluster shape we tested last:
+              #
+              #   /opt/cni/bin                       — kind default,
+              #                                        the standard
+              #                                        containernetworking
+              #                                        path on most distros
+              #   /var/lib/rancher/k3s/data/cni      — k3s 1.30+ default
+              #   /bin                               — older k3s configs
+              #                                        (bin_dir = "/bin"
+              #                                        observed in CI on
+              #                                        k3d's default
+              #                                        rancher/k3s image)
+              #
+              # The DaemonSet declares hostPath mounts for all three;
+              # paths that genuinely don't exist on the host get auto-
+              # created by DirectoryOrCreate. setcap on every copy so
+              # BPF_OBJ_PIN works no matter which one kubelet exec's.
+              for dst in /host/opt/cni/bin /host/var-k3s-cni /host/bin; do
+                if [ -d "$dst" ]; then
+                  install -m 0755 /usr/local/bin/natra "$dst/natra"
+                  if command -v setcap >/dev/null 2>&1; then
+                    setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep "$dst/natra" || true
+                  fi
+                  echo "natra: binary installed at $dst/natra"
+                fi
+              done
+              if ! command -v setcap >/dev/null 2>&1; then
                 echo "natra: setcap unavailable; relying on caller caps"
               fi
-              echo "natra: binary installed at /opt/cni/bin/natra"
 
               # Wait for at least one *.conflist to appear (kindnet
               # writes its conflist after its own DaemonSet starts),
@@ -105,6 +125,10 @@ spec:
           volumeMounts:
             - name: cni-bin-dir
               mountPath: /host/opt/cni/bin
+            - name: cni-bin-k3s
+              mountPath: /host/var-k3s-cni
+            - name: cni-bin-root
+              mountPath: /host/bin
             - name: cni-net-dir
               mountPath: /host/etc/cni/net.d
             - name: host-sys
@@ -139,6 +163,19 @@ spec:
           hostPath:
             path: /opt/cni/bin
             type: DirectoryOrCreate
+        - name: cni-bin-k3s
+          hostPath:
+            path: /var/lib/rancher/k3s/data/cni
+            type: DirectoryOrCreate
+        - name: cni-bin-root
+          # CI's k3d image observed in 2026-05 has containerd
+          # configured with cni bin_dir = /bin (an unusual k3s
+          # default). Mounting /bin RO-or-RW lets us install
+          # natra there too. DirectoryOrCreate keeps the manifest
+          # portable; /bin always exists in practice.
+          hostPath:
+            path: /bin
+            type: Directory
         - name: cni-net-dir
           hostPath:
             path: /etc/cni/net.d

@@ -256,7 +256,6 @@ func installNatraDaemon() {
 	mustExec("bash", "-c",
 		fmt.Sprintf(
 			`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' `+
-				`-e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' `+
 				`-e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' `+
 				`%s | `+
 				`awk -v am=%q '`+
