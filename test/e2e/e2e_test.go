@@ -34,6 +34,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -224,25 +225,54 @@ func installNatraDaemon() {
 	// to any of {tcx-hostside, tcx-podside, clsact-hostside,
 	// clsact-podside, auto} to exercise that combination explicitly.
 	attachMode := os.Getenv("NATRA_E2E_ATTACH_MODE")
-	// awk targets the specific env var by name so we don't replace
-	// both NATRA_ATTACH_MODE and NATRA_EDT_PACING with the same
-	// value (a global s|value: ""$|...| sed would do that).
+	// awk patterns are scoped so we touch only the natra init
+	// container's lines, not the pause sidecar's. A global
+	// s|imagePullPolicy: IfNotPresent|...|Never| would flip the
+	// pause container's policy too — and k3s nodes don't have
+	// registry.k8s.io/pause locally, so kubelet then refuses to
+	// start the sidecar with ErrImageNeverPull. Same logic for
+	// NATRA_ATTACH_MODE's env value: targeted by name so it
+	// doesn't also rewrite NATRA_EDT_PACING.
 	mustExec("bash", "-c",
 		fmt.Sprintf(
 			`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' `+
-				`-e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' `+
 				`-e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' `+
 				`-e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' `+
 				`%s | `+
-				`awk -v am=%q '/name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next } { print }' | `+
+				`awk -v am=%q '`+
+				`/image: %s/ { print; getline; if ($1 == "imagePullPolicy:") sub(/IfNotPresent/, "Never"); print; next } `+
+				`/name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next } `+
+				`{ print }`+
+				`' | `+
 				`kubectl apply -f -`,
 			natraImage,
 			repoFile("..", "..", "deploy", "cni-installer.yaml"),
 			attachMode,
+			// awk's `/regex/` is BRE; escape the slashes in the image ref.
+			strings.ReplaceAll(natraImage, "/", `\/`),
 		),
 	)
-	mustExec("kubectl", "rollout", "status", "daemonset/natra-installer",
-		"-n", "kube-system", "--timeout=120s")
+	if err := exec.Command("kubectl", "rollout", "status",
+		"daemonset/natra-installer", "-n", "kube-system",
+		"--timeout=120s").Run(); err != nil {
+		// Daemonset rollout failed — surface installer state so the
+		// next CI failure has something to grep. Without these dumps
+		// we just see "0 of 2 updated pods are available" and the
+		// underlying reason (image pull error, init container hang,
+		// node taint mismatch) is invisible.
+		dump := func(name string, args ...string) {
+			GinkgoWriter.Printf("===== %s =====\n", name)
+			out, _ := exec.Command(args[0], args[1:]...).CombinedOutput()
+			GinkgoWriter.Printf("%s\n", out)
+		}
+		dump("kubectl get pods (kube-system, wide)", "kubectl", "get", "pods", "-n", "kube-system", "-o", "wide")
+		dump("kubectl describe ds/natra-installer", "kubectl", "describe", "ds/natra-installer", "-n", "kube-system")
+		dump("kubectl logs natra-installer init (all pods)", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "-c", "install", "--tail=200", "--prefix=true")
+		dump("kubectl get events (kube-system, last 30)", "kubectl", "get", "events", "-n", "kube-system",
+			"--sort-by=.lastTimestamp", "-o", "wide")
+		dump("k3d node list", "k3d", "node", "list")
+		Fail(fmt.Sprintf("natra-installer rollout failed: %v (see diagnostics above)", err))
+	}
 }
 
 // removeNatraDaemon deletes the natra DaemonSet and waits for the

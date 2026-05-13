@@ -782,12 +782,18 @@ kubectl apply -f "$TMPDIR/natra/namespace.yaml"
 ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
 if [ "$ATTACH_MODE" = "tcx-hostside" ]; then ATTACH_MODE=""; fi
 EDT_PACING="${NATRA_PERF_EDT_PACING:-}"
+# awk patterns are scoped so we only touch the natra init container's
+# imagePullPolicy and env vars — never the pause sidecar. k3s nodes
+# don't have registry.k8s.io/pause:3.10 locally, so flipping its
+# policy to Never gives ErrImageNeverPull and the whole DS stalls.
+# The natra-image-line regex escapes slashes for awk's BRE.
+natra_image_re=$(echo "$NATRA_IMAGE" | sed 's|/|\\/|g')
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
-    -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
     -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
     -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
     "${REPO_ROOT}/deploy/cni-installer.yaml" | \
-    awk -v am="$ATTACH_MODE" -v ep="$EDT_PACING" '
+    awk -v am="$ATTACH_MODE" -v ep="$EDT_PACING" -v nire="$natra_image_re" '
+        $0 ~ "image: " nire { print; getline; if ($1 == "imagePullPolicy:") sub(/IfNotPresent/, "Never"); print; next }
         /name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next }
         /name: NATRA_EDT_PACING/  { print; getline; sub(/value: ".*"/, "value: \"" ep "\""); print; next }
         { print }
