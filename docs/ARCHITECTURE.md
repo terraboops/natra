@@ -43,19 +43,20 @@ The per-direction state lives in direction-keyed map slots:
 | `natra_config_map`| key = direction (0=ingress, 1=egress); 2 slots                                        |
 | `natra_bucket_map`| key = direction; 2 slots (each: tokens, last_update_ns, next_release_ns + spin_lock)  |
 | `natra_stats_map` | key = direction × 6 + slot (passed/throttled/hh_hits/ecn_marked/edt_delayed/dropped); 12 slots, per-CPU |
-| `natra_cms_map`   | key = direction × 131072 + row × 32768 + col; 262144 cells × 8 bytes = ~2 MiB         |
+| `natra_cms_map`   | key = direction × 131072 + row × 32768 + col; 262144 cells × 16 bytes = 4 MiB         |
 
 CMS halves are independent per-direction. Asymmetric workloads (HTTP
 downloads, file uploads, streaming) make a flow heavy in one direction
 and mice on the other (just ACKs); a shared CMS would falsely classify
-ACK streams as heavy. Total CMS cost is ~2 MiB per pod, sized to
+ACK streams as heavy. Total CMS cost is 4 MiB per pod, sized to
 cover ~50K-flow workloads without saturating.
 
 The pipeline is two stages on the Pod-side veth:
 
 1. **Count-Min Sketch.** 4-row × 32768-column sketch per direction
-   (8 bytes per cell, ~1 MiB per direction). The 5-tuple (src/dst
-   IP, src/dst port, proto) hashes into one cell per row via FNV-1a
+   (16 bytes per cell after alignment padding, 2 MiB per direction).
+   The 5-tuple (src/dst IP, src/dst port, proto) hashes into one cell
+   per row via FNV-1a
    mixed with per-row seeds. The estimator is `min` across the four
    rows. A flow is "heavy" when its estimate exceeds the
    `heavy_hitter_threshold`. Each cell carries a `last_decay_idx`

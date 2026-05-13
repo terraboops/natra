@@ -6,9 +6,9 @@
 // Stage 1 (Count-Min Sketch): every packet's 5-tuple flow key is
 // hashed CMS_DEPTH times, each into one column of CMS_WIDTH. The min
 // across rows is the per-flow count estimator. Constant memory
-// (CMS_WIDTH * CMS_DEPTH * DIR_MAX = 32768 cells = 256 KiB per pod
-// at the 8-byte cell layout) regardless of how many distinct flows
-// the pod sees.
+// (CMS_WIDTH * CMS_DEPTH * DIR_MAX = 262144 cells × 16 bytes per
+// cell = 4 MiB per pod) regardless of how many distinct flows the
+// pod sees.
 //
 // Stage 2 (token bucket): only flows whose CMS estimate exceeds
 // `hh_threshold` go through the bucket. Mice flows take the fast
@@ -47,29 +47,15 @@
 #include <bpf/bpf_endian.h>
 
 // CMS dimensions are compile-time constants because BPF map sizes are
-// fixed at load time. 16384 × 4 = 65536 cells per direction; sized
-// to cover ~50K-flow workloads without saturating.
+// fixed at load time. 32768 × 4 = 131072 cells per direction;
+// 262144 cells total per pod. Sized so saturation stays below ~50%
+// for ~50K concurrent flows per direction — past that, collisions
+// dominate and every flow looks heavy.
 //
-// Sizing history — every step driven by profile data:
-//   1024 × 4   — original. Saturated in ~5s of mixed-workload
-//               traffic (iperf3 --bidir + ~1500 hey RPS); all cells
-//               nonzero, cell-value-mean climbed above the
-//               heavy-hitter threshold of 10, so new mice flows were
-//               false-positive-classified as heavy on their first
-//               packet. Hey RPS topped out at ~1000.
-//   4096 × 4   — 4×. Still 99.9% saturated, 69% packets classified
-//               heavy. Hey RPS improved to ~1500.
-//   16384 × 4  — 16×. 82% fill, 54% heavy. Hey RPS ~2000.
-//   32768 × 4  — 32×, current. 41% fill expected; most flows take
-//               the fast pass. Diminishing returns past this point
-//               unless the workload's flow cardinality grows.
-//
-// Cost: 32× original memory. Cell is 8 bytes (count + last_decay_idx)
-// after aging added the timestamp, so per pod: 32768 × 4 × 2 × 8 =
-// 2 MiB. At 100 pods/node that's 200 MiB — still trivial for a
-// kernel-side data structure. Cluster-tier knobs let operators pick a
-// smaller tier for low-cardinality workloads (saving memory at the
-// cost of CMS accuracy under load spikes).
+// Cell is 16 bytes (u64 bytes + u32 last_decay_idx, padded to
+// 8-byte alignment), so per pod: 32768 × 4 × 2 × 16 = 4 MiB. At
+// 100 pods/node that's 400 MiB — trivial for a kernel-side data
+// structure.
 #define CMS_WIDTH 32768
 #define CMS_DEPTH 4
 

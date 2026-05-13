@@ -87,11 +87,11 @@ make ci            # full matrix (lint, licenses, L1-L5)
 - IPv6 is not classified. `parse_flow` returns -1 for non-IPv4, so
   IPv6 flows pass through unrate-limited.
 - The CMS sketch is fixed at compile time at 32768 × 4 cells per
-  direction (262144 cells total per pod, ~2 MiB). Past saturation,
-  every flow's estimate collides with at least one other flow's;
-  classification accuracy degrades silently. The chaos test confirms
-  the program survives the condition, not that the classification
-  stays meaningful.
+  direction (262144 cells total per pod, 4 MiB at 16 bytes per
+  cell). Past saturation, every flow's estimate collides with at
+  least one other flow's; classification accuracy degrades silently.
+  The chaos test confirms the program survives the condition, not
+  that the classification stays meaningful.
 
 ## Docs
 
