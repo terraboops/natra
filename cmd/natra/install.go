@@ -93,14 +93,18 @@ func writeChainedSibling(src, dst string) error {
 	// disables auto-detection. Reject anything else loudly so a typo
 	// in the DaemonSet env doesn't silently fall through to a
 	// default that was wrong for this node.
+	const (
+		attachAutoVal      = "auto"
+		attachExplicitVals = "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside"
+	)
 	if mode := os.Getenv("NATRA_ATTACH_MODE"); mode != "" {
 		switch mode {
-		case "auto", "tcx-hostside", "tcx-podside", "clsact-hostside", "clsact-podside":
+		case attachAutoVal, "tcx-hostside", "tcx-podside", "clsact-hostside", "clsact-podside":
 			natraEntry["attachMode"] = mode
 		default:
 			return fmt.Errorf(
-				"NATRA_ATTACH_MODE=%q is not recognized (want one of: auto, %s)",
-				mode, "tcx-hostside, tcx-podside, clsact-hostside, clsact-podside",
+				"NATRA_ATTACH_MODE=%q is not recognized (want one of: %s, %s)",
+				mode, attachAutoVal, attachExplicitVals,
 			)
 		}
 	}
@@ -122,20 +126,24 @@ func writeChainedSibling(src, dst string) error {
 		}
 		defaults["burstRatio"] = v
 	}
-	// NATRA_EDT_PACING=1 opts the cluster into EDT pacing on egress.
-	// natra will (a) install fq on each pod's eth0 at CNI ADD so EDT
-	// timestamps are honored, and (b) force pod-side egress attach so
-	// fq sits downstream of the BPF program. Off by default — without
-	// fq the EDT path silently breaks egress rate-limiting.
-	if e := os.Getenv("NATRA_EDT_PACING"); e != "" {
-		switch e {
-		case "1", "true", "yes", "on":
-			defaults["edtPacing"] = true
-		case "0", "false", "no", "off":
-			// explicitly disabled — omit
-		default:
-			return fmt.Errorf("NATRA_EDT_PACING=%q must be a boolean (1/0, true/false, yes/no, on/off)", e)
-		}
+	// NATRA_EDT_PACING={auto,on,off}. Tri-state:
+	//   auto (default if env unset): probe fq install at CNI ADD;
+	//     use EDT pacing when probe succeeds, fall back to drop
+	//     semantics when it fails.
+	//   on: require EDT; refuse to attach if fq install fails.
+	//   off: never install fq, never set the EDT bit.
+	// The string form is passed through to the conflist so the CNI
+	// binary makes the final attach-time call per pod.
+	const edtOffVal = "off"
+	switch e := os.Getenv("NATRA_EDT_PACING"); e {
+	case "", attachAutoVal:
+		// auto is the implicit default — omit from conflist
+	case "1", "true", "yes", "on":
+		defaults["edtPacing"] = "on"
+	case "0", "false", "no", edtOffVal:
+		defaults["edtPacing"] = edtOffVal
+	default:
+		return fmt.Errorf("NATRA_EDT_PACING=%q is not recognized (want one of: %s, on, %s)", e, attachAutoVal, edtOffVal)
 	}
 	if len(defaults) > 0 {
 		natraEntry["defaults"] = defaults

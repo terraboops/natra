@@ -89,13 +89,47 @@ type NetConfDefaults struct {
 	// (compiled-in: 2). A 10 Mbps annotation with ratio 2 gives a
 	// 2.5 MB token bucket (= 2 seconds of credit).
 	BurstRatio float64 `json:"burstRatio,omitempty"`
-	// EDTPacing turns on Earliest-Departure-Time pacing for
-	// above-rate egress packets. Without it natra falls back to
-	// drop on egress (after first trying ECN-mark). EDT requires
-	// an fq qdisc downstream of natra's attach point — without fq
-	// the EDT-stamped packets pass at line rate and the rate limit
-	// silently breaks. Default off.
-	EDTPacing bool `json:"edtPacing,omitempty"`
+	// EDTPacing controls EDT-stamped pacing for above-rate egress
+	// packets. natra installs an fq qdisc on the pod's eth0 so
+	// skb->tstamp is honored — no drops, no TCP retransmits.
+	//
+	// Three modes:
+	//   ""/"auto" (default): try to install fq on pod-eth0; if it
+	//     succeeds use EDT pacing, if it fails fall back to drop
+	//     semantics. Best-effort optimal config — operator never
+	//     has to think about it.
+	//   "on": require fq install; fail attach if it doesn't work.
+	//     Useful when you know the environment supports it and
+	//     want any failure surfaced loudly.
+	//   "off": never install fq, never set the EDT bit. Drop is
+	//     the only above-rate disposition after ECN-mark.
+	//
+	// Stored as a string so the "auto" sentinel is distinguishable
+	// from an explicit on/off in the JSON form.
+	EDTPacing string `json:"edtPacing,omitempty"`
+}
+
+// edtMode is the resolved tri-state for EDT pacing.
+type edtMode int
+
+const (
+	edtAuto edtMode = iota // try EDT, fall back if fq install fails
+	edtOn                  // require EDT; fail attach on fq install error
+	edtOff                 // never try EDT
+)
+
+func parseEDTMode(s string) (edtMode, error) {
+	switch s {
+	case "", "auto":
+		return edtAuto, nil
+	case "1", "true", "yes", "on":
+		return edtOn, nil
+	case "0", "false", "no", "off":
+		return edtOff, nil
+	default:
+		return edtAuto, fmt.Errorf(
+			"edtPacing=%q unrecognized (want one of: auto, on, off)", s)
+	}
 }
 
 // attachAttempt is a single (hook, side) pair to try.
@@ -108,30 +142,45 @@ func (a attachAttempt) String() string {
 	return fmt.Sprintf("%s-%s", a.hook, a.side)
 }
 
-// resolveAttachStrategy parses NetConf.AttachMode into the ordered
-// list of attempts to make. Empty string ("" or "auto") expands to
-// the default fallback chain:
+// resolveAttachStrategy parses NetConf.AttachMode + the resolved EDT
+// mode into the ordered list of attempts to make.
 //
-//	tcx-hostside → tcx-podside → clsact-hostside → clsact-podside
-//
-// The chain prefers tcx (multi-program friendly, the cilium / AWS
-// NPA shape) and host-side (peer of pod's eth0, same surface other
-// BPF stacks use). Real-world fallbacks: old kernels (< 6.6) skip
-// every tcx step and land on clsact; locked-down host netns skips
-// hostside and lands on podside.
+// Empty / "auto" attachMode:
+//   - edt off: tcx-host → tcx-pod → clsact-host → clsact-pod.
+//     Host-side first matches cilium / AWS NPA shape.
+//   - edt auto/on: tcx-pod → clsact-pod (+ tcx-host → clsact-host
+//     when edt is auto). Pod-side first so the fq install on
+//     pod-eth0 is downstream of the BPF program. With edt=on the
+//     host-side fallbacks are dropped — fq + host-side don't
+//     compose, and "on" means the operator wants EDT enforced.
 //
 // Explicit values ("tcx-hostside", etc.) produce a single-attempt
 // list with no fallback — the operator asked for exactly that
 // combination, so honor it.
-func resolveAttachStrategy(s string) ([]attachAttempt, error) {
+func resolveAttachStrategy(s string, edt edtMode) ([]attachAttempt, error) {
 	switch s {
 	case "", "auto":
-		return []attachAttempt{
-			{bpf.HookTCX, bpf.SideHost},
-			{bpf.HookTCX, bpf.SidePod},
-			{bpf.HookClsact, bpf.SideHost},
-			{bpf.HookClsact, bpf.SidePod},
-		}, nil
+		switch edt {
+		case edtOn:
+			return []attachAttempt{
+				{bpf.HookTCX, bpf.SidePod},
+				{bpf.HookClsact, bpf.SidePod},
+			}, nil
+		case edtAuto:
+			return []attachAttempt{
+				{bpf.HookTCX, bpf.SidePod},
+				{bpf.HookClsact, bpf.SidePod},
+				{bpf.HookTCX, bpf.SideHost},
+				{bpf.HookClsact, bpf.SideHost},
+			}, nil
+		default: // edtOff
+			return []attachAttempt{
+				{bpf.HookTCX, bpf.SideHost},
+				{bpf.HookTCX, bpf.SidePod},
+				{bpf.HookClsact, bpf.SideHost},
+				{bpf.HookClsact, bpf.SidePod},
+			}, nil
+		}
 	case "tcx-hostside":
 		return []attachAttempt{{bpf.HookTCX, bpf.SideHost}}, nil
 	case "tcx-podside":
@@ -215,7 +264,16 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("parse config: %w", err)
 	}
 
-	strategy, err := resolveAttachStrategy(conf.AttachMode)
+	var edtSetting string
+	if conf.Defaults != nil {
+		edtSetting = conf.Defaults.EDTPacing
+	}
+	edt, err := parseEDTMode(edtSetting)
+	if err != nil {
+		return fmt.Errorf("edtPacing: %w", err)
+	}
+
+	strategy, err := resolveAttachStrategy(conf.AttachMode, edt)
 	if err != nil {
 		return fmt.Errorf("attachMode: %w", err)
 	}
@@ -226,14 +284,10 @@ func cmdAdd(args *skel.CmdArgs) error {
 		logf("no rate limit on either direction, passing through")
 		return passthrough(args, conf)
 	}
-	logf("config resolved: ingress=%v egress=%v strategy=%v",
-		describeCfg(ingressCfg), describeCfg(egressCfg), strategy)
+	logf("config resolved: ingress=%v egress=%v strategy=%v edt=%d",
+		describeCfg(ingressCfg), describeCfg(egressCfg), strategy, edt)
 
-	var edtPacing uint64
-	if conf.Defaults != nil && conf.Defaults.EDTPacing {
-		edtPacing = 1
-	}
-	if err := attachBPF(args, ingressCfg, egressCfg, strategy, edtPacing); err != nil {
+	if err := attachBPF(args, ingressCfg, egressCfg, strategy, edt); err != nil {
 		// Fail-open: log and continue.
 		fmt.Fprintf(os.Stderr, "natra: BPF attach failed (%v) — passing through unrate-limited\n", err)
 		logf("attachBPF FAILED: %v", err)
@@ -446,7 +500,7 @@ func attachBPF(
 	args *skel.CmdArgs,
 	ingressCfg, egressCfg *config.Config,
 	strategy []attachAttempt,
-	edtPacing uint64,
+	edt edtMode,
 ) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -455,28 +509,25 @@ func attachBPF(
 		return fmt.Errorf("create pin dir %s: %w", pinDir, err)
 	}
 
-	// EDT requires an fq qdisc downstream of where the BPF program
-	// runs. The only place natra can install fq deterministically is
-	// pod-eth0 (inside the pod netns), which is downstream only for
-	// pod-side egress attach. So when EDT is on, filter the strategy
-	// down to pod-side attempts and let tryAttachOne install fq next
-	// to its attach.
-	if edtPacing != 0 {
-		filtered := make([]attachAttempt, 0, len(strategy))
+	// Pre-flight check: edtOn means EDT is required, which means
+	// pod-side attach is required (fq install is only feasible on
+	// pod-eth0). resolveAttachStrategy already filtered to pod-side
+	// for explicit "auto"/"" + edtOn, but explicit "tcx-hostside"
+	// etc. bypass that. Refuse loudly so the operator's request
+	// isn't silently downgraded.
+	if edt == edtOn {
 		for _, a := range strategy {
-			if a.side == bpf.SidePod {
-				filtered = append(filtered, a)
+			if a.side != bpf.SidePod {
+				return fmt.Errorf(
+					"edtPacing=on requires pod-side attach mode but strategy includes %s",
+					a)
 			}
 		}
-		if len(filtered) == 0 {
-			return fmt.Errorf("edtPacing requires a pod-side attach mode but strategy %v has none", strategy)
-		}
-		strategy = filtered
 	}
 
 	attemptErrs := make([]string, 0, len(strategy))
 	for _, attempt := range strategy {
-		err := tryAttachOne(args, ingressCfg, egressCfg, attempt, edtPacing)
+		err := tryAttachOne(args, ingressCfg, egressCfg, attempt, edt)
 		if err == nil {
 			return nil
 		}
@@ -501,7 +552,7 @@ func tryAttachOne(
 	args *skel.CmdArgs,
 	ingressCfg, egressCfg *config.Config,
 	attempt attachAttempt,
-	edtPacing uint64,
+	edt edtMode,
 ) error {
 	ifIndex, restore, err := resolveIfIndex(args.Netns, args.IfName, attempt.side)
 	if err != nil {
@@ -509,14 +560,19 @@ func tryAttachOne(
 	}
 	defer restore()
 
-	// Install fq on pod-eth0 so EDT actually paces. Only meaningful
-	// when attached pod-side (we're already in the pod netns and
-	// ifIndex is pod-eth0's). attachBPF restricts strategy to pod-side
-	// when edtPacing != 0, so this is reachable from the EDT path.
-	if edtPacing != 0 && attempt.side == bpf.SidePod {
-		if err := installFQ(ifIndex); err != nil {
-			fmt.Fprintf(os.Stderr, "natra: install fq on ifindex %d failed (%v) — EDT pacing will not engage\n", ifIndex, err)
-			logf("install fq failed: %v", err)
+	// Detect EDT viability per-attempt: only on pod-side attach
+	// (fq install on pod-eth0 is downstream of pod-egress BPF), and
+	// only if installFQ succeeds. edt=on requires success; edt=auto
+	// silently degrades to drop semantics; edt=off skips the probe.
+	var edtPacing uint64
+	if edt != edtOff && attempt.side == bpf.SidePod {
+		if err := installFQ(ifIndex); err == nil {
+			edtPacing = 1
+			logf("fq installed on ifindex %d — EDT pacing enabled", ifIndex)
+		} else if edt == edtOn {
+			return fmt.Errorf("install fq on ifindex %d (required by edtPacing=on): %w", ifIndex, err)
+		} else {
+			logf("fq install failed (%v) — falling back to drop semantics", err)
 		}
 	}
 
