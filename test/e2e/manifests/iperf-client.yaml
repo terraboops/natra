@@ -11,7 +11,7 @@ spec:
   # clsact filter on the *server* side veth where the packet arrives
   # from a remote source — the production-shaped scenario.
   nodeSelector:
-    kubernetes.io/hostname: natra-e2e-control-plane
+    kubernetes.io/hostname: k3d-natra-e2e-server-0
   tolerations:
     - key: node-role.kubernetes.io/control-plane
       operator: Exists

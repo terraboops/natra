@@ -151,9 +151,12 @@ metadata:
       {"rate":"5M","heavyHitterThreshold":20}
 ```
 
-The default threshold is 50 (raised from the earlier project default
-of 10 based on observed GRO/GSO-coalesced super-packet behavior under
-a realistic mixed workload).
+The threshold unit is **bytes** (CMS counts byte volume per flow,
+not packet count). When unset on a per-pod basis, the per-pod
+default is rate-scaled:
+`max(16 KiB, rate_bps × FASTPASS_TIME_CONSTANT_MS / 1000)`. With
+the default 100 ms time constant, a 10 Mbps pod gets ~125 KiB
+threshold and a 1 Gbps pod gets ~12.5 MiB.
 
 ## Chained conflist
 

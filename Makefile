@@ -212,7 +212,7 @@ else
 endif
 
 .PHONY: test-e2e
-test-e2e: ## Layer 4 — kind end-to-end (works on Mac with Docker; Linux native too).
+test-e2e: ## Layer 4 — k3d end-to-end (works on Mac with Docker; Linux native too).
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then \
 		echo "Layer 4 needs Docker. Start the daemon and retry."; \
 	else \

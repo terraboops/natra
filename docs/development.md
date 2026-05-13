@@ -7,10 +7,8 @@
   kernel for L2/L4/L5 test runs and for the production-image build
 - LLVM clang with the `bpf` target. Apple clang lacks it; on macOS,
   `brew install llvm` and the Makefile picks up `/opt/homebrew/opt/llvm/bin/clang`.
-- `kubectl` and `kind` for L4
-- `k3d` (optional) — only needed for `scripts/soak-test.sh`, which
-  uses a different cluster base than the rest of the test rig to
-  exercise node-membership changes (`brew install k3d`).
+- `kubectl` and `k3d` for L4 e2e + `scripts/soak-test.sh`
+  (`brew install k3d`)
 
 ## Git hooks
 
@@ -56,7 +54,7 @@ make test-fuzz       # L1b: 30s fuzz against the parser
 make test-bench      # L1c: hot-path Go benchmarks
 make test-cni        # L2: CNI protocol (privileged container)
 make test-bpf        # L3: BPF dataplane via BPF_PROG_RUN
-make test-e2e        # L4: kind end-to-end with iperf throughput assertion
+make test-e2e        # L4: k3d end-to-end with iperf throughput assertion
 make test-perf       # L5: BPF_PROG_RUN perf scenarios + synthetic vs-vanilla
 make ci              # All of the above + lint + license scan
 ```
@@ -68,7 +66,7 @@ A real-cluster head-to-head against the upstream
 on-demand:
 
 ```bash
-make perf-vs-vanilla   # ~6 min; two kind clusters, real iperf
+make perf-vs-vanilla   # ~6 min; two k3d clusters, real iperf
 ```
 
 See `docs/perf-vs-vanilla.md` for what it measures.
@@ -85,9 +83,9 @@ make check # fmt + vet + lint
 ## Local deploy
 
 ```bash
-kind create cluster --name natra-dev
+k3d cluster create natra-dev --agents 1
 make docker-build
-kind load docker-image ghcr.io/terraboops/natra:latest --name natra-dev
+k3d image import ghcr.io/terraboops/natra:latest --cluster natra-dev
 kubectl apply -f deploy/cni-installer.yaml
 kubectl get pods -n kube-system -l app=natra
 ```
@@ -109,7 +107,7 @@ bpf/                   BPF C source (natra.bpf.c, vanilla.bpf.c, placeholder.bpf
 deploy/                DaemonSet manifest, Dockerfile
 test/cni/              L2 CNI protocol tests
 test/bpf/              L3 BPF dataplane + chaos + edge-case tests
-test/e2e/              L4 kind end-to-end + chaos
+test/e2e/              L4 k3d end-to-end + chaos
 test/perf/             L5 perf scenarios; test/perf/realworld for the
                        on-demand vs-vanilla cluster comparison
 docs/                  Architecture, CNI spec, this guide, blog
@@ -124,12 +122,12 @@ every CNI invocation; the DaemonSet host-mounts the path so a
 single `tail -f /var/log/natra-cni.log` shows everything across
 pods.
 
-To inspect attached programs and pinned objects on a kind node:
+To inspect attached programs and pinned objects on a k3d node:
 
 ```bash
 docker exec <node> bpftool link list
 docker exec <node> ls /sys/fs/bpf/natra/
-docker exec <node> cat /etc/cni/net.d/00-natra-*.conflist
+docker exec <node> cat /var/lib/rancher/k3s/agent/etc/cni/net.d/00-natra-*.conflist
 ```
 
 To read live counters from a running attachment:

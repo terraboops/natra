@@ -10,7 +10,7 @@ concurrency:
 
 jobs:
   e2e:
-    name: kind e2e + cluster chaos
+    name: k3d e2e + cluster chaos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,9 +20,9 @@ jobs:
       - uses: ./.github/actions/build-bpf
       - name: Build natra binary (Linux native, no Docker wrap)
         run: make build-cni-inner
-      - name: Install kind
-        uses: helm/kind-action@v1
-        with:
-          install_only: true
+      - name: Install k3d
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh \
+            | TAG=v5.7.4 bash
       - name: Run Layer 4 tests
         run: go test -tags=e2e -v -timeout=20m ./test/e2e/...

@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 > **Status: experimental.** A few days old; no production users; tested
-> on kind + colima. See [Limitations](#limitations) before deploying.
+> on k3d + colima. See [Limitations](#limitations) before deploying.
 
 A chained CNI plugin that rate-limits Pod traffic in either direction.
 Reads the standard `kubernetes.io/ingress-bandwidth` and
@@ -68,7 +68,7 @@ make ci            # full matrix (lint, licenses, L1-L5)
 ## Limitations
 
 - No production users. The code is days old.
-- Tested on kind + colima. Not yet exercised on EKS, GKE, AKS, or a
+- Tested on k3d + colima. Not yet exercised on EKS, GKE, AKS, or a
   real bare-metal cluster.
 - Default attach mode is `auto` — tries TCX (kernel 6.6+) then
   clsact, host-side then pod-side, taking the first that works.
@@ -83,7 +83,7 @@ make ci            # full matrix (lint, licenses, L1-L5)
   which has different timing characteristics than packets flowing
   through a NIC. The real-cluster head-to-head in
   [docs/perf-vs-vanilla.md](docs/perf-vs-vanilla.md) uses real iperf
-  traffic in a kind cluster, but kind is not bare metal either.
+  traffic in a k3d cluster, which still isn't bare metal.
 - IPv6 is not classified. `parse_flow` returns -1 for non-IPv4, so
   IPv6 flows pass through unrate-limited.
 - The CMS sketch is fixed at compile time at 32768 × 4 cells per

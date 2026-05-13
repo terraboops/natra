@@ -11,7 +11,7 @@ metadata:
     app: iperf-server-noplugin
 spec:
   nodeSelector:
-    kubernetes.io/hostname: natra-e2e-worker
+    kubernetes.io/hostname: k3d-natra-e2e-agent-0
   containers:
     - name: iperf
       image: networkstatic/iperf3:latest

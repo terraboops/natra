@@ -12,7 +12,7 @@ spec:
   # Pin to the worker node so client (on control-plane) generates cross-node
   # traffic, exercising the real veth/qdisc path.
   nodeSelector:
-    kubernetes.io/hostname: natra-e2e-worker
+    kubernetes.io/hostname: k3d-natra-e2e-agent-0
   containers:
     - name: iperf
       image: networkstatic/iperf3:latest

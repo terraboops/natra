@@ -129,7 +129,7 @@ var _ = Describe("natra cluster chaos", func() {
 			// JSON --overrides has to be a single-quoted string so the
 			// shell doesn't strip its quotes; we're not going through a
 			// shell here (exec.Command), so we pass the raw JSON.
-			overrides := `{"spec":{"nodeSelector":{"kubernetes.io/hostname":"natra-e2e-worker"}}}`
+			overrides := `{"spec":{"nodeSelector":{"kubernetes.io/hostname":"k3d-natra-e2e-agent-0"}}}`
 			out, err := exec.CommandContext(ctx,
 				"kubectl", "run", name,
 				"-n", namespace,

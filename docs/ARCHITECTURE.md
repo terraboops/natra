@@ -98,9 +98,14 @@ so one elephant flow eats every token and mice starve. The
 CMS-then-bucket shape lets mice fast-pass, which is what the L5 test
 (`TestScenarioMixedVsVanilla` in both directions) measures.
 
-The default heavy-hitter threshold is 50. GRO/GSO superpackets
-routinely produce 27 KB "packets" at the BPF layer; a higher threshold
-lets short flows through ~tens of MB before any throttling kicks in.
+The default heavy-hitter threshold is rate-scaled: each pod gets
+`threshold = max(16 KiB, rate_bps × 100 ms / 1000)`, computed at
+CNI ADD from the pod's annotated rate. A 10 Mbps pod gets ~125 KiB,
+a 1 Gbps pod gets ~12.5 MiB. The CMS counts bytes (not packets),
+so this is invariant of GRO super-packet coalescing. Operators can
+override per-pod via the JSON annotation form's
+`heavyHitterThreshold` field or cluster-wide via
+`NATRA_DEFAULT_HH_THRESHOLD` / `NATRA_FASTPASS_TIME_CONSTANT_MS`.
 
 ### DaemonSet installer
 

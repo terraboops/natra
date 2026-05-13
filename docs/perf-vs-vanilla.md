@@ -2,11 +2,11 @@
 
 Real-cluster comparison across three configurations:
 
-1. **baseline** — kindnet alone, no rate-limiting plugin chained.
+1. **baseline** — flannel alone, no rate-limiting plugin chained.
    The bandwidth annotations on `perf-server` are present but
    nothing acts on them; this is the "unaided cluster" floor.
-2. **natra** — kindnet + natra chained.
-3. **upstream `bandwidth`** — kindnet + `containernetworking/plugins`
+2. **natra** — flannel + natra chained.
+3. **upstream `bandwidth`** — flannel + `containernetworking/plugins`
    bandwidth plugin chained.
 
 Two workloads are run against each:
@@ -23,7 +23,7 @@ Run with:
 
 ```bash
 make perf-vs-vanilla
-# ~18-22 min, three kind clusters in sequence
+# ~18-22 min, three k3d clusters in sequence
 cat docs/perf-vs-vanilla-result.txt
 ```
 
@@ -32,20 +32,20 @@ mode for the comparison via `NATRA_PERF_ATTACH_MODE=clsact-podside`.
 
 ## Setup
 
-Three kind clusters, identical topology:
+Three k3d clusters, identical topology:
 
-- 2 nodes (control-plane + worker), kindnet as main CNI
+- 2 nodes (control-plane + worker), flannel as main CNI
 - `perf-server` pinned to worker, annotated
   `kubernetes.io/ingress-bandwidth: "10M"` + `egress-bandwidth: "10M"`;
   runs iperf3 + nginx
 - `bystander` pinned to worker, **no annotations**; runs nginx only
-- `perf-client` on control-plane (cross-node traffic over kindnet's
+- `perf-client` on control-plane (cross-node traffic over flannel's
   bridge + tunnel)
-- Cluster 0: kindnet only. Cluster A chains natra; cluster B chains
+- Cluster 0: flannel only. Cluster A chains natra; cluster B chains
   the upstream `bandwidth` plugin.
 
 For Cluster B, the test fetches the upstream `bandwidth` binary from
-the `containernetworking/plugins` v1.5.1 release (kind nodes ship a
+the `containernetworking/plugins` v1.5.1 release (kindest/node images, which k3d also uses, ship a
 subset of CNI plugins and don't include `bandwidth`) and `modprobe`s
 `ifb` on each node. Without the IFB module, the upstream plugin's
 HTB-on-IFB silently no-ops.
@@ -92,23 +92,21 @@ Receiver-side aggregate goodput from
 The single-stream elephant lands within ~21% of the 10 Mbps cap
 under natra and exactly at cap under vanilla.
 
-The 20-parallel "mice" column is where natra reads 3.5× over cap.
-That's the intentional consequence of natra's heavy-hitter
-threshold (default 50): each parallel iperf3 stream gets ~50 GRO-
-coalesced super-packets of fast-pass before its CMS count crosses
-classification, and 20 streams × 50-packet budget × 1Gbps line
-rate dominates a 10s measurement. With single-stream flows the
-elephant fully consumes its budget in milliseconds and steady-state
-throttling takes over for the rest of the test, hence the ~12 Mbps
-reading. The threshold is what makes the mixed workload (Workload
-2 below) work — without it, every HTTP request would false-positive-
-classify as heavy and hit the bucket. Twenty parallel iperf streams
-is neither real mice nor a real elephant; this column is a synthetic
-in-between case kept around to document the threshold trade-off.
+The 20-parallel "mice" column sits at the threshold tradeoff
+natra's CMS is designed for. The heavy-hitter threshold is now in
+**bytes** and **scaled to the annotated rate** (default formula:
+`rate × 100 ms`), so a 10 Mbps pod gets a ~125 KiB threshold —
+enough headroom for tail mice (HTTP responses, WebSocket frames)
+but tight enough that each iperf3 parallel stream crosses after
+~2 GRO-coalesced super-packets and steady-state throttling takes
+over. With single-stream flows the elephant crosses in
+milliseconds. Twenty parallel iperf streams is neither real mice
+nor a real elephant; this column is a synthetic in-between case
+useful for sanity-checking the threshold value.
 
 ## Workload 2: mixed (elephant + annotated mice + bystander mice)
 
-Three pods on the same kind cluster:
+Three pods on the same k3d cluster:
 
 - `perf-server` (annotated 10M/10M, runs iperf3 + nginx, pinned
   to worker)
@@ -122,13 +120,14 @@ Client traffic, concurrent for `MIXED_HEY_DURATION` (~20s):
 - After 5s of warmup, two parallel `hey -c 50 -z 20s
   -disable-keepalive` runs — one to `perf-server`, one to
   `bystander`. Each request opens a fresh TCP connection (new
-  5-tuple → new flow_key) with ~5-7 packets total. Well under
-  natra's heavy-hitter threshold of 50.
+  5-tuple → new flow_key) with ~5-7 KB of total bytes. Well
+  under the rate-scaled heavy-hitter threshold (~125 KiB at the
+  10 Mbps annotation).
 
 Three things to read out of the result table:
 
 1. **Elephant ingress/egress.** The headline rate-limit guarantee.
-   Baseline shows kindnet line rate; both plugins land at-or-below
+   Baseline shows flannel line rate; both plugins land at-or-below
    10 Mbps.
 2. **Annotated mice (perf-server) RPS / p99.** What the plugin does
    to small flows *sharing the elephant's pod budget*. This is

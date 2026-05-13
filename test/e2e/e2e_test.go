@@ -130,15 +130,16 @@ func repoRoot() string {
 }
 
 var _ = BeforeSuite(func() {
-	requireBinary("kind")
+	requireBinary("k3d")
 	requireBinary("kubectl")
 	requireBinary("docker")
 
-	By("creating kind cluster")
-	mustExec("kind", "create", "cluster",
-		"--name", clusterName,
-		"--config", repoFile("kind-config.yaml"),
-		"--wait", "120s",
+	By("creating k3d cluster")
+	mustExec("k3d", "cluster", "create", clusterName,
+		"--agents", "1",
+		"--no-lb",
+		"--k3s-arg", "--disable=traefik,servicelb@server:0",
+		"--wait",
 	)
 
 	By("building natra container image")
@@ -148,8 +149,8 @@ var _ = BeforeSuite(func() {
 		".",
 	)
 
-	By("loading natra image into kind cluster")
-	mustExec("kind", "load", "docker-image", natraImage, "--name", clusterName)
+	By("loading natra image into k3d cluster")
+	mustExec("k3d", "image", "import", natraImage, "--cluster", clusterName)
 
 	By("creating test namespace")
 	mustExec("kubectl", "apply", "-f", repoFile("manifests", "namespace.yaml"))
@@ -191,7 +192,8 @@ var _ = BeforeSuite(func() {
 		}
 		dump("kubectl get pods", "kubectl", "get", "pods", "-n", namespace, "-o", "wide")
 		dump("install init-container logs", "kubectl", "logs", "-n", "kube-system", "-l", "app=natra", "-c", "install", "--tail=80")
-		dump("conflist on worker node", "docker", "exec", clusterName+"-worker", "sh", "-c", "ls /etc/cni/net.d && cat /etc/cni/net.d/*.conflist 2>/dev/null")
+		dump("conflist on agent node", "docker", "exec", "k3d-"+clusterName+"-agent-0", "sh", "-c",
+			"ls /var/lib/rancher/k3s/agent/etc/cni/net.d && cat /var/lib/rancher/k3s/agent/etc/cni/net.d/*.conflist 2>/dev/null")
 		Fail("iperf pods failed to reach Ready (see diagnostics above)")
 	}
 
@@ -204,13 +206,18 @@ var _ = AfterSuite(func() {
 		GinkgoWriter.Printf("NATRA_E2E_KEEP=1 — leaving cluster %q up for inspection\n", clusterName)
 		return
 	}
-	By("deleting kind cluster")
-	_ = exec.Command("kind", "delete", "cluster", "--name", clusterName).Run()
+	By("deleting k3d cluster")
+	_ = exec.Command("k3d", "cluster", "delete", clusterName).Run()
 })
 
 // installNatraDaemon applies deploy/cni-installer.yaml with the e2e
 // image override and waits for rollout. Used by BeforeSuite and by
 // Topology F's reinstatement step.
+//
+// The installer manifest ships with kind-style host paths
+// (/opt/cni/bin, /etc/cni/net.d). k3s puts CNI bits under
+// /var/lib/rancher/k3s/{data/cni,agent/etc/cni/net.d}, so we sed
+// those in at apply time. Same pattern as scripts/soak-test.sh.
 func installNatraDaemon() {
 	// NATRA_E2E_ATTACH_MODE picks the attach path the test rig
 	// exercises. Default is "" which the binary treats as auto. Set
@@ -222,7 +229,11 @@ func installNatraDaemon() {
 	// value (a global s|value: ""$|...| sed would do that).
 	mustExec("bash", "-c",
 		fmt.Sprintf(
-			`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' -e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' %s | `+
+			`sed -e 's|ghcr.io/terraboops/natra:latest|%s|' `+
+				`-e 's|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|' `+
+				`-e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' `+
+				`-e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' `+
+				`%s | `+
 				`awk -v am=%q '/name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next } { print }' | `+
 				`kubectl apply -f -`,
 			natraImage,

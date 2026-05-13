@@ -2,10 +2,11 @@
 # Real-cluster head-to-head: baseline (no plugin) vs natra vs upstream
 # containernetworking/plugins/bandwidth.
 #
-# Spins up three kind clusters in sequence:
-#   - Phase 0: kindnet alone, no rate-limiting plugin (baseline floor)
-#   - Phase A: kindnet + natra chained
-#   - Phase B: kindnet + upstream bandwidth chained
+# Spins up three k3d clusters in sequence (k3s in Docker; same shape
+# as L4 e2e and the soak rig, standardized on k3d for the project):
+#   - Phase 0: flannel alone, no rate-limiting plugin (baseline floor)
+#   - Phase A: flannel + natra chained
+#   - Phase B: flannel + upstream bandwidth chained
 #
 # Two workloads per cluster:
 #
@@ -54,20 +55,30 @@ MIXED_HEY_DURATION=20
 MIXED_HEY_CONCURRENCY=50
 
 cleanup() {
-    kind delete cluster --name "$BASELINE_CLUSTER" 2>/dev/null || true
-    kind delete cluster --name "$NATRA_CLUSTER" 2>/dev/null || true
-    kind delete cluster --name "$VANILLA_CLUSTER" 2>/dev/null || true
+    k3d cluster delete "$BASELINE_CLUSTER" 2>/dev/null || true
+    k3d cluster delete "$NATRA_CLUSTER" 2>/dev/null || true
+    k3d cluster delete "$VANILLA_CLUSTER" 2>/dev/null || true
+}
+
+# nodes_for prints the docker container names for every node (server
+# + agents) in the named k3d cluster. k3d's node-list output format
+# is `k3d-<cluster>-{server,agent}-N`; we filter by the cluster
+# column so unrelated k3d clusters on the same daemon don't bleed in.
+nodes_for() {
+    local cluster="$1"
+    k3d node list --no-headers 2>/dev/null \
+        | awk -v c="$cluster" '$3 == c {print $1}'
 }
 
 # enable_ecn flips tcp_ecn=1 on every node of the named cluster.
-# Sets the netns-scoped sysctl in the kind node's root netns, which
+# Sets the netns-scoped sysctl in the k3d node's root netns, which
 # pod netns created later inherit. iperf3 and hey traffic between
 # pods then negotiate ECN-capable connections at handshake time, so
 # natra's bpf_skb_ecn_set_ce path can fire on above-rate packets
 # instead of dropping them.
 enable_ecn() {
     local cluster="$1"
-    for node in $(kind get nodes --name "$cluster"); do
+    for node in $(nodes_for "$cluster"); do
         docker exec "$node" sysctl -w net.ipv4.tcp_ecn=1 >/dev/null 2>&1 || \
             echo "warn: tcp_ecn=1 on $node failed (continuing)"
     done
@@ -91,7 +102,7 @@ require() {
 }
 
 require docker
-require kind
+require k3d
 require kubectl
 require jq
 require curl
@@ -183,24 +194,27 @@ install_bpftool_in_node() {
     return 0
 }
 
-# Render iperf manifests with the cluster-specific node names. kind
-# names nodes <cluster>-{control-plane,worker}; the source manifests
-# hardcode natra-e2e-* names, so we sed them at runtime. The bidi
-# manifest carries both ingress and egress annotations so the same
-# server pod can be exercised in either direction without a redeploy.
+# Render iperf manifests with the cluster-specific node names. k3d
+# names nodes k3d-<cluster>-{server,agent}-N; the source manifests
+# hardcode k3d-natra-e2e-* names (the canonical e2e cluster), so we
+# sed them to whichever cluster this run uses. The bidi manifest
+# carries both ingress and egress annotations so the same server
+# pod can be exercised in either direction without a redeploy.
 render_manifests() {
     local cluster_name="$1" outdir="$2"
+    local k3d_agent="k3d-${cluster_name}-agent-0"
+    local k3d_server="k3d-${cluster_name}-server-0"
     # Rename the pod/service from iperf-server-bidi → iperf-server so
     # the run_workload commands below can use the canonical name and
     # match the L4 e2e shape. The bidi YAML carries both annotations,
     # which is what we want for this two-phase per-direction workload.
-    sed -e "s|natra-e2e-worker|${cluster_name}-worker|" \
-        -e "s|natra-e2e-control-plane|${cluster_name}-control-plane|" \
+    sed -e "s|k3d-natra-e2e-agent-0|${k3d_agent}|" \
+        -e "s|k3d-natra-e2e-server-0|${k3d_server}|" \
         -e "s|iperf-server-bidi|iperf-server|g" \
         "${REPO_ROOT}/test/e2e/manifests/iperf-server-bidi.yaml" \
         > "$outdir/iperf-server.yaml"
-    sed -e "s|natra-e2e-worker|${cluster_name}-worker|" \
-        -e "s|natra-e2e-control-plane|${cluster_name}-control-plane|" \
+    sed -e "s|k3d-natra-e2e-agent-0|${k3d_agent}|" \
+        -e "s|k3d-natra-e2e-server-0|${k3d_server}|" \
         "${REPO_ROOT}/test/e2e/manifests/iperf-client.yaml" \
         > "$outdir/iperf-client.yaml"
     cp "${REPO_ROOT}/test/e2e/manifests/namespace.yaml" "$outdir/namespace.yaml"
@@ -219,7 +233,7 @@ render_manifests() {
 # AFTER pods are Ready (so the plugin has installed the qdiscs).
 fix_vanilla_htb_burst() {
     local cluster="$1"
-    for node in $(kind get nodes --name "$cluster"); do
+    for node in $(nodes_for "$cluster"); do
         docker exec "$node" bash -c '
             for dev in $(tc qdisc show 2>/dev/null | awk "/htb/ {print \$5}" | sort -u); do
                 # class 1:30 (hex) = ShapedClassMinorID 48 in the
@@ -238,13 +252,15 @@ fix_vanilla_htb_burst() {
 # bandwidth annotations).
 render_mixed_manifests() {
     local cluster_name="$1" outdir="$2"
-    sed -e "s|PERF_WORKER_NODE|${cluster_name}-worker|" \
+    local k3d_agent="k3d-${cluster_name}-agent-0"
+    local k3d_server="k3d-${cluster_name}-server-0"
+    sed -e "s|PERF_WORKER_NODE|${k3d_agent}|" \
         "${REPO_ROOT}/test/perf/realworld/perf-server.yaml" \
         > "$outdir/perf-server.yaml"
-    sed -e "s|PERF_CONTROL_NODE|${cluster_name}-control-plane|" \
+    sed -e "s|PERF_CONTROL_NODE|${k3d_server}|" \
         "${REPO_ROOT}/test/perf/realworld/perf-client.yaml" \
         > "$outdir/perf-client.yaml"
-    sed -e "s|PERF_WORKER_NODE|${cluster_name}-worker|" \
+    sed -e "s|PERF_WORKER_NODE|${k3d_agent}|" \
         "${REPO_ROOT}/test/perf/realworld/bystander.yaml" \
         > "$outdir/bystander.yaml"
 }
@@ -675,29 +691,41 @@ summarize_profile() {
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"; cleanup' EXIT
 
-# Build images once, up front. Both clusters reuse them via kind load.
+# k3d cluster bootstrap is the same for every phase: 1 agent + 1
+# server, no LoadBalancer, drop traefik/servicelb addons we don't use.
+# Default flannel CNI stays in place; natra (Phase A) and the vanilla
+# bandwidth plugin (Phase B) chain after it.
+bootstrap_k3d() {
+    local cluster="$1"
+    k3d cluster create "$cluster" \
+        --agents 1 \
+        --no-lb \
+        --k3s-arg "--disable=traefik,servicelb@server:0" \
+        --wait
+}
+
+# Build images once, up front. Each cluster reuses them via k3d image import.
 echo "==> building natra image: $NATRA_IMAGE"
 docker build -q -t "$NATRA_IMAGE" -f "${REPO_ROOT}/deploy/docker/Dockerfile.cni" "$REPO_ROOT" >/dev/null
 
 echo "==> building perfclient image: $PERFCLIENT_IMAGE"
 docker build -q -t "$PERFCLIENT_IMAGE" -f "${REPO_ROOT}/deploy/docker/Dockerfile.perfclient" "$REPO_ROOT" >/dev/null
 
-# ---- Phase 0: baseline (kindnet only, no rate-limiting) ----
+# ---- Phase 0: baseline (flannel only, no rate-limiting) ----
 echo
 echo "===================================================================="
-echo "Phase 0: baseline (kindnet, no rate-limiting plugin chained)"
+echo "Phase 0: baseline (flannel, no rate-limiting plugin chained)"
 echo "===================================================================="
 mkdir -p "$TMPDIR/baseline"
 render_manifests "$BASELINE_CLUSTER" "$TMPDIR/baseline"
 render_mixed_manifests "$BASELINE_CLUSTER" "$TMPDIR/baseline"
 
-kind create cluster --name "$BASELINE_CLUSTER" \
-    --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
-kind load docker-image "$PERFCLIENT_IMAGE" --name "$BASELINE_CLUSTER"
+bootstrap_k3d "$BASELINE_CLUSTER"
+k3d image import "$PERFCLIENT_IMAGE" --cluster "$BASELINE_CLUSTER"
 enable_ecn "$BASELINE_CLUSTER"
 
 kubectl apply -f "$TMPDIR/baseline/namespace.yaml"
-# No plugin DaemonSet here — kindnet's conflist alone, so the
+# No plugin DaemonSet here — flannel's conflist alone, so the
 # kubernetes.io/{ingress,egress}-bandwidth annotations on perf-server
 # are present but not processed by any chained plugin. Traffic flows
 # at line rate; this row is the "what does the cluster do unaided"
@@ -726,7 +754,7 @@ echo "  baseline mixed iperf ingress=$baseline_mixed_iperf_ing bps  egress=$base
 echo "  baseline mixed pod hey  rps=$baseline_mixed_pod_rps  p50=$baseline_mixed_pod_p50  p99=$baseline_mixed_pod_p99"
 echo "  baseline mixed bystander rps=$baseline_mixed_by_rps  p50=$baseline_mixed_by_p50  p99=$baseline_mixed_by_p99"
 
-kind delete cluster --name "$BASELINE_CLUSTER"
+k3d cluster delete "$BASELINE_CLUSTER"
 
 # ---- Phase A: natra ----
 echo
@@ -737,9 +765,8 @@ mkdir -p "$TMPDIR/natra"
 render_manifests "$NATRA_CLUSTER" "$TMPDIR/natra"
 render_mixed_manifests "$NATRA_CLUSTER" "$TMPDIR/natra"
 
-kind create cluster --name "$NATRA_CLUSTER" \
-    --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
-kind load docker-image "$NATRA_IMAGE" "$PERFCLIENT_IMAGE" --name "$NATRA_CLUSTER"
+bootstrap_k3d "$NATRA_CLUSTER"
+k3d image import "$NATRA_IMAGE" "$PERFCLIENT_IMAGE" --cluster "$NATRA_CLUSTER"
 enable_ecn "$NATRA_CLUSTER"
 
 kubectl apply -f "$TMPDIR/natra/namespace.yaml"
@@ -748,11 +775,17 @@ kubectl apply -f "$TMPDIR/natra/namespace.yaml"
 # NATRA_PERF_EDT_PACING={1,true} flips the cluster-default EDT
 # pacing knob — natra installs fq on each pod eth0 and uses
 # EDT-stamped skbs for above-rate egress instead of dropping.
+#
+# k3s puts CNI under /var/lib/rancher/k3s/{data/cni,agent/etc/cni/
+# net.d}, so the installer's bin / conflist hostPaths get sed'd
+# from the kind-style defaults at apply time.
 ATTACH_MODE="${NATRA_PERF_ATTACH_MODE:-}"
 if [ "$ATTACH_MODE" = "tcx-hostside" ]; then ATTACH_MODE=""; fi
 EDT_PACING="${NATRA_PERF_EDT_PACING:-}"
 sed -e "s|ghcr.io/terraboops/natra:latest|${NATRA_IMAGE}|" \
     -e "s|imagePullPolicy: IfNotPresent|imagePullPolicy: Never|" \
+    -e "s|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|" \
+    -e "s|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|" \
     "${REPO_ROOT}/deploy/cni-installer.yaml" | \
     awk -v am="$ATTACH_MODE" -v ep="$EDT_PACING" '
         /name: NATRA_ATTACH_MODE/ { print; getline; sub(/value: ".*"/, "value: \"" am "\""); print; next }
@@ -784,7 +817,7 @@ echo "  natra mixed iperf ingress=$natra_mixed_iperf_ing bps  egress=$natra_mixe
 echo "  natra mixed pod hey  rps=$natra_mixed_pod_rps  p50=$natra_mixed_pod_p50  p99=$natra_mixed_pod_p99"
 echo "  natra mixed bystander rps=$natra_mixed_by_rps  p50=$natra_mixed_by_p50  p99=$natra_mixed_by_p99"
 
-kind delete cluster --name "$NATRA_CLUSTER"
+k3d cluster delete "$NATRA_CLUSTER"
 
 # ---- Phase B: upstream bandwidth plugin ----
 echo
@@ -795,23 +828,28 @@ mkdir -p "$TMPDIR/vanilla"
 render_manifests "$VANILLA_CLUSTER" "$TMPDIR/vanilla"
 render_mixed_manifests "$VANILLA_CLUSTER" "$TMPDIR/vanilla"
 
-kind create cluster --name "$VANILLA_CLUSTER" \
-    --config "${REPO_ROOT}/test/e2e/kind-config.yaml" --wait 120s
-kind load docker-image "$PERFCLIENT_IMAGE" --name "$VANILLA_CLUSTER"
+bootstrap_k3d "$VANILLA_CLUSTER"
+k3d image import "$PERFCLIENT_IMAGE" --cluster "$VANILLA_CLUSTER"
 enable_ecn "$VANILLA_CLUSTER"
 
-# Load ifb on each kind node — the upstream bandwidth plugin uses
-# HTB on an IFB device, and the kind base image ships the module but
-# doesn't auto-load it. Doing this before the DaemonSet's install
-# container patches the conflist guarantees the bandwidth plugin can
-# create the IFB device when kubelet first invokes it.
-for node in $(kind get nodes --name "$VANILLA_CLUSTER"); do
+# Load ifb on each k3d node — the upstream bandwidth plugin uses
+# HTB on an IFB device, and the kindest/node image (which k3d also
+# uses under the hood) ships the module but doesn't auto-load it.
+# Doing this before the DaemonSet's install container patches the
+# conflist guarantees the bandwidth plugin can create the IFB
+# device when kubelet first invokes it.
+for node in $(nodes_for "$VANILLA_CLUSTER"); do
     docker exec "$node" modprobe ifb || \
         echo "warn: modprobe ifb on $node failed (continuing)"
 done
 
 kubectl apply -f "$TMPDIR/vanilla/namespace.yaml"
-kubectl apply -f "${REPO_ROOT}/test/perf/realworld/vanilla-installer.yaml"
+# vanilla-installer.yaml's bin hostPath is /opt/cni/bin (kind);
+# k3s wants /var/lib/rancher/k3s/data/cni. sed at apply time.
+sed -e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' \
+    -e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' \
+    "${REPO_ROOT}/test/perf/realworld/vanilla-installer.yaml" \
+    | kubectl apply -f -
 kubectl rollout status daemonset/vanilla-bandwidth-installer -n kube-system --timeout=120s
 
 kubectl apply -f "$TMPDIR/vanilla/iperf-server.yaml"
@@ -843,7 +881,7 @@ echo "  vanilla mixed iperf ingress=$vanilla_mixed_iperf_ing bps  egress=$vanill
 echo "  vanilla mixed pod hey  rps=$vanilla_mixed_pod_rps  p50=$vanilla_mixed_pod_p50  p99=$vanilla_mixed_pod_p99"
 echo "  vanilla mixed bystander rps=$vanilla_mixed_by_rps  p50=$vanilla_mixed_by_p50  p99=$vanilla_mixed_by_p99"
 
-kind delete cluster --name "$VANILLA_CLUSTER"
+k3d cluster delete "$VANILLA_CLUSTER"
 
 # Format human-readable output.
 fmt_bps() {
@@ -868,9 +906,9 @@ fmt_secs() {
 }
 
 cat <<EOF | tee "$RESULT_FILE"
-natra vs upstream containernetworking/plugins/bandwidth — kind cluster head-to-head
+natra vs upstream containernetworking/plugins/bandwidth — k3d cluster head-to-head
 ====================================================================================
-Three configurations: baseline (kindnet alone, no rate-limiting), natra, upstream
+Three configurations: baseline (flannel alone, no rate-limiting), natra, upstream
 containernetworking/plugins/bandwidth. Same workloads against each.
 
 Workload 1: iperf-only (legacy). Same iperf3 client/server, ${RATE} annotation each direction.
