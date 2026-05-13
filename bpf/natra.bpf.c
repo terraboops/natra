@@ -140,8 +140,9 @@ struct {
 // decay reduces (they re-increment on every packet); dormant cells
 // fade lazily the next time they're touched.
 //
-// last_decay_idx uses CMS_DECAY_INTERVAL_NS as its unit (one tick per
-// 60 seconds) and stores as u32, wrapping every ~136 years — fine.
+// last_decay_idx uses CMS_DECAY_INTERVAL_NS as its unit and stores as
+// u32, wrapping every ~hundreds of years at the chosen interval —
+// fine.
 //
 // Cost vs the prior u32-only cell: doubles memory (32 KiB → 64 KiB
 // per pod) and adds ~10 extra instructions per cell hit. Per packet
@@ -151,7 +152,14 @@ struct {
 // is approximate by design; lost increments under cross-CPU race
 // give slightly conservative classification (an elephant takes one
 // extra packet to be marked heavy), which is the safe direction.
-#define CMS_DECAY_INTERVAL_NS (60ULL * 1000000000ULL)
+//
+// CMS_DECAY_INTERVAL_NS is intentionally a power of two so the
+// `now_ns / CMS_DECAY_INTERVAL_NS` reduces to a right-shift in the
+// BPF JIT. (1 << 36) ns ≈ 68.7 s — close enough to the prior 60 s
+// decay window that the behavior is indistinguishable; the trade is
+// one shift instead of an integer division per packet. Stays well
+// inside u32 wrap (2^32 ticks × 68.7 s ≈ 9300 years).
+#define CMS_DECAY_INTERVAL_NS (1ULL << 36)
 
 struct cms_cell {
 	__u32 count;
