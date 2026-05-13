@@ -106,15 +106,18 @@ var _ = Describe("natra CNI binary", func() {
 			Expect(result["cniVersion"]).To(Equal("1.0.0"))
 		})
 
-		// tcx-hostside is the production default. The pin filename uses
+		// tcx-hostside pins the link via bpffs. The pin filename uses
 		// a dotless suffix ("-link") because bpffs's bpf_lookup rejects
 		// any path component containing a '.' on user-mounted
 		// subdirectories (kernel/bpf/inode.c) — those names are
 		// reserved for populate_bpffs's internal special files. An
 		// earlier revision used `<id>-eth0.link` and got EPERM on
 		// every Pin call; same shape applies to map pins (`-map`
-		// suffix). Test asserts the happy path end-to-end.
-		It("default mode attaches ingress via tcx-hostside and pins the link to bpffs", func() {
+		// suffix). Test asserts the happy path end-to-end with the
+		// attachMode pinned in stdin so the assertions don't depend
+		// on the cluster-default behavior (which is now "auto" and
+		// prefers pod-side when EDT pacing is on).
+		It("tcx-hostside attaches ingress and pins the link to bpffs", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
@@ -125,6 +128,7 @@ var _ = Describe("natra CNI binary", func() {
 				"cniVersion": "1.0.0",
 				"name": "natra-test",
 				"type": "natra",
+				"attachMode": "tcx-hostside",
 				"runtimeConfig": {
 					"podAnnotations": {
 						"kubernetes.io/ingress-bandwidth": "10M"
@@ -259,7 +263,7 @@ var _ = Describe("natra CNI binary", func() {
 				"clsact-hostside mode should not produce a link pin")
 		})
 
-		It("default mode attaches egress via tcx-hostside with only egress-bandwidth annotated", func() {
+		It("tcx-hostside attaches egress with only egress-bandwidth annotated", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
@@ -270,6 +274,7 @@ var _ = Describe("natra CNI binary", func() {
 				"cniVersion": "1.0.0",
 				"name": "natra-test",
 				"type": "natra",
+				"attachMode": "tcx-hostside",
 				"runtimeConfig": {
 					"podAnnotations": {
 						"kubernetes.io/egress-bandwidth": "10M"
@@ -297,7 +302,7 @@ var _ = Describe("natra CNI binary", func() {
 				"all per-container pins should be cleaned up by DEL")
 		})
 
-		It("default mode attaches both directions when both annotations are present", func() {
+		It("tcx-hostside attaches both directions when both annotations are present", func() {
 			By("creating a veth pair end inside the pod netns")
 			ns, cleanup, err := newTestNetnsWithVeth("eth0")
 			Expect(err).NotTo(HaveOccurred())
@@ -308,6 +313,7 @@ var _ = Describe("natra CNI binary", func() {
 				"cniVersion": "1.0.0",
 				"name": "natra-test",
 				"type": "natra",
+				"attachMode": "tcx-hostside",
 				"runtimeConfig": {
 					"podAnnotations": {
 						"kubernetes.io/ingress-bandwidth": "10M",
