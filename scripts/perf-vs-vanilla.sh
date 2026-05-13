@@ -351,6 +351,18 @@ run_mixed_workload() {
     local hey_pod_log="$TMPDIR/hey-pod-${tag}.txt"
     local hey_by_log="$TMPDIR/hey-bystander-${tag}.txt"
 
+    # The function's stdout is the channel the caller reads from. Any
+    # accidental stdout write in our body (docker exec error messages
+    # to stdout, kubectl warnings, etc.) corrupts the read's
+    # space-separated parse — observed: kubectl exec emitting "OCI
+    # runtime exec failed: ..." somewhere in the chain caused the
+    # caller to assign "OCI" to iperf_ing, "runtime" to iperf_eg,
+    # and so on across all 10 variables. Save the real stdout on
+    # fd 3 and redirect 1→2 for the body so only the final result
+    # echo (>&3) lands on the read's input.
+    exec 3>&1
+    exec 1>&2
+
     # Profile collector runs on the worker node only when natra is
     # under test. The vanilla and baseline clusters have no natra
     # binary on /opt/cni/bin.
@@ -442,23 +454,12 @@ run_mixed_workload() {
         fi
     done
 
-    # Debug: dump every var to stderr right before emit, so we can
-    # see if downstream parsing breakage is at this layer or above.
-    {
-        echo "=== run_mixed_workload($tag) final vars ==="
-        echo "iperf_ing=$iperf_ing"
-        echo "iperf_eg=$iperf_eg"
-        echo "pod_rps=$pod_rps"
-        echo "pod_p50=$pod_p50"
-        echo "pod_p99=$pod_p99"
-        echo "pod_total=$pod_total"
-        echo "by_rps=$by_rps"
-        echo "by_p50=$by_p50"
-        echo "by_p99=$by_p99"
-        echo "by_total=$by_total"
-    } >&2
-
-    echo "$iperf_ing $iperf_eg $pod_rps $pod_p50 $pod_p99 $pod_total $by_rps $by_p50 $by_p99 $by_total"
+    # Result emit on the original stdout (fd 3), which the caller's
+    # `read` consumes. Anything else printed in this function went
+    # to stderr (via the exec 1>&2 at the top), so it lands in the
+    # logs but doesn't corrupt the field-by-field parse.
+    echo "$iperf_ing $iperf_eg $pod_rps $pod_p50 $pod_p99 $pod_total $by_rps $by_p50 $by_p99 $by_total" >&3
+    exec 3>&-
 }
 
 # Profile collector: runs `natra profile` on the worker node as a
