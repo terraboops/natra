@@ -446,8 +446,8 @@ start_profile_collector() {
     # process survives the docker-exec shell exiting (default SIGHUP
     # on exec-shell teardown was killing the collector before its
     # first snapshot landed).
-    docker exec "${cluster}-worker" mkdir -p /var/log/natra-profile
-    docker exec "${cluster}-worker" bash -c '
+    docker exec "k3d-${cluster}-agent-0" mkdir -p /var/log/natra-profile
+    docker exec "k3d-${cluster}-agent-0" bash -c '
         setsid nohup /opt/cni/bin/natra profile \
             -interval 2s \
             -output /var/log/natra-profile/snapshots.jsonl \
@@ -459,7 +459,7 @@ start_profile_collector() {
     # Brief settle so the first snapshot is on disk and the collector
     # has stabilized before workload traffic starts.
     sleep 1
-    echo "==> started natra profile collector on ${cluster}-worker" >&2
+    echo "==> started natra profile collector on k3d-${cluster}-agent-0" >&2
 
     # bpftool prog profile gives cycles + instructions per
     # natra_ingress / natra_egress invocation — finer-grained than
@@ -477,15 +477,15 @@ start_profile_collector() {
     # so `features: llvm, skeletons` is set) and caches it under bin/.
     # install_bpftool_in_node copies that staged binary into the kind
     # node at /usr/local/bin/bpftool.
-    if ensure_bpftool && install_bpftool_in_node "${cluster}-worker"; then
+    if ensure_bpftool && install_bpftool_in_node "k3d-${cluster}-agent-0"; then
         # Loosen perf paranoia and enable BPF stats so the in-kernel
         # runtime_ns / run_cnt counters update for `bpftool prog show`.
         # Both knobs are netns-root-scoped and idempotent.
-        docker exec "${cluster}-worker" bash -c '
+        docker exec "k3d-${cluster}-agent-0" bash -c '
             sysctl -w kernel.perf_event_paranoid=-1 >/dev/null 2>&1 || true
             sysctl -w kernel.bpf_stats_enabled=1   >/dev/null 2>&1 || true
         ' || true
-        docker exec "${cluster}-worker" bash -c '
+        docker exec "k3d-${cluster}-agent-0" bash -c '
             set +e
             if ! command -v bpftool >/dev/null 2>&1; then
                 echo "bpftool not on PATH after install; skipping prog profile" > /var/log/natra-profile/bpftool.txt
@@ -586,14 +586,14 @@ start_profile_collector() {
         ' >/dev/null 2>&1 &
     else
         echo "==> bpftool unavailable; skipping prog profile" >&2
-        docker exec "${cluster}-worker" bash -c \
+        docker exec "k3d-${cluster}-agent-0" bash -c \
             'echo "bpftool unavailable on host (ensure_bpftool failed); skipping prog profile" > /var/log/natra-profile/bpftool.txt' \
             >/dev/null 2>&1 || true
     fi
     # Diagnostic: dump state of /var/log/natra-profile/ so a missing
     # snapshot or a startup error in the profile binary shows up
     # immediately rather than as a silent "no snapshots written".
-    docker exec "${cluster}-worker" bash -c '
+    docker exec "k3d-${cluster}-agent-0" bash -c '
         echo "  profile pid: $(cat /var/log/natra-profile/profile.pid 2>/dev/null)";
         echo "  profile process: $(ps -p $(cat /var/log/natra-profile/profile.pid 2>/dev/null) -o comm= 2>/dev/null || echo NOT_RUNNING)";
         echo "  profile dir:";
@@ -607,7 +607,7 @@ stop_profile_collector() {
     local cluster="$1" tag="$2"
     local profile_dir="$TMPDIR/profile-${tag}"
 
-    docker exec "${cluster}-worker" bash -c '
+    docker exec "k3d-${cluster}-agent-0" bash -c '
         pid=$(cat /var/log/natra-profile/profile.pid 2>/dev/null || true)
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
@@ -621,16 +621,16 @@ stop_profile_collector() {
     # Copy out the artifacts. Surface errors loudly — silent docker
     # cp failures previously masked the real reason snapshots weren't
     # landing locally.
-    if ! docker cp "${cluster}-worker:/var/log/natra-profile/snapshots.jsonl" \
+    if ! docker cp "k3d-${cluster}-agent-0:/var/log/natra-profile/snapshots.jsonl" \
         "$profile_dir/snapshots.jsonl"; then
         echo "==> docker cp snapshots.jsonl FAILED" >&2
     fi
-    docker cp "${cluster}-worker:/var/log/natra-profile/heap" \
+    docker cp "k3d-${cluster}-agent-0:/var/log/natra-profile/heap" \
         "$profile_dir/heap" || \
         echo "==> docker cp heap-dir failed (skipping)" >&2
-    docker cp "${cluster}-worker:/var/log/natra-profile/profile.log" \
+    docker cp "k3d-${cluster}-agent-0:/var/log/natra-profile/profile.log" \
         "$profile_dir/profile.log" || true
-    docker cp "${cluster}-worker:/var/log/natra-profile/bpftool.txt" \
+    docker cp "k3d-${cluster}-agent-0:/var/log/natra-profile/bpftool.txt" \
         "$profile_dir/bpftool-prog-profile.txt" || true
     echo "==> profile artifacts: $profile_dir" >&2
     summarize_profile "$profile_dir/snapshots.jsonl"
