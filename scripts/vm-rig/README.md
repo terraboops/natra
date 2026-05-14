@@ -55,9 +55,12 @@ the natra + perfclient images, imports them into each VM, applies
 the installer DaemonSet, then runs two assertions back-to-back
 across the VM boundary:
 
-- **iperf3 throttle**: a 15-second TCP elephant from iperf-client
-  to iperf-server (annotated 10 Mbps ingress). Asserts the
-  receiver's bps stays within the 1.30× slack cap.
+- **iperf3 throttle (bidi)**: against a server annotated with both
+  ingress and egress at 10 Mbps, two 15-second TCP elephants run
+  back-to-back — forward (`iperf3 -c`) for ingress and reverse
+  (`iperf3 -R`) for egress. Asserts the receiver-side bps stays
+  within the 1.30× slack cap on *each* direction. Same shape as
+  Topology C in the L4 e2e suite.
 - **hey HTTP fast-pass**: 15 seconds of hey at -c 50
   -disable-keepalive against an annotated nginx target (same 10
   Mbps cap as the iperf elephant). Asserts RPS clears a generous

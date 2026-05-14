@@ -54,24 +54,38 @@ func cmdTest(c *Config) error {
 	return nil
 }
 
-// testIperfThrottle: ingress elephant flow → expect throttled
-// receiver throughput within rate × 1.30.
+// testIperfThrottle: bidi elephant flow → expect both directions
+// throttled within rate × 1.30. Forward iperf3 stresses the
+// server's ingress (client → server) and reverse iperf3 -R stresses
+// the server's egress (server → client). Same shape as Topology C
+// in the L4 e2e suite.
 func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNode string) error {
 	const (
-		rateBitsPS  = 10_000_000 // 10 Mbps annotation
+		rateBitsPS  = 10_000_000 // 10 Mbps annotation, both directions
 		slackFactor = 1.30
 	)
 
-	fmt.Println("==> [iperf] deploying iperf client + server")
-	for _, m := range []string{"iperf-client.yaml", "iperf-server.yaml"} {
-		manifest, err := renderE2EManifest(c, m, namespace, serverNode, workerNode)
-		if err != nil {
-			return err
-		}
-		if err := kubectl(env, strings.NewReader(manifest),
-			"apply", "-f", "-"); err != nil {
-			return err
-		}
+	// Use the bidi-annotated manifest (both ingress and egress at
+	// 10M); rename the pod from iperf-server-bidi → iperf-server so
+	// the iperf3 client invocations stay symmetric with the L4
+	// suite. Same pattern scripts/perf-vs-vanilla.sh uses.
+	fmt.Println("==> [iperf] deploying iperf client + bidi-annotated server")
+	clientManifest, err := renderE2EManifest(c, "iperf-client.yaml", namespace, serverNode, workerNode)
+	if err != nil {
+		return err
+	}
+	if err := kubectl(env, strings.NewReader(clientManifest),
+		"apply", "-f", "-"); err != nil {
+		return err
+	}
+	serverManifest, err := renderE2EManifest(c, "iperf-server-bidi.yaml", namespace, serverNode, workerNode)
+	if err != nil {
+		return err
+	}
+	serverManifest = strings.ReplaceAll(serverManifest, "iperf-server-bidi", "iperf-server")
+	if err := kubectl(env, strings.NewReader(serverManifest),
+		"apply", "-f", "-"); err != nil {
+		return err
 	}
 
 	fmt.Println("==> [iperf] waiting for pods Ready")
@@ -82,39 +96,49 @@ func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNod
 		return err
 	}
 
-	// Drain the bucket. natra's burst is 2× rate (~2.5 MB at
-	// 10 Mbps); a fresh bucket lets the first measured second run
-	// at line rate. 20 seconds × 4 parallel streams flushes the
-	// burst window.
-	fmt.Println("==> [iperf] warming up (draining bucket)")
+	// Drain both directions' buckets. natra's burst is 2× rate
+	// (~2.5 MB at 10 Mbps); a fresh bucket lets the first measured
+	// second run at line rate. 20 seconds × 4 parallel streams
+	// flushes the forward (ingress) burst; a second pass with -R
+	// flushes the reverse (egress) burst.
+	fmt.Println("==> [iperf] warming up (draining buckets, both directions)")
 	_ = kubectl(env, nil,
 		"exec", "-n", namespace, "iperf-client", "--",
 		"iperf3", "-c", "iperf-server", "-t", "20", "-P", "4")
-
-	fmt.Println("==> [iperf] measuring throttled throughput")
-	out, err := captureKubectl(env,
+	_ = kubectl(env, nil,
 		"exec", "-n", namespace, "iperf-client", "--",
-		"iperf3", "-c", "iperf-server", "-t", "15", "-J")
-	if err != nil {
-		return err
-	}
-	var res iperfResult
-	if err := json.Unmarshal([]byte(out), &res); err != nil {
-		return fmt.Errorf("parse iperf JSON: %w", err)
-	}
+		"iperf3", "-c", "iperf-server", "-t", "20", "-P", "4", "-R")
 
-	measured := res.End.SumReceived.BitsPerSecond
 	cap := float64(rateBitsPS) * slackFactor
 
-	fmt.Println()
-	fmt.Printf("iperf-server (annotated 10 Mbps) on %s ← iperf-client on %s\n", workerNode, serverNode)
-	fmt.Printf("  measured: %s\n", fmtBps(measured))
-	fmt.Printf("  cap:      %s (rate × %.2f slack)\n", fmtBps(cap), slackFactor)
+	for _, leg := range []struct {
+		label     string // "ingress" / "egress"
+		direction string // "forward (-c)" / "reverse (-R)"
+		args      []string
+	}{
+		{"ingress", "forward", []string{"iperf3", "-c", "iperf-server", "-t", "15", "-J"}},
+		{"egress", "reverse", []string{"iperf3", "-c", "iperf-server", "-t", "15", "-R", "-J"}},
+	} {
+		fmt.Printf("==> [iperf/%s] measuring throttled throughput\n", leg.label)
+		args := append([]string{"exec", "-n", namespace, "iperf-client", "--"}, leg.args...)
+		out, err := captureKubectl(env, args...)
+		if err != nil {
+			return err
+		}
+		var res iperfResult
+		if err := json.Unmarshal([]byte(out), &res); err != nil {
+			return fmt.Errorf("parse iperf JSON (%s): %w", leg.label, err)
+		}
+		measured := res.End.SumReceived.BitsPerSecond
 
-	if measured > cap {
-		return fmt.Errorf("[iperf] measured throughput %s exceeds cap %s", fmtBps(measured), fmtBps(cap))
+		fmt.Printf("  [%s] %s direction, measured: %s\n", leg.label, leg.direction, fmtBps(measured))
+		fmt.Printf("  [%s] cap: %s (rate × %.2f slack)\n", leg.label, fmtBps(cap), slackFactor)
+		if measured > cap {
+			return fmt.Errorf("[iperf/%s] measured throughput %s exceeds cap %s",
+				leg.label, fmtBps(measured), fmtBps(cap))
+		}
 	}
-	fmt.Println("PASS [iperf]: ingress throttled within cap on a real two-kernel cluster.")
+	fmt.Println("PASS [iperf]: both directions throttled within cap on a real two-kernel cluster.")
 	return nil
 }
 
