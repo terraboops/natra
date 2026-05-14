@@ -62,29 +62,19 @@ of magnitude catches plugin bugs that only surface at higher rates
 
 | Direction | Plugin   | Elephant   | Mice (20× parallel) |
 |-----------|----------|------------|---------------------|
-| ingress   | natra    | 10.29 Mbps | 11.39 Mbps          |
-| ingress   | upstream | 21.40 Mbps |  9.57 Mbps          |
-| egress    | natra    |  8.84 Mbps | 13.08 Mbps          |
-| egress    | upstream | 42.42 Mbps |  9.55 Mbps          |
+| ingress   | natra    | 10.28 Mbps | 11.47 Mbps          |
+| ingress   | upstream | 10.07 Mbps |  9.43 Mbps          |
+| egress    | natra    |  9.01 Mbps | 12.98 Mbps          |
+| egress    | upstream | 10.08 Mbps |  9.48 Mbps          |
 
 Rig: colima aarch64, LinuxKit ~6.8.x, k3d v5.7.4, flannel
 host-gw, software dataplane (no NIC offload). Single sample
-each, freshly captured. natra elephants land within 12% of cap
-(ingress 3% over, egress 12% under as single-sample noise — the
-same cell under concurrent traffic in Workload 2 measures 9.79
-Mbps, 2% under). At higher rates natra lands within 5% of cap
-(1028 Mbps on 1G, 10142/10106 Mbps on 10G).
-
-Upstream's 21/42 Mbps elephants in this run reflect a fix that
-landed after capture: the previous `fix_vanilla_htb_burst`
-targeted HTB class 1:30 via `tc class change` and silently
-no-op'd on the v1.6.0-k3s1 binary (which uses TBF, not HTB, and
-ships in a k3s node container with no `tc` userspace tool). The
-current `fix_vanilla_tbf_burst` reaches the node netns via
-nsenter from the host kernel and rewrites the TBF qdisc burst
-directly. The next perf-vs-vanilla run will replace this
-upstream row with the patched-burst measurement, expected at
-~10 Mbps on the 10M cell.
+each, captured in one run with both plugins active. Both
+plugins land within 10% of cap. At higher rates both stay
+inside 5% of cap (natra 1026/1048 Mbps on 1G, upstream 957/957
+Mbps on 1G). Above ~1 Gbps the rig's wire becomes the
+bottleneck — single-stream colima caps at ~10 Gbps regardless
+of shaper.
 
 Heavy-hitter threshold scales with rate:
 `max(16 KiB, rate_bytes × 100ms)`. 10 Mbps pod → ~125 KiB. Tail
@@ -116,35 +106,38 @@ Client traffic:
   is a fresh TCP connection at ~5-7 KB, well under the 125 KiB
   heavy-hitter threshold.
 
-| Plugin                | iperf ing  | iperf eg  | Annotated mice RPS / p99 | Bystander RPS / p99 |
-|-----------------------|------------|-----------|--------------------------|---------------------|
-| baseline (no plugin)  | 59.5 Mbps  | 57.3 Mbps |   34 / 5980 ms           | 9281 / 38 ms        |
-| natra                 | 10.52 Mbps | 9.79 Mbps | 4709 /   82 ms           | 6072 / 78 ms        |
-| upstream `bandwidth`  | 17.02 Mbps | 8.88 Mbps |   92 / 5655 ms           | 7426 / 39 ms        |
+| Plugin                | iperf ing  | iperf eg   | Annotated mice RPS / p99 | Bystander RPS / p99 |
+|-----------------------|------------|------------|--------------------------|---------------------|
+| baseline (no plugin)  | 59.66 Mbps | 58.58 Mbps |   31 /  4996 ms          | 8591 / 39 ms        |
+| natra                 | 10.21 Mbps |  9.16 Mbps | 7015 /    69 ms          | 7354 / 61 ms        |
+| upstream `bandwidth`  | 10.77 Mbps | 10.14 Mbps |   31 /  1794 ms          | 8979 / 34 ms        |
 
-Single sample, freshly captured. Baseline mice are slow under
-concurrent load because the elephant saturates colima's shared
-software dataplane — the bucket isn't what's hurting them, the
-wire is. With either plugin's elephant capped (or even partly
-capped) toward 10 Mbps, the mice get the wire back. Read in
-three pieces:
+Single sample, captured in the same run as Workload 1 with
+both plugins active. Baseline mice are slow under concurrent
+load because the elephant saturates colima's shared software
+dataplane — the bucket isn't what's hurting them, the wire is.
+With either plugin's elephant capped to 10 Mbps, the mice get
+the wire back. Read in three pieces:
 
-- **Elephant cap.** natra ingress 10.52 Mbps and egress 9.79 Mbps
-  — both inside 6% of the 10M cap. Upstream ingress 17.02 Mbps
-  reflects the pre-fix TBF-burst-patch issue (Workload 1 caption);
-  on a rig with the new patch active, upstream tracks natra's
-  envelope.
-- **Annotated mice.** natra 4709 RPS / p99 82 ms vs upstream 92
-  RPS / p99 5655 ms. CMS classification lets each fresh-flow
-  hey request bypass the bucket; HTB queues everything against
-  the same 10 Mbps slot, so mice wait behind the elephant. 51×
-  RPS, 69× lower p99 — the value-prop of CMS-then-bucket on a
-  mixed workload, end-to-end.
+- **Elephant cap.** natra and upstream land within 10% of the
+  10M cap on both directions (natra 10.21/9.16, upstream
+  10.77/10.14). The differences are single-sample noise plus
+  natra's ~3-5% headroom from its CMS+EDT shape.
+- **Annotated mice.** natra 7015 RPS / p99 69 ms vs upstream 31
+  RPS / p99 1794 ms. CMS classification lets each fresh-flow
+  hey request bypass the bucket; the upstream token-bucket
+  qdisc queues every flow against the same 10 Mbps slot, so
+  mice wait behind the elephant. **226× RPS, 26× lower p99 —
+  the value-prop of CMS-then-bucket on a mixed workload,
+  end-to-end on real upstream code.**
 - **Bystander.** Neither plugin attaches anything to unannotated
-  pods. The bystander p99 sits at 78 ms under natra vs 39 ms
-  under upstream — structural cost from a paced elephant sharing
-  the node (softirq time, NIC ring contention, cache pressure),
-  not from natra touching the bystander.
+  pods. natra's bystander p99 (61 ms) is higher than upstream's
+  (34 ms) — structural cost of EDT pacing vs simple qdisc drops:
+  EDT-stamped packets sit in `fq` and compete with the bystander's
+  packets for the same NIC ring; pure-drop disposition gives the
+  bystander unimpeded wire time. Trade-off: natra protects the
+  annotated pod's own mice (7015 vs 31 RPS) at the cost of ~2× p99
+  on a same-node unannotated neighbor.
 
 ## Gaps in this comparison
 
