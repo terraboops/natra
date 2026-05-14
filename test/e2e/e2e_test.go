@@ -386,8 +386,13 @@ func waitForServiceEndpoints(svcName string) {
 // minor between-test variance the 3-sample window won't see.
 func calibrateRig() {
 	defer func() {
-		GinkgoWriter.Printf("throttleDuration = %ds, throttledCap = %.2f Mbps, chaosBpsCap = %.2f Mbps\n",
-			throttleDuration, float64(throttledCap)/1e6, float64(chaosBpsCap)/1e6)
+		// stdout (fmt.Printf) so the summary lands in CI logs even on
+		// passing runs; GinkgoWriter buffers and only flushes on failure.
+		fmt.Printf("calibration summary: throttleDuration=%ds throttledCap=%.2fMbps chaosBpsCap=%.2fMbps (rate=%.2fMbps annotation)\n",
+			throttleDuration,
+			float64(throttledCap)/1e6,
+			float64(chaosBpsCap)/1e6,
+			float64(bandwidthBps)/1e6)
 	}()
 
 	const drainSeconds = 10
@@ -448,8 +453,8 @@ func calibrateRig() {
 	safe := 1.0 + 2.0*jitter
 	if dynCapRatio <= safe+0.005 {
 		throttleDuration = throttleDurationCeiling
-		GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% — high jitter, clamping duration to %ds\n",
-			mean/1e6, stddev/1e6, jitter*100, throttleDuration)
+		fmt.Printf("calibration: mean=%.2fMbps stddev=%.2fMbps jitter=%.2f%% overshoot=%.1f%% — high jitter, clamping duration to %ds\n",
+			mean/1e6, stddev/1e6, jitter*100, (mean/float64(bandwidthBps)-1)*100, throttleDuration)
 		return
 	}
 	optimal := math.Ceil(burstSeconds / (dynCapRatio/safe - 1.0))
@@ -461,8 +466,8 @@ func calibrateRig() {
 		d = throttleDurationCeiling
 	}
 	throttleDuration = d
-	GinkgoWriter.Printf("calibration: mean=%.2f Mbps stddev=%.2f Mbps jitter=%.2f%% → throttleDuration=%ds (raw %.1fs, clamped to [%d, %d])\n",
-		mean/1e6, stddev/1e6, jitter*100, throttleDuration, optimal, throttleDurationFloor, throttleDurationCeiling)
+	fmt.Printf("calibration: mean=%.2fMbps stddev=%.2fMbps jitter=%.2f%% overshoot=%.1f%% → throttleDuration=%ds (raw %.1fs, clamped to [%d, %d])\n",
+		mean/1e6, stddev/1e6, jitter*100, (mean/float64(bandwidthBps)-1)*100, throttleDuration, optimal, throttleDurationFloor, throttleDurationCeiling)
 }
 
 // runIperfWithDiagnostics is runIperf plus a 0-bps retry loop and a
