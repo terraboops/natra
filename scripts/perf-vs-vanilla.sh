@@ -1102,10 +1102,11 @@ kubectl wait --for=condition=Ready \
     pod/iperf-client pod/perf-server pod/perf-client pod/bystander \
     -n natra-e2e --timeout=180s
 
-# Patch HTB burst on every veth/ifb the bandwidth plugin created.
-# Without this, kubelet's default-huge burst lets the first ~150s of
-# traffic flow unshaped — measurements that fit inside that window
-# never see HTB engage.
+# Patch the per-pod TBF burst on every veth/ifb the bandwidth plugin
+# created (HTB in v1.5.1, TBF in v1.6.0+ — the function adapts).
+# Without this, kubelet's default ~150 sec of credit lets the first
+# ~150 seconds of traffic flow unshaped — measurements that fit inside
+# that window never see the rate-limiter engage.
 fix_vanilla_tbf_burst "$VANILLA_CLUSTER"
 
 sweep_rate_workload vanilla
