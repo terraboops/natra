@@ -55,8 +55,9 @@ reflect steady state, not initial-burst artifacts:
   credit (observed: `burst 193 MB / cburst 386 MB` on a 10 Mbps
   annotation). The script overrides each pod's HTB class via `tc
   class change ... burst 1mb cburst 1mb` after pod-ready, before
-  measurement. natra's bucket is 2× rate by design (2.5 MB for
-  10 Mbps), already small enough.
+  measurement. natra's bucket defaults to 0.5 × rate (625 KB at
+  10 Mbps), already small enough — both plugins land in the same
+  burst envelope when measured.
 - **Bucket warmup.** A 20s forward + 20s reverse priming flow on
   each server pod drains any initial-burst tokens. Applies
   symmetrically to both plugins.
@@ -104,6 +105,14 @@ macOS, LinuxKit kernel ~6.8.x, k3d v5.7.4 (k3s under containerd) on
 the docker bridge, flannel host-gw, no NIC offload (software
 dataplane). One run; numbers below are not averaged across runs.
 
+> **Stale numbers.** Captured when natra's default burst was 2.0 ×
+> rate (2 sec of credit) — see commit history. The default is now
+> 0.5 × rate (0.5 sec credit) which over a 15-second iperf window
+> drops the theoretical overshoot from ~13% to ~3.3%. A fresh
+> `make perf-vs-vanilla` run is needed to replace this table;
+> expected: natra elephant columns land near 10.3-10.7 Mbps, in
+> the same envelope as the upstream HTB rows below.
+
 | Direction | Plugin                | Elephant   | Mice (20× parallel)  |
 |-----------|-----------------------|------------|----------------------|
 | ingress   | natra                 | 11.16 Mbps | 11.65 Mbps           |
@@ -111,9 +120,9 @@ dataplane). One run; numbers below are not averaged across runs.
 | egress    | natra                 | 11.69 Mbps | 12.81 Mbps           |
 | egress    | upstream `bandwidth`  | 10.11 Mbps |  9.61 Mbps           |
 
-Both plugins land within their cap-plus-burst envelope; natra's
-single-flow elephant and 20-parallel mice columns sit in the same
-range as the upstream HTB plugin on this rig.
+Both plugins should land within their cap-plus-burst envelope; the
+20-parallel "mice" column for natra is the cell most sensitive to
+the CMS classifier's behavior under parallel flows.
 
 Baseline (no plugin) on this rig is ~21-43 Mbps for elephants —
 colima's flannel host-gw is bottlenecked by the LinuxKit kernel's

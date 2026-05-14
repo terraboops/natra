@@ -55,6 +55,40 @@ type Config struct {
 // so the meaning is invariant to GRO super-packet coalescing.
 const DefaultHHThresholdBytes int64 = 256 * 1024
 
+// DefaultBurstRatio sets the token bucket capacity as a multiple of
+// the rate (in seconds of credit). 0.5 = half a second of credit;
+// at 10 Mbps that's 625 KB, at 1 Gbps that's 62.5 MB.
+//
+// Trade-off: bigger burst tolerates spikier traffic without
+// triggering throttle; smaller burst keeps the measured average
+// throughput closer to the configured rate. Math: a T-second
+// measurement of a long-lived elephant averages
+// rate × (1 + burst_seconds / T), so 0.5 sec of credit over a
+// 15-second window lands at 3.3% over rate — well inside the
+// "vanilla-like" 1-5% envelope. (Previous value 2.0 landed at
+// ~13% over.) Override per-cluster via defaults.burstRatio.
+const DefaultBurstRatio = 0.5
+
+// MinBurstBytes is the floor on the computed burst. At very low
+// rates, rate × burstRatio falls below the size of a single
+// GRO-coalesced super-packet, which would make the bucket reject
+// every packet that arrives over the wire. Set the floor at 64 KB
+// — one max-sized GSO super-packet — so any rate-scaled burst
+// stays admittable.
+const MinBurstBytes int64 = 64 * 1024
+
+// DefaultBurstFor returns the burst (bytes) the parser uses when
+// an annotation specifies a rate but no explicit burst. Centralized
+// so the simple form, the JSON form, and the runtimeConfig path in
+// cmd/natra/main.go all compute burst the same way.
+func DefaultBurstFor(rate int64) int64 {
+	b := int64(float64(rate) * DefaultBurstRatio)
+	if b < MinBurstBytes {
+		return MinBurstBytes
+	}
+	return b
+}
+
 // DefaultConfig returns the zero-rate baseline. Callers overwrite
 // Rate (and optionally Burst) from the parsed annotation.
 //
@@ -108,7 +142,7 @@ func ParseBandwidthAnnotation(annotation string) (*Config, error) {
 	}
 	cfg := DefaultConfig()
 	cfg.Rate = rateBits / 8
-	cfg.Burst = cfg.Rate * 2
+	cfg.Burst = DefaultBurstFor(cfg.Rate)
 	return cfg, nil
 }
 
@@ -143,7 +177,7 @@ func parseJSONConfig(data string) (*Config, error) {
 		}
 		cfg.Burst = burstBits / 8
 	} else if cfg.Rate > 0 {
-		cfg.Burst = cfg.Rate * 2
+		cfg.Burst = DefaultBurstFor(cfg.Rate)
 	}
 	if raw.HeavyHitterThreshold > 0 {
 		cfg.HeavyHitterThreshold = raw.HeavyHitterThreshold

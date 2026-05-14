@@ -81,12 +81,15 @@ spec:
             # per-rate scaling would over- or under-shoot.
             - name: NATRA_DEFAULT_HH_THRESHOLD
               value: ""
-            # NATRA_DEFAULT_BURST_RATIO sets the bucket-capacity
-            # multiplier on the configured rate. Default 2 (so a
-            # 10 Mbps pod gets a 2.5 MB bucket = 2 seconds of credit).
-            # Raise for spikier workloads that need more burst
-            # headroom; lower for stricter caps with shorter burst
-            # tolerance.
+            # NATRA_DEFAULT_BURST_RATIO sets the bucket-capacity as
+            # seconds of credit at the configured rate. Default 0.5
+            # — a 10 Mbps pod gets a 625 KB bucket (0.5 sec of credit),
+            # which keeps measured throughput within ~3-5% of the
+            # configured rate over a 15-second window. Raise toward
+            # 1.0 for spikier workloads that need more burst headroom;
+            # lower toward 0.1 for stricter caps. Burst is floored at
+            # one max-GRO super-packet (64 KB) so a single skb is
+            # always admittable even at very low rates.
             - name: NATRA_DEFAULT_BURST_RATIO
               value: ""
           command:

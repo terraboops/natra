@@ -164,11 +164,11 @@ func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNod
 		return err
 	}
 
-	// Drain both directions' buckets. natra's burst is 2× rate
-	// (~2.5 MB at 10 Mbps); a fresh bucket lets the first measured
-	// second run at line rate. 20 seconds × 4 parallel streams
-	// flushes the forward (ingress) burst; a second pass with -R
-	// flushes the reverse (egress) burst.
+	// Drain both directions' buckets. natra's burst defaults to
+	// 0.5 × rate (~625 KB at 10 Mbps); a fresh bucket lets the
+	// first measured second run at line rate. 20 seconds × 4
+	// parallel streams flushes the forward (ingress) burst; a
+	// second pass with -R flushes the reverse (egress) burst.
 	fmt.Println("==> [iperf] warming up (draining buckets, both directions)")
 	_ = kubectl(env, nil,
 		"exec", "-n", namespace, "iperf-client", "--",

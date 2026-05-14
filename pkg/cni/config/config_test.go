@@ -19,12 +19,14 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 	Context("with simple form", func() {
 		// Inputs are bits/sec (k8s convention); Config.Rate is
 		// bytes/sec. Expected values are the bit-quantity divided by 8.
+		// Burst is whatever DefaultBurstFor returns — currently
+		// 0.5×rate with a 64 KiB floor.
 		DescribeTable("decimal SI suffixes parse bits/sec -> bytes/sec",
 			func(annotation string, expected int64) {
 				cfg, err := config.ParseBandwidthAnnotation(annotation)
 				Expect(err).NotTo(HaveOccurred())
 				Expect(cfg.Rate).To(Equal(expected))
-				Expect(cfg.Burst).To(Equal(expected * 2))
+				Expect(cfg.Burst).To(Equal(config.DefaultBurstFor(expected)))
 			},
 			Entry("plain integer", "100", int64(100/8)),
 			Entry("explicit B suffix", "100B", int64(100/8)),
@@ -75,8 +77,11 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 		It("parses rate-only (50 Mbit -> 6.25 MB/s)", func() {
 			cfg, err := config.ParseBandwidthAnnotation(`{"rate":"50M"}`)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(cfg.Rate).To(Equal(int64(50_000_000 / 8)))
-			Expect(cfg.Burst).To(Equal(int64(50_000_000 / 8 * 2)))
+			rate := int64(50_000_000 / 8)
+			Expect(cfg.Rate).To(Equal(rate))
+			// Default burst = DefaultBurstFor(rate); test asserts the
+			// helper's output rather than re-deriving it.
+			Expect(cfg.Burst).To(Equal(config.DefaultBurstFor(rate)))
 		})
 
 		It("parses rate + explicit burst (both bits/sec)", func() {
@@ -115,6 +120,25 @@ var _ = Describe("ParseBandwidthAnnotation", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cfg.Rate).To(Equal(int64(10_000_000 / 8)))
 		})
+	})
+})
+
+var _ = Describe("DefaultBurstFor", func() {
+	// The burst formula is the load-bearing reason measured
+	// throughput stays close to the configured rate over a
+	// finite-window iperf run; pin both the multiplier and the
+	// MTU-sized floor so the math doesn't silently drift.
+	It("returns 0.5 × rate for rates well above the floor", func() {
+		// 10 Mbps in bytes/sec = 1_250_000. 0.5× = 625_000.
+		Expect(config.DefaultBurstFor(1_250_000)).To(Equal(int64(625_000)))
+		// 100 Mbps. 0.5× = 6_250_000.
+		Expect(config.DefaultBurstFor(12_500_000)).To(Equal(int64(6_250_000)))
+	})
+	It("clamps to MinBurstBytes at very low rates", func() {
+		// 100 KB/s × 0.5 = 50_000, below 64 KiB floor.
+		Expect(config.DefaultBurstFor(100_000)).To(Equal(config.MinBurstBytes))
+		// Zero rate also clamps; defensive.
+		Expect(config.DefaultBurstFor(0)).To(Equal(config.MinBurstBytes))
 	})
 })
 

@@ -98,9 +98,13 @@ type NetConfDefaults struct {
 	// looser rate-limit caps under bursty parallel-flow workloads.
 	// Per-pod HHThreshold annotation overrides this.
 	FastPassTimeConstantMs int64 `json:"fastPassTimeConstantMs,omitempty"`
-	// BurstRatio overrides the default burst-to-rate ratio
-	// (compiled-in: 2). A 10 Mbps annotation with ratio 2 gives a
-	// 2.5 MB token bucket (= 2 seconds of credit).
+	// BurstRatio overrides the default burst-to-rate ratio in
+	// seconds of credit. Compiled-in default 0.5 — a 10 Mbps
+	// annotation gets a 625 KB bucket (0.5 sec of credit), which
+	// keeps measured throughput within ~3-5% of the configured
+	// rate over a 15-second window. Raise toward 1.0 for spikier
+	// workloads that need more burst headroom; lower toward 0.1
+	// for stricter caps.
 	BurstRatio float64 `json:"burstRatio,omitempty"`
 	// EDTPacing controls EDT-stamped pacing for above-rate egress
 	// packets. natra installs an fq qdisc on the pod's eth0 so
@@ -411,10 +415,12 @@ func parseConfig(stdin []byte) (*NetConf, error) {
 //     annotation string passes through and we parse it ourselves.
 //     Already bytes/sec.
 //
-// Burst is clamped to 2× rate. Kubelet sets burst to MaxUint32 (~4 GB)
-// when the annotation doesn't specify one, which would let a high-rate
-// flow saturate the link for ~30s before the bucket caught up. 2× rate
-// is a one-second burst window — same heuristic the upstream plugin uses.
+// Burst is clamped to rate × cluster-default BurstRatio (compiled
+// default 0.5 sec of credit), floored at MinBurstBytes so one
+// max-GRO super-packet always fits. Kubelet sets burst to
+// MaxUint32 (~4 GB) when the annotation doesn't specify one, which
+// would let a high-rate flow saturate the link for tens of seconds
+// before the bucket caught up — the clamp prevents that.
 //
 // Returns nil if neither channel produces a usable rate for this
 // direction. Each direction is resolved independently so a pod with
@@ -436,9 +442,10 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 		annotationKey = "kubernetes.io/egress-bandwidth"
 	}
 
-	// Cluster-default burst ratio. Falls back to 2× when the
-	// conflist doesn't set one — same value baked into pkg/cni/config.
-	burstRatio := 2.0
+	// Cluster-default burst ratio. Falls back to config.DefaultBurstRatio
+	// (0.5 sec of credit) when the conflist doesn't override; same
+	// default the pkg/cni/config parser uses for the simple/JSON forms.
+	burstRatio := config.DefaultBurstRatio
 	if conf.Defaults != nil && conf.Defaults.BurstRatio > 0 {
 		burstRatio = conf.Defaults.BurstRatio
 	}
@@ -448,6 +455,9 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 		out.Rate = rateBits / 8 // bits → bytes
 		burst := burstBits / 8
 		maxBurst := int64(float64(out.Rate) * burstRatio)
+		if maxBurst < config.MinBurstBytes {
+			maxBurst = config.MinBurstBytes
+		}
 		if burst <= 0 || burst > maxBurst {
 			burst = maxBurst
 		}
@@ -472,9 +482,11 @@ func resolveDirectionConfig(conf *NetConf, dir bpf.Direction) *config.Config {
 				if parsed.HeavyHitterThreshold == config.DefaultConfig().HeavyHitterThreshold {
 					parsed.HeavyHitterThreshold = resolveHHThreshold(conf, parsed.Rate)
 				}
-				if conf.Defaults != nil {
-					if conf.Defaults.BurstRatio > 0 && parsed.Burst == parsed.Rate*2 {
-						parsed.Burst = int64(float64(parsed.Rate) * burstRatio)
+				if conf.Defaults != nil && conf.Defaults.BurstRatio > 0 &&
+					parsed.Burst == config.DefaultBurstFor(parsed.Rate) {
+					parsed.Burst = int64(float64(parsed.Rate) * burstRatio)
+					if parsed.Burst < config.MinBurstBytes {
+						parsed.Burst = config.MinBurstBytes
 					}
 				}
 				return parsed
