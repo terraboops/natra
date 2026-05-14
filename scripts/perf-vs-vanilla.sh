@@ -365,6 +365,30 @@ warmup_pod() {
 # Takes the server name (e.g. iperf-server-r10m, iperf-server-r1g) so
 # the same workload can be driven against multiple per-rate pods on the
 # same cluster without redeploys.
+# measure_iperf runs `iperf3 -c ...` in iperf-client and prints the
+# receiver-side throughput in bps. On failure (iperf3 nonzero exit,
+# missing receiver-side stats) it prints 0 and emits a stderr warning
+# tagged with the label so the operator can see which cell failed —
+# the `// 0` fallback alone would silently bury the failure as a real
+# zero-measurement, which then quietly poisons the comparison table.
+measure_iperf() {
+    local namespace="natra-e2e" server="$1" label="$2"
+    shift 2
+    local raw bps
+    raw=$(kubectl exec -n "$namespace" iperf-client -- iperf3 -c "$server" -J "$@" 2>/dev/null) || {
+        echo "warn: iperf3 $label against $server failed (exit nonzero); recording 0" >&2
+        echo "0"
+        return
+    }
+    bps=$(printf '%s' "$raw" | jq -r '.end.sum_received.bits_per_second // 0')
+    if [ "$bps" = "0" ] || [ -z "$bps" ]; then
+        echo "warn: iperf3 $label against $server produced no receiver-side throughput; recording 0" >&2
+        echo "0"
+        return
+    fi
+    echo "$bps"
+}
+
 run_workload() {
     local namespace="natra-e2e" server="$1"
 
@@ -373,21 +397,10 @@ run_workload() {
 
     local ing_elephant ing_mice eg_elephant eg_mice
 
-    ing_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c "$server" -t "$ELEPHANT_DURATION" -J 2>/dev/null \
-        | jq '.end.sum_received.bits_per_second // 0')
-
-    ing_mice=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c "$server" -t "$MICE_DURATION" -P "$MICE_PARALLEL" -J 2>/dev/null \
-        | jq '.end.sum_received.bits_per_second // 0')
-
-    eg_elephant=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c "$server" -t "$ELEPHANT_DURATION" -R -J 2>/dev/null \
-        | jq '.end.sum_received.bits_per_second // 0')
-
-    eg_mice=$(kubectl exec -n "$namespace" iperf-client -- \
-        iperf3 -c "$server" -t "$MICE_DURATION" -P "$MICE_PARALLEL" -R -J 2>/dev/null \
-        | jq '.end.sum_received.bits_per_second // 0')
+    ing_elephant=$(measure_iperf "$server" "ingress-elephant" -t "$ELEPHANT_DURATION")
+    ing_mice=$(measure_iperf "$server" "ingress-mice" -t "$MICE_DURATION" -P "$MICE_PARALLEL")
+    eg_elephant=$(measure_iperf "$server" "egress-elephant" -t "$ELEPHANT_DURATION" -R)
+    eg_mice=$(measure_iperf "$server" "egress-mice" -t "$MICE_DURATION" -P "$MICE_PARALLEL" -R)
 
     echo "$ing_elephant $ing_mice $eg_elephant $eg_mice"
 }
