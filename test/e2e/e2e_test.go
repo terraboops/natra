@@ -528,7 +528,7 @@ var _ = Describe("Topology A — ingress only", func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		bps := runIperf(ctx, iperfOpts{Target: "iperf-server"})
-		GinkgoWriter.Printf("smoke throughput: %.2f Mbps\n", float64(bps)/1e6)
+		fmt.Printf("[smoke] measured=%.2fMbps\n", float64(bps)/1e6)
 		Expect(bps).To(BeNumerically(">", 0),
 			"connectivity should work between iperf pods")
 	})
@@ -601,9 +601,9 @@ var _ = Describe("Topology D — mixed (only some pods annotated)", func() {
 		bpsB := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-b"})
 		bpsC := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-c"})
 
-		GinkgoWriter.Printf("mixed-a (annotated)   throughput: %.2f Mbps\n", float64(bpsA)/1e6)
-		GinkgoWriter.Printf("mixed-b (unannotated) throughput: %.2f Mbps\n", float64(bpsB)/1e6)
-		GinkgoWriter.Printf("mixed-c (unannotated) throughput: %.2f Mbps\n", float64(bpsC)/1e6)
+		fmt.Printf("[mixed/a annotated]   measured=%.2fMbps\n", float64(bpsA)/1e6)
+		fmt.Printf("[mixed/b unannotated] measured=%.2fMbps\n", float64(bpsB)/1e6)
+		fmt.Printf("[mixed/c unannotated] measured=%.2fMbps\n", float64(bpsC)/1e6)
 
 		Expect(bpsA).To(BeNumerically("<=", throttledCap),
 			"annotated pod should be throttled")
@@ -624,9 +624,9 @@ var _ = Describe("Topology E — no annotations (natra is no-op)", func() {
 		bpsB := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-b"})
 		bpsC := runIperf(ctx, iperfOpts{Target: "iperf-server-mixed-c"})
 
-		GinkgoWriter.Printf("mixed-b throughput (no annotation, natra in path): %.2f Mbps\n",
+		fmt.Printf("[none/b unannotated] measured=%.2fMbps (natra in path, no annotation)\n",
 			float64(bpsB)/1e6)
-		GinkgoWriter.Printf("mixed-c throughput (no annotation, natra in path): %.2f Mbps\n",
+		fmt.Printf("[none/c unannotated] measured=%.2fMbps (natra in path, no annotation)\n",
 			float64(bpsC)/1e6)
 
 		Expect(bpsB).To(BeNumerically(">=", unthrottledFloor),
@@ -670,8 +670,10 @@ var _ = Describe("Topology G — proxy-like simultaneous bidirectional", func() 
 		Expect(fwdErr).NotTo(HaveOccurred(), "concurrent forward iperf3 failed")
 		Expect(revErr).NotTo(HaveOccurred(), "concurrent reverse iperf3 failed")
 
-		GinkgoWriter.Printf("concurrent forward (ingress) throughput: %.2f Mbps\n", float64(fwdBps)/1e6)
-		GinkgoWriter.Printf("concurrent reverse (egress)  throughput: %.2f Mbps\n", float64(revBps)/1e6)
+		fmt.Printf("[bidi/concurrent/fwd ingress] measured=%.2fMbps cap=%.2fMbps\n",
+			float64(fwdBps)/1e6, float64(throttledCap)/1e6)
+		fmt.Printf("[bidi/concurrent/rev egress]  measured=%.2fMbps cap=%.2fMbps\n",
+			float64(revBps)/1e6, float64(throttledCap)/1e6)
 
 		Expect(fwdBps).To(BeNumerically("<=", throttledCap),
 			"ingress should throttle even while egress traffic flows simultaneously")
@@ -729,7 +731,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		waitForServiceEndpoints(podName)
 
 		baselineNoPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: throttleDuration})
-		GinkgoWriter.Printf("no-plugin baseline: %.2f Mbps\n", float64(baselineNoPlugin)/1e6)
+		fmt.Printf("[topF/no-plugin baseline] measured=%.2fMbps\n", float64(baselineNoPlugin)/1e6)
 		Expect(baselineNoPlugin).To(BeNumerically(">", 0),
 			"baseline should produce a real number")
 	})
@@ -746,7 +748,7 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		waitForServiceEndpoints(podName)
 
 		baselineWithPlugin = runIperfWithDiagnostics(ctx, iperfOpts{Target: podName, Duration: throttleDuration})
-		GinkgoWriter.Printf("with-natra baseline: %.2f Mbps\n", float64(baselineWithPlugin)/1e6)
+		fmt.Printf("[topF/with-natra] measured=%.2fMbps\n", float64(baselineWithPlugin)/1e6)
 		Expect(baselineWithPlugin).To(BeNumerically(">", 0),
 			"with-plugin throughput should produce a real number")
 
@@ -756,17 +758,19 @@ var _ = Describe("Topology F — no-plugin regression", Ordered, func() {
 		if delta < 0 {
 			delta = -delta
 		}
-		GinkgoWriter.Printf("regression delta: %.1f%% (tolerance %.0f%%)\n", delta*100, tolerance*100)
+		fmt.Printf("[topF/regression] delta=%.1f%% tolerance=%.0f%%\n", delta*100, tolerance*100)
 		Expect(delta).To(BeNumerically("<=", tolerance),
 			"natra without an annotation must not introduce >%.0f%% throughput regression", tolerance*100)
 	})
 })
 
-// logThrottled writes the human-readable summary line that the
-// existing tests depend on for log inspection.
+// logThrottled writes the per-spec measurement to stdout (not
+// GinkgoWriter, which buffers and only flushes on failure) so the
+// measured Mbps for each topology lands in CI logs on success too.
+// Format: [direction] measured=X.XX Mbps cap=Y.YY Mbps rate=Z.ZZ Mbps
 func logThrottled(direction string, bps int64) {
-	GinkgoWriter.Printf("[%s] throttled throughput: %.2f Mbps (cap rate %.2f Mbps; effective cap %.2f Mbps)\n",
-		direction, float64(bps)/1e6, float64(bandwidthBps)/1e6, float64(throttledCap)/1e6)
+	fmt.Printf("[%s] measured=%.2fMbps cap=%.2fMbps rate=%.2fMbps\n",
+		direction, float64(bps)/1e6, float64(throttledCap)/1e6, float64(bandwidthBps)/1e6)
 }
 
 func requireBinary(name string) {
