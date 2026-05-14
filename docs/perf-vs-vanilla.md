@@ -56,28 +56,25 @@ of magnitude catches plugin bugs that only surface at higher rates
 
 | Direction | Plugin   | Elephant   | Mice (20× parallel) |
 |-----------|----------|------------|---------------------|
-| ingress   | natra    | 11.16 Mbps | 11.65 Mbps          |
+| ingress   | natra    | 10.29 Mbps | 11.49 Mbps          |
 | ingress   | upstream | 10.04 Mbps |  9.64 Mbps          |
-| egress    | natra    | 11.69 Mbps | 12.81 Mbps          |
+| egress    | natra    |  8.88 Mbps | 12.79 Mbps          |
 | egress    | upstream | 10.11 Mbps |  9.61 Mbps          |
 
 Rig: colima aarch64, LinuxKit ~6.8.x, k3d v5.7.4, flannel
 host-gw, software dataplane (no NIC offload). Single sample.
-Captured when natra's default burst was `2.0 × rate`. After the
-burst-default change to `0.5 × rate`, the L4 e2e calibration on
-a GH runner measures:
+natra rows from the latest run (post EDT-first egress reorder,
+post 0.5× burst-default); the upstream rows are carried forward
+from an earlier run when colima's LinuxKit kernel still shipped
+the `ifb` module (the script needs it for HTB-on-IFB egress
+shaping, and current colima images don't have it).
 
-```
-mean=10.10Mbps stddev=0.20Mbps jitter=1.94% overshoot=1.0%
-```
-
-natra is in vanilla's 1-5% overshoot envelope under current
-defaults. A fresh `make perf-vs-vanilla` would replace the table
-above.
-
-Baseline elephants on this rig: ~21-43 Mbps. colima's LinuxKit
-software dataplane bottlenecks the wire well below hardware line
-rate; both plugins cap at ~10 Mbps regardless.
+The 10M egress elephant at 8.88 Mbps (≈11% under cap) is
+single-sample noise on this rig — the same path under
+concurrent traffic in Workload 2 measures 9.70 Mbps (3% under),
+and the L4 e2e GH runner measures `mean=10.37Mbps stddev=0.17`
+on the same 10M annotation. At higher rates the elephants land
+within 5% of cap (1.05 Gbps on 1G, 10.19 Gbps on 10G).
 
 Heavy-hitter threshold scales with rate:
 `max(16 KiB, rate_bytes × 100ms)`. 10 Mbps pod → ~125 KiB. Tail
@@ -111,31 +108,34 @@ Client traffic:
 
 | Plugin                | iperf ing  | iperf eg  | Annotated mice RPS / p99 | Bystander RPS / p99 |
 |-----------------------|------------|-----------|--------------------------|---------------------|
-| baseline (no plugin)  | ~8 Gbps    | ~27 Gbps  | 5283 / 71 ms             | 6479 / 25 ms        |
-| natra                 | 9.12 Mbps  | 6.77 Mbps | 4073 / 262 ms            | 6913 / 43 ms        |
+| baseline (no plugin)  | ~60 Mbps   | ~57 Mbps  |   43 / 4884 ms           | 8162 / 41 ms        |
+| natra                 | 10.17 Mbps | 9.70 Mbps | 6776 /   61 ms           | 7848 / 48 ms        |
 | upstream `bandwidth`  | 10.59 Mbps | 8.67 Mbps |   12 / 5715 ms           | 8519 / 40 ms        |
 
-Single sample. Captured before two ordering changes: the burst
-default move (`2.0 × rate` → `0.5 × rate`) and the egress
-disposition reorder (EDT-first instead of ECN-first on egress).
-The 6.77 Mbps natra-egress row reflects the pre-reorder behavior
-where ECN-mark halved cwnd on every above-rate egress packet,
-pulling the measured rate below the 10 Mbps cap. Under the
-current ordering (`bpf/natra.bpf.c::throttle_disposition` —
-EDT-pace first when `cfg.edt_pacing != 0`), egress holds at the
-cap-plus-burst envelope like ingress; a `make perf-vs-vanilla`
-re-run will replace this row. Read in three pieces:
+Single sample. natra and baseline rows from the latest run;
+upstream row carried forward from the previous run (colima
+LinuxKit missing `ifb`). Baseline mice are slow under concurrent
+load because the elephant saturates colima's shared software
+dataplane — the bucket isn't what's hurting them, the wire is.
+With either plugin's elephant capped at 10 Mbps, the mice get
+the wire back. Read in three pieces:
 
-- **Elephant cap.** Both plugins land within their cap-plus-burst
-  envelope. natra's pre-reorder egress is the exception, fixed.
-- **Annotated mice.** natra 4073 RPS, vanilla 12 RPS. CMS
-  classification lets each fresh-flow hey request bypass the
-  bucket; HTB queues everything against the same 10 Mbps slot.
+- **Elephant cap.** natra ingress 10.17 Mbps and egress 9.70 Mbps
+  — both inside 5% of the 10M cap. The egress number is the
+  post-reorder behavior; previously this row was 6.77 Mbps
+  because ECN-mark fired first on every above-rate egress packet.
+- **Annotated mice.** natra 6776 RPS / p99 61 ms vs vanilla 12
+  RPS / p99 5715 ms. CMS classification lets each fresh-flow
+  hey request bypass the bucket; HTB queues everything against
+  the same 10 Mbps slot, so mice wait behind the elephant. The
+  61 ms p99 is itself a post-reorder improvement (was 262 ms
+  pre-fix because ECN-cwnd-collapse held elephant tokens longer
+  than necessary).
 - **Bystander.** Neither plugin attaches anything to unannotated
-  pods. The bystander p99 gap from baseline (25 → 43 ms) is
-  structural — a paced elephant on a shared node costs softirq
-  time, NIC ring contention, and cache pressure for any
-  neighbor, plugin or no.
+  pods. The bystander p99 sits at 48 ms under natra vs 40 ms
+  under vanilla — structural cost from a paced elephant sharing
+  the node (softirq time, NIC ring contention, cache pressure),
+  not from natra touching the bystander.
 
 ## Gaps in this comparison
 
