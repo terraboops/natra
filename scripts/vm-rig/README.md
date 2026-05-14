@@ -102,17 +102,27 @@ go run ./cmd/vm-rig down   # when done
 vm-rig — natra kernel-isolated test rig (lima + k3s)
 
 Subcommands:
-  up        bring up the two-VM k3s cluster
-  install   build and import the natra image, apply installer
-  test      iperf throttle + hey HTTP-mice fast-pass assertions
-  down      tear down both VMs
-  all       up + install + test (down on exit unless -keep)
+  up             bring up the two-VM k3s cluster
+  install        build and import the natra image, apply installer
+  test           iperf throttle + hey HTTP-mice fast-pass assertions
+  perfvsvanilla  natra-vs-upstream-bandwidth comparison (scaffolding;
+                 currently bails on the cross-VM connectivity blocker)
+  down           tear down both VMs
+  all            up + install + test (down on exit unless -keep)
 
 Environment:
   NATRA_VM_KUBECONFIG   kubeconfig output path (default /tmp/natra-vm-rig.kubeconfig)
   NATRA_VM_IMAGE        natra image tag to build/use (default ghcr.io/terraboops/natra:vm-rig)
   NATRA_VM_KEEP=1       used by `all` to skip teardown on exit
 ```
+
+The `perfvsvanilla` subcommand is the planned local-developer driver
+for the natra-vs-upstream comparison documented in
+`docs/perf-vs-vanilla.md`. The scaffolding is in place
+(`cmd/vm-rig/perfvsvanilla.go`); it currently probes cross-VM
+connectivity and exits cleanly if the blocker is hit. The three-phase
+implementation (baseline / natra / upstream-bandwidth measurements)
+fills in once cross-VM pod traffic works.
 
 ## Pinning a kernel version
 

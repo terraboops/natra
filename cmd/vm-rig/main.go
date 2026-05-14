@@ -26,11 +26,13 @@ import (
 const usage = `vm-rig — natra kernel-isolated test rig (lima + k3s)
 
 Subcommands:
-  up        bring up the two-VM k3s cluster
-  install   build and import natra + perfclient images, apply installer
-  test      iperf throttle + hey HTTP-mice fast-pass assertions
-  down      tear down both VMs
-  all       up + install + test (down on exit unless -keep)
+  up             bring up the two-VM k3s cluster
+  install        build and import natra + perfclient images, apply installer
+  test           iperf throttle + hey HTTP-mice fast-pass assertions
+  perfvsvanilla  natra-vs-upstream-bandwidth comparison (scaffolding;
+                 see scripts/vm-rig/README.md for the connectivity blocker)
+  down           tear down both VMs
+  all            up + install + test (down on exit unless -keep)
 
 Environment:
   NATRA_VM_KUBECONFIG         kubeconfig output path
@@ -61,6 +63,8 @@ func main() {
 		err = cmdInstall(cfg)
 	case "test":
 		err = cmdTest(cfg)
+	case "perfvsvanilla":
+		err = cmdPerfVsVanilla(cfg)
 	case "down":
 		err = cmdDown(cfg)
 	case "all":
