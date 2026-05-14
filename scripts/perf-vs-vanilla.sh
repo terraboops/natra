@@ -988,9 +988,21 @@ enable_ecn "$VANILLA_CLUSTER"
 # Doing this before the DaemonSet's install container patches the
 # conflist guarantees the bandwidth plugin can create the IFB
 # device when kubelet first invokes it.
+#
+# Two-step: load in the underlying kernel first (colima VM on Mac,
+# or the host on native Linux), then a no-op modprobe inside each
+# container so userspace tools don't error. The container's
+# /lib/modules is empty on current k3s base images; modprobe -a
+# from inside fails even though the module exists on the host.
+if command -v colima >/dev/null 2>&1 && colima status >/dev/null 2>&1; then
+    colima ssh -- sudo modprobe ifb 2>/dev/null || \
+        echo "warn: modprobe ifb on colima VM failed (vanilla phase may fail)"
+elif [ "$(uname -s)" = "Linux" ]; then
+    sudo modprobe ifb 2>/dev/null || \
+        echo "warn: modprobe ifb on host failed (vanilla phase may fail)"
+fi
 for node in $(nodes_for "$VANILLA_CLUSTER"); do
-    docker exec "$node" modprobe ifb || \
-        echo "warn: modprobe ifb on $node failed (continuing)"
+    docker exec "$node" modprobe ifb 2>/dev/null || true
 done
 
 kubectl apply -f "$TMPDIR/vanilla/namespace.yaml"
