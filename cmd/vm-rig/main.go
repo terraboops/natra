@@ -27,14 +27,19 @@ const usage = `vm-rig — natra kernel-isolated test rig (lima + k3s)
 
 Subcommands:
   up        bring up the two-VM k3s cluster
-  install   build and import the natra image, apply installer
-  test      run the iperf throttle assertion
+  install   build and import natra + perfclient images, apply installer
+  test      iperf throttle + hey HTTP-mice fast-pass assertions
   down      tear down both VMs
   all       up + install + test (down on exit unless -keep)
 
 Environment:
-  NATRA_VM_KUBECONFIG   kubeconfig output path (default /tmp/natra-vm-rig.kubeconfig)
-  NATRA_VM_IMAGE        natra image tag to build/use (default ghcr.io/terraboops/natra:vm-rig)
+  NATRA_VM_KUBECONFIG         kubeconfig output path
+                              (default /tmp/natra-vm-rig.kubeconfig)
+  NATRA_VM_IMAGE              natra image tag to build/use
+                              (default ghcr.io/terraboops/natra:vm-rig)
+  NATRA_VM_PERFCLIENT_IMAGE   perfclient image tag (iperf3 + hey)
+                              (default ghcr.io/terraboops/natra-perfclient:vm-rig)
+  NATRA_VM_KEEP=1             leave VMs up after 'all' (default tears down)
 `
 
 func main() {

@@ -16,30 +16,44 @@ func cmdInstall(c *Config) error {
 		return fmt.Errorf("%s not found — run 'vm-rig up' first", c.KubeconfigPath)
 	}
 
-	fmt.Printf("==> building natra image (%s)\n", c.NatraImage)
-	if err := run("docker", "build", "-q", "-t", c.NatraImage,
-		"-f", filepath.Join(c.RepoRoot, "deploy", "docker", "Dockerfile.cni"),
-		c.RepoRoot); err != nil {
-		return err
-	}
-
-	tarFile := "/tmp/natra-vm-rig.tar"
-	fmt.Println("==> exporting image tarball")
-	if err := run("docker", "save", "-o", tarFile, c.NatraImage); err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(tarFile) }()
-
-	for _, vm := range []string{c.ServerName, c.AgentName} {
-		fmt.Printf("==> copying image to %s\n", vm)
-		if err := run("limactl", "copy", tarFile, vm+":/tmp/natra-vm-rig.tar"); err != nil {
+	// Build and push both images. natra is the CNI plugin DaemonSet
+	// image; perfclient bundles iperf3 + hey for the test phases
+	// (iperf3 elephant throttle, hey HTTP-mice fast-pass).
+	for _, img := range []struct {
+		tag, dockerfile, label string
+	}{
+		{c.NatraImage, "Dockerfile.cni", "natra"},
+		{c.PerfclientImage, "Dockerfile.perfclient", "perfclient"},
+	} {
+		fmt.Printf("==> building %s image (%s)\n", img.label, img.tag)
+		if err := run("docker", "build", "-q", "-t", img.tag,
+			"-f", filepath.Join(c.RepoRoot, "deploy", "docker", img.dockerfile),
+			c.RepoRoot); err != nil {
 			return err
 		}
-		fmt.Printf("==> importing image in %s\n", vm)
-		if err := run("limactl", "shell", vm, "--",
-			"sudo", "k3s", "ctr", "-n", "k8s.io", "images", "import",
-			"/tmp/natra-vm-rig.tar"); err != nil {
+	}
+
+	// Export each image to a tar, copy to both VMs, import into the
+	// k3s-embedded containerd. The same temp tarball is reused per
+	// image — one round-trip per (image × VM).
+	tarFile := "/tmp/natra-vm-rig.tar"
+	defer func() { _ = os.Remove(tarFile) }()
+	for _, img := range []string{c.NatraImage, c.PerfclientImage} {
+		fmt.Printf("==> exporting %s tarball\n", img)
+		if err := run("docker", "save", "-o", tarFile, img); err != nil {
 			return err
+		}
+		for _, vm := range []string{c.ServerName, c.AgentName} {
+			fmt.Printf("==> copying image to %s\n", vm)
+			if err := run("limactl", "copy", tarFile, vm+":/tmp/natra-vm-rig.tar"); err != nil {
+				return err
+			}
+			fmt.Printf("==> importing image in %s\n", vm)
+			if err := run("limactl", "shell", vm, "--",
+				"sudo", "k3s", "ctr", "-n", "k8s.io", "images", "import",
+				"/tmp/natra-vm-rig.tar"); err != nil {
+				return err
+			}
 		}
 	}
 

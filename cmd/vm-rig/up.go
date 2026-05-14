@@ -89,7 +89,7 @@ func cmdUp(c *Config) error {
 	// Stage 4: wait for both nodes to register as Ready.
 	fmt.Println("==> waiting for both nodes Ready")
 	if err := waitForNodesReady(c, 2, 60, 2*time.Second); err != nil {
-		_, _ = captureWithEnv([]string{"KUBECONFIG=" + c.KubeconfigPath}, "kubectl", "get", "nodes")
+		_, _ = captureKubectl([]string{"KUBECONFIG=" + c.KubeconfigPath}, "get", "nodes")
 		return err
 	}
 	if err := run("env", "KUBECONFIG="+c.KubeconfigPath, "kubectl", "get", "nodes", "-o", "wide"); err != nil {
@@ -146,7 +146,7 @@ func waitForFile(vm, path string, attempts int, delay time.Duration) error {
 func waitForNodesReady(c *Config, want, attempts int, delay time.Duration) error {
 	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
 	for i := 0; i < attempts; i++ {
-		out, err := captureWithEnv(env, "kubectl", "get", "nodes", "--no-headers")
+		out, err := captureKubectl(env, "get", "nodes", "--no-headers")
 		if err == nil {
 			ready := 0
 			for _, line := range strings.Split(out, "\n") {

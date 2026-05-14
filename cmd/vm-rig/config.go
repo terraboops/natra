@@ -36,14 +36,20 @@ type Config struct {
 	// the VMs. Pinned to a vm-rig-specific tag so it doesn't
 	// collide with the L4 e2e ":e2e" tag or production ":latest".
 	NatraImage string
+
+	// PerfclientImage is the load-generator image (iperf3 + hey)
+	// built from deploy/docker/Dockerfile.perfclient. Imported into
+	// both VMs and used by the hey HTTP-mice test.
+	PerfclientImage string
 }
 
 func loadConfig() *Config {
 	c := &Config{
-		ServerName:     "natra-server",
-		AgentName:      "natra-agent",
-		KubeconfigPath: envOr("NATRA_VM_KUBECONFIG", "/tmp/natra-vm-rig.kubeconfig"),
-		NatraImage:     envOr("NATRA_VM_IMAGE", "ghcr.io/terraboops/natra:vm-rig"),
+		ServerName:      "natra-server",
+		AgentName:       "natra-agent",
+		KubeconfigPath:  envOr("NATRA_VM_KUBECONFIG", "/tmp/natra-vm-rig.kubeconfig"),
+		NatraImage:      envOr("NATRA_VM_IMAGE", "ghcr.io/terraboops/natra:vm-rig"),
+		PerfclientImage: envOr("NATRA_VM_PERFCLIENT_IMAGE", "ghcr.io/terraboops/natra-perfclient:vm-rig"),
 	}
 	_, thisFile, _, _ := runtime.Caller(0)
 	c.RepoRoot = filepath.Join(filepath.Dir(thisFile), "..", "..")

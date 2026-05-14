@@ -51,9 +51,21 @@ make test-vm
 
 End-to-end: brings up both VMs (~2-3 min on first run, faster after
 the cloud image is cached), joins them into a k3s cluster, builds
-the natra image, imports it into each VM, applies the installer
-DaemonSet, runs an iperf3 throttle assertion across the VM
-boundary, and tears down.
+the natra + perfclient images, imports them into each VM, applies
+the installer DaemonSet, then runs two assertions back-to-back
+across the VM boundary:
+
+- **iperf3 throttle**: a 15-second TCP elephant from iperf-client
+  to iperf-server (annotated 10 Mbps ingress). Asserts the
+  receiver's bps stays within the 1.30× slack cap.
+- **hey HTTP fast-pass**: 15 seconds of hey at -c 50
+  -disable-keepalive against an annotated nginx target (same 10
+  Mbps cap as the iperf elephant). Asserts RPS clears a generous
+  floor (200 RPS) — natra's CMS classifier should let each fresh
+  TCP connection fast-pass the bucket because its byte volume
+  stays well under the heavy-hitter threshold.
+
+Then tears the rig down.
 
 Leave the VMs up for inspection:
 
@@ -83,7 +95,7 @@ vm-rig — natra kernel-isolated test rig (lima + k3s)
 Subcommands:
   up        bring up the two-VM k3s cluster
   install   build and import the natra image, apply installer
-  test      run the iperf throttle assertion
+  test      iperf throttle + hey HTTP-mice fast-pass assertions
   down      tear down both VMs
   all       up + install + test (down on exit unless -keep)
 

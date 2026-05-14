@@ -6,25 +6,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-// cmdTest pins the iperf-client to the server VM and iperf-server
-// to the agent VM, so iperf3 traffic crosses the inter-VM virtual
-// NIC pair (real two-kernel handoff, not a shared bridge in one
-// kernel). Asserts the measured throughput stays within the 1.30×
-// cap the L4 e2e uses.
+// cmdTest runs two assertions back-to-back against the vm-rig:
+//
+//  1. iperf throttle: pin iperf-client to the server VM and
+//     iperf-server to the agent VM so traffic crosses the inter-VM
+//     virtual NIC pair, measure receiver bps, assert it stays
+//     within the 1.30× slack cap.
+//  2. hey fast-pass: deploy perf-server (iperf+nginx, both
+//     directions annotated 10M) and perf-client (iperf3+hey baked
+//     in), kubectl exec hey against the nginx target, parse the
+//     CSV, assert RPS clears a floor that proves CMS classification
+//     is letting HTTP mice bypass the bucket.
+//
+// Both pieces run against the same cluster, share the namespace,
+// and both source traffic from the server VM toward the agent VM
+// so the cross-kernel signal is the same.
 func cmdTest(c *Config) error {
 	if _, err := os.Stat(c.KubeconfigPath); err != nil {
 		return fmt.Errorf("%s not found — run 'vm-rig up' first", c.KubeconfigPath)
 	}
 
 	const (
-		namespace   = "natra-vm-rig"
-		serverNode  = "lima-natra-server" // lima sets in-VM hostname to lima-<vm>
-		workerNode  = "lima-natra-agent"
-		rateBitsPS  = 10_000_000 // 10 Mbps annotation
-		slackFactor = 1.30
+		namespace  = "natra-vm-rig"
+		serverNode = "lima-natra-server" // lima sets in-VM hostname to lima-<vm>
+		workerNode = "lima-natra-agent"
 	)
 	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
 
@@ -36,9 +45,26 @@ func cmdTest(c *Config) error {
 		return err
 	}
 
-	fmt.Println("==> deploying iperf client + server")
+	if err := testIperfThrottle(c, env, namespace, serverNode, workerNode); err != nil {
+		return err
+	}
+	if err := testHeyFastPass(c, env, namespace, serverNode, workerNode); err != nil {
+		return err
+	}
+	return nil
+}
+
+// testIperfThrottle: ingress elephant flow → expect throttled
+// receiver throughput within rate × 1.30.
+func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNode string) error {
+	const (
+		rateBitsPS  = 10_000_000 // 10 Mbps annotation
+		slackFactor = 1.30
+	)
+
+	fmt.Println("==> [iperf] deploying iperf client + server")
 	for _, m := range []string{"iperf-client.yaml", "iperf-server.yaml"} {
-		manifest, err := renderIperfManifest(c, m, namespace, serverNode, workerNode)
+		manifest, err := renderE2EManifest(c, m, namespace, serverNode, workerNode)
 		if err != nil {
 			return err
 		}
@@ -48,7 +74,7 @@ func cmdTest(c *Config) error {
 		}
 	}
 
-	fmt.Println("==> waiting for iperf pods Ready")
+	fmt.Println("==> [iperf] waiting for pods Ready")
 	if err := kubectl(env, nil,
 		"wait", "--for=condition=Ready",
 		"pod/iperf-client", "pod/iperf-server",
@@ -58,16 +84,16 @@ func cmdTest(c *Config) error {
 
 	// Drain the bucket. natra's burst is 2× rate (~2.5 MB at
 	// 10 Mbps); a fresh bucket lets the first measured second run
-	// at line rate. 20 seconds × 4 parallel streams is enough to
-	// flush both natra and (would-be-)vanilla burst windows.
-	fmt.Println("==> warming up iperf-server (draining bucket)")
+	// at line rate. 20 seconds × 4 parallel streams flushes the
+	// burst window.
+	fmt.Println("==> [iperf] warming up (draining bucket)")
 	_ = kubectl(env, nil,
 		"exec", "-n", namespace, "iperf-client", "--",
 		"iperf3", "-c", "iperf-server", "-t", "20", "-P", "4")
 
-	fmt.Println("==> measuring throttled throughput")
-	out, err := captureWithEnv(env,
-		"kubectl", "exec", "-n", namespace, "iperf-client", "--",
+	fmt.Println("==> [iperf] measuring throttled throughput")
+	out, err := captureKubectl(env,
+		"exec", "-n", namespace, "iperf-client", "--",
 		"iperf3", "-c", "iperf-server", "-t", "15", "-J")
 	if err != nil {
 		return err
@@ -86,9 +112,90 @@ func cmdTest(c *Config) error {
 	fmt.Printf("  cap:      %s (rate × %.2f slack)\n", fmtBps(cap), slackFactor)
 
 	if measured > cap {
-		return fmt.Errorf("measured throughput %s exceeds cap %s", fmtBps(measured), fmtBps(cap))
+		return fmt.Errorf("[iperf] measured throughput %s exceeds cap %s", fmtBps(measured), fmtBps(cap))
 	}
-	fmt.Println("PASS: ingress throttled within cap on a real two-kernel cluster.")
+	fmt.Println("PASS [iperf]: ingress throttled within cap on a real two-kernel cluster.")
+	return nil
+}
+
+// testHeyFastPass: many short HTTP requests against an annotated
+// nginx target → expect the CMS fast-pass to let them through
+// (high RPS, low latency) even though the same pod's iperf
+// elephant would be throttled to ~10 Mbps. This is natra's design
+// wedge vs upstream HTB; the assertion is a generous RPS floor
+// that any working fast-pass clears trivially and a broken one
+// (every request queued behind the bucket) misses by orders of
+// magnitude.
+func testHeyFastPass(c *Config, env []string, namespace, serverNode, workerNode string) error {
+	const (
+		heyDurationS = 15
+		heyConcurr   = 50
+		heyRPSFloor  = 200.0 // generous; perf-vs-vanilla numbers show natra at thousands of RPS, vanilla at ~12
+	)
+
+	fmt.Println()
+	fmt.Println("==> [hey] deploying perf-server (nginx + iperf, annotated 10M) + perf-client")
+	for _, m := range []string{
+		"test/perf/realworld/perf-server.yaml",
+		"test/perf/realworld/perf-client.yaml",
+	} {
+		manifest, err := renderPerfManifest(c, m, namespace, serverNode, workerNode, c.PerfclientImage)
+		if err != nil {
+			return err
+		}
+		if err := kubectl(env, strings.NewReader(manifest),
+			"apply", "-f", "-"); err != nil {
+			return err
+		}
+	}
+
+	fmt.Println("==> [hey] waiting for pods Ready")
+	if err := kubectl(env, nil,
+		"wait", "--for=condition=Ready",
+		"pod/perf-server", "pod/perf-client",
+		"-n", namespace, "--timeout=180s"); err != nil {
+		return err
+	}
+
+	// hey -z <duration> -c <conn> -disable-keepalive — each request
+	// is a fresh TCP connection, so the 5-tuple changes per request
+	// and the CMS estimate per flow stays below the heavy-hitter
+	// threshold. -o csv keeps the parser stable across hey versions.
+	fmt.Printf("==> [hey] running hey for %ds against perf-server:80\n", heyDurationS)
+	out, err := captureKubectl(env,
+		"exec", "-n", namespace, "perf-client", "-c", "tools", "--",
+		"hey",
+		"-z", fmt.Sprintf("%ds", heyDurationS),
+		"-c", strconv.Itoa(heyConcurr),
+		"-disable-keepalive",
+		"-o", "csv",
+		"http://perf-server:80/")
+	if err != nil {
+		return err
+	}
+
+	res, err := parseHeyCSV([]byte(out), float64(heyDurationS))
+	if err != nil {
+		return fmt.Errorf("parse hey output: %w", err)
+	}
+
+	fmt.Println()
+	fmt.Printf("perf-server (annotated 10M ingress + egress) on %s ← perf-client on %s\n", workerNode, serverNode)
+	fmt.Printf("  hey ok:     %d requests\n", res.OK)
+	fmt.Printf("  hey errors: %d\n", res.Errors)
+	fmt.Printf("  hey rps:    %.0f\n", res.RPS())
+	fmt.Printf("  hey p50:    %.1f ms\n", res.P50*1000)
+	fmt.Printf("  hey p99:    %.1f ms\n", res.P99*1000)
+	fmt.Printf("  floor:      %.0f rps (CMS fast-pass should clear this with headroom)\n", heyRPSFloor)
+
+	if res.RPS() < heyRPSFloor {
+		return fmt.Errorf("[hey] %0.f rps below floor %.0f — CMS fast-pass may be regressed",
+			res.RPS(), heyRPSFloor)
+	}
+	if res.Errors > res.OK/10 {
+		return fmt.Errorf("[hey] errors %d > 10%% of ok %d", res.Errors, res.OK)
+	}
+	fmt.Println("PASS [hey]: HTTP mice fast-passed through CMS while the pod's elephant cap is 10 Mbps.")
 	return nil
 }
 
@@ -96,29 +203,45 @@ func fmtBps(bps float64) string {
 	return fmt.Sprintf("%.2f Mbps", bps/1e6)
 }
 
-// renderIperfManifest reads test/e2e/manifests/<name>, swaps the
+// renderE2EManifest reads test/e2e/manifests/<name>, swaps the
 // k3d node-name nodeSelectors for the lima ones, and rewrites the
 // hardcoded natra-e2e namespace to the rig's namespace. The
 // manifests stay shared with the L4 e2e suite — this is just a
 // nodeSelector/namespace overlay.
-func renderIperfManifest(c *Config, name, namespace, serverNode, workerNode string) (string, error) {
+func renderE2EManifest(c *Config, name, namespace, serverNode, workerNode string) (string, error) {
 	src := filepath.Join(c.RepoRoot, "test", "e2e", "manifests", name)
+	return renderManifest(src, strings.NewReplacer(
+		"k3d-natra-e2e-agent-0", workerNode,
+		"k3d-natra-e2e-server-0", serverNode,
+		"namespace: natra-e2e", "namespace: "+namespace,
+	))
+}
+
+// renderPerfManifest reads a test/perf/realworld/<path> manifest
+// and rewrites the placeholder node names (PERF_WORKER_NODE /
+// PERF_CONTROL_NODE) and the perfclient image tag. perf-client.yaml
+// also lives in test/perf/realworld with the same shape — both
+// are templated the same way.
+func renderPerfManifest(c *Config, relPath, namespace, serverNode, workerNode, image string) (string, error) {
+	src := filepath.Join(c.RepoRoot, relPath)
+	return renderManifest(src, strings.NewReplacer(
+		"PERF_WORKER_NODE", workerNode,
+		"PERF_CONTROL_NODE", serverNode,
+		"namespace: natra-e2e", "namespace: "+namespace,
+		"ghcr.io/terraboops/natra-perfclient:vsperf", image,
+	))
+}
+
+// renderManifest is the shared path: read a YAML file, apply a
+// string replacer line by line. Lots of strings.Replace.Replace is
+// fine because the replacements are short and the manifests are
+// small.
+func renderManifest(src string, repl *strings.Replacer) (string, error) {
 	f, err := os.Open(src)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
-
-	const (
-		k3dAgent  = "k3d-natra-e2e-agent-0"
-		k3dServer = "k3d-natra-e2e-server-0"
-		nsE2E     = "namespace: natra-e2e"
-	)
-	repl := strings.NewReplacer(
-		k3dAgent, workerNode,
-		k3dServer, serverNode,
-		nsE2E, "namespace: "+namespace,
-	)
 
 	var out strings.Builder
 	scanner := bufio.NewScanner(f)

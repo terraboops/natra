@@ -53,18 +53,19 @@ func capture(name string, args ...string) (string, error) {
 	return trimRight(stdout.String()), nil
 }
 
-// captureWithEnv is capture with an extra environment overlay.
-// Used for kubectl invocations that need KUBECONFIG set without
-// disturbing the parent's env.
-func captureWithEnv(env []string, name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
+// captureKubectl runs `kubectl <args...>` with an extra environment
+// overlay (KUBECONFIG=...) and captures stdout. Errors include
+// the captured stderr — important when kubectl fails for an
+// obvious reason we want to surface (RBAC, missing namespace, etc).
+func captureKubectl(env []string, args ...string) (string, error) {
+	cmd := exec.Command("kubectl", args...)
 	cmd.Env = append(os.Environ(), env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		return "", fmt.Errorf("%s %v: %w (stderr: %s)", name, args, err, stderr.String())
+		return "", fmt.Errorf("kubectl %v: %w (stderr: %s)", args, err, stderr.String())
 	}
 	return trimRight(stdout.String()), nil
 }
