@@ -168,16 +168,18 @@ plumbing without committing to multi-host infra. Catches: NIC
 offload skew, real veth/bridge handoff, cross-kernel BPF version
 mismatch, real network namespaces, MTU.
 
-**Status: built.** `scripts/vm-rig/` runs a two-VM k3s cluster
-under lima — server (control-plane) and agent (worker) each on
-their own Linux kernel, joined via the lima `shared` network so
-pod-to-pod traffic between annotated pods crosses a real virtual
-NIC pair. Invoke with `make test-vm`. macOS prerequisite:
-`brew install socket_vmnet` for VM-to-VM L2 reachability; Linux
-uses libvirt/KVM bridged networks directly.
+**Status: built.** Orchestration lives in `cmd/vm-rig/` (Go,
+subcommands `up / install / test / down / all`); lima VM templates
+live in `scripts/vm-rig/*.yaml`. The rig brings up two VMs — server
+(control-plane) and agent (worker), each on its own Linux kernel —
+joined via the lima `shared` network so pod-to-pod traffic between
+annotated pods crosses a real virtual NIC pair. Invoke with
+`make test-vm`. macOS prerequisite: `brew install socket_vmnet` for
+VM-to-VM L2 reachability; Linux uses libvirt/KVM bridged networks
+directly.
 
 See `scripts/vm-rig/README.md` for the layout, kernel-version
-override path (set a different cloud image in
+override path (swap the `images:` block in either
 `lima-server.yaml` / `lima-agent.yaml` to test e.g. clsact on 5.x
 against tcx on 6.6+), and known limits (the underlying transport
 is software vmnet, not hardware NICs).

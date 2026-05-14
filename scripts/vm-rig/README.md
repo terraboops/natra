@@ -6,6 +6,12 @@ containers in one shared Linux kernel — each VM here runs its own
 Linux kernel, and inter-pod traffic between annotated pods crosses
 a real virtual NIC pair via the lima shared network.
 
+The orchestration lives in Go at `cmd/vm-rig/` (subcommands:
+`up`, `install`, `test`, `down`, `all`). The two files in this
+directory are config templates the Go binary reads at runtime —
+keeping them as YAML lets you tweak kernel image / CPU / memory /
+networking without recompiling.
+
 What this catches that k3d doesn't:
 
 - Cross-kernel BPF behavior. The server VM and agent VM each load
@@ -15,8 +21,8 @@ What this catches that k3d doesn't:
   GRO-coalesced by *that* kernel — exactly the shape a production
   cross-node packet takes.
 - Kernel-version drift. Each VM can run a different kernel image
-  (override `images:` in `lima-server.yaml` / `lima-agent.yaml`)
-  to validate the attach-mode fallback chain end-to-end.
+  (swap the `images:` block in either YAML) to validate the
+  attach-mode fallback chain end-to-end.
 
 What it still doesn't cover: real NICs (the underlying transport
 is software vmnet / KVM bridged, not hardware), real switch
@@ -32,10 +38,10 @@ for what cloud-VM / metal would add on top.
   socket_vmnet`. Lima will refuse to start the `shared` network
   without it. Linux doesn't need this — lima uses libvirt/KVM
   bridged networks directly.
-- `kubectl`, `docker`, `jq` on PATH.
-- ~6 GiB free disk per VM (Ubuntu 24.04 cloud image + k3s state +
-  the natra container image).
-- ~30 GiB free disk overall is comfortable headroom.
+- `kubectl`, `docker` on PATH.
+- Go 1.25+ (to run `cmd/vm-rig`; the binary is built on demand by
+  `go run`, no separate install step).
+- ~6 GiB free disk per VM; ~30 GiB headroom overall is comfortable.
 
 ## Run
 
@@ -53,24 +59,39 @@ Leave the VMs up for inspection:
 
 ```bash
 NATRA_VM_KEEP=1 make test-vm
-# ...inspect...
+# ...or run the subcommands directly:
+go run ./cmd/vm-rig up
 export KUBECONFIG=/tmp/natra-vm-rig.kubeconfig
 kubectl get pods -A
-bash scripts/vm-rig/down.sh   # when done
+go run ./cmd/vm-rig down   # when done
 ```
 
-## Layout
+## Files in this directory
 
 - `lima-server.yaml` — VM template for the k3s server (control-plane).
-- `lima-agent.yaml` — VM template for the k3s agent (worker).
-- `up.sh` — start both VMs, join them, export kubeconfig.
-- `install-natra.sh` — build natra image, import into both VMs,
-  apply installer DaemonSet.
-- `run-tests.sh` — run the ingress-throttle topology against the
-  cluster.
-- `down.sh` — stop + delete both VMs.
-- `all.sh` — wire `up → install → run-tests` together with cleanup
-  on exit (the Makefile entry point invokes this).
+  Cloud-init provisions k3s on first boot and writes the join token
+  to `/etc/natra-node-token`.
+- `lima-agent.yaml` — VM template for the k3s agent (worker). Reads
+  `NATRA_K3S_URL` + `NATRA_K3S_TOKEN` from its env block; `cmd/vm-rig`
+  renders a copy with those values inlined before `limactl create`.
+
+## CLI
+
+```text
+vm-rig — natra kernel-isolated test rig (lima + k3s)
+
+Subcommands:
+  up        bring up the two-VM k3s cluster
+  install   build and import the natra image, apply installer
+  test      run the iperf throttle assertion
+  down      tear down both VMs
+  all       up + install + test (down on exit unless -keep)
+
+Environment:
+  NATRA_VM_KUBECONFIG   kubeconfig output path (default /tmp/natra-vm-rig.kubeconfig)
+  NATRA_VM_IMAGE        natra image tag to build/use (default ghcr.io/terraboops/natra:vm-rig)
+  NATRA_VM_KEEP=1       used by `all` to skip teardown on exit
+```
 
 ## Pinning a kernel version
 
@@ -87,6 +108,6 @@ The agent and server can run *different* kernels independently.
 - On Apple Silicon with lima's `vmType: vz` (the default), the
   shared network still needs `socket_vmnet` — vz's own NAT doesn't
   expose VM-to-VM L2.
-- Tests run from the host's kubectl against the agent VM's k3s
+- Tests run from the host's kubectl against the server VM's k3s
   API. If the lima shared network drops (rare), the test will see
-  the API as unreachable; rerun `up.sh`.
+  the API as unreachable; rerun `go run ./cmd/vm-rig up`.

@@ -2,6 +2,8 @@
 bin/
 *.o
 *.a
+# Stray `go build ./cmd/vm-rig` lands the binary at the repo root.
+/vm-rig
 
 # eBPF
 bpf/*.o
