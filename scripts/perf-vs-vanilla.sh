@@ -58,6 +58,14 @@ MICE_DURATION=10
 # means the rig produces meaningful numbers when run on metal.
 RATE_SWEEP="${RATE_SWEEP:-10M 1G 10G}"
 
+# PERF_RUNS controls how many iperf3 samples are taken per (phase,
+# rate, direction, kind) cell. Default 1 — single sample, fast,
+# matches the legacy behavior. Higher values produce a mean+stddev
+# in the rendered table, at the cost of N× wall-clock. 3 is a
+# reasonable starting point for run-to-run distribution; 5+ gives
+# a tighter stddev estimate but costs proportionally more.
+PERF_RUNS="${PERF_RUNS:-1}"
+
 # rate_to_label normalizes a rate string into a k8s-friendly suffix:
 # "10M" → "10m", "1G" → "1g". Pod and service names follow RFC 1123
 # (lowercase alphanumeric); annotations preserve original casing.
@@ -384,7 +392,9 @@ run_workload() {
     echo "$ing_elephant $ing_mice $eg_elephant $eg_mice"
 }
 
-# record stashes a per-rate iperf result into the global results file.
+# record stashes one sample into $RESULTS_TSV. Multiple samples per
+# (phase, rate, direction, kind) cell are appended as separate rows;
+# render_iperf_table aggregates them at output time.
 # Columns: phase rate direction kind bps. Kind ∈ {elephant, mice}.
 record() {
     printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$RESULTS_TSV"
@@ -392,20 +402,27 @@ record() {
 
 # sweep_rate_workload runs the iperf-only workload against every per-
 # rate server pod, recording results to $RESULTS_TSV under the given
-# phase tag (baseline, natra, vanilla).
+# phase tag (baseline, natra, vanilla). When PERF_RUNS > 1, each cell
+# is re-measured PERF_RUNS times so the table can show mean+stddev.
 sweep_rate_workload() {
-    local phase="$1" rate label
+    local phase="$1" rate label run
     local ing_e ing_m eg_e eg_m
     for rate in $RATE_SWEEP; do
         label=$(rate_to_label "$rate")
-        echo "==> running iperf-only workload (phase $phase, rate $rate)"
-        read -r ing_e ing_m eg_e eg_m < <(run_workload "iperf-server-r${label}")
-        record "$phase" "$rate" ingress elephant "$ing_e"
-        record "$phase" "$rate" ingress mice     "$ing_m"
-        record "$phase" "$rate" egress  elephant "$eg_e"
-        record "$phase" "$rate" egress  mice     "$eg_m"
-        echo "  $phase rate=$rate ingress elephant=$ing_e bps  mice=$ing_m bps"
-        echo "  $phase rate=$rate egress  elephant=$eg_e bps  mice=$eg_m bps"
+        for run in $(seq 1 "$PERF_RUNS"); do
+            if [ "$PERF_RUNS" -gt 1 ]; then
+                echo "==> iperf-only (phase $phase, rate $rate, run $run/$PERF_RUNS)"
+            else
+                echo "==> running iperf-only workload (phase $phase, rate $rate)"
+            fi
+            read -r ing_e ing_m eg_e eg_m < <(run_workload "iperf-server-r${label}")
+            record "$phase" "$rate" ingress elephant "$ing_e"
+            record "$phase" "$rate" ingress mice     "$ing_m"
+            record "$phase" "$rate" egress  elephant "$eg_e"
+            record "$phase" "$rate" egress  mice     "$eg_m"
+            echo "  $phase rate=$rate ingress elephant=$ing_e bps  mice=$ing_m bps"
+            echo "  $phase rate=$rate egress  elephant=$eg_e bps  mice=$eg_m bps"
+        done
     done
 }
 
@@ -1037,22 +1054,57 @@ fmt_secs() {
     }'
 }
 
-# lookup pulls one bps result out of $RESULTS_TSV by composite key.
-# Returns "0" if no row matches (e.g. a phase that errored out).
-lookup() {
+# cell_stats aggregates every sample row for one (phase, rate, dir,
+# kind) cell into "mean count stddev" on stdout. count=0 when no
+# rows matched. stddev is sample stddev (Bessel-corrected) when
+# count >= 2; 0 otherwise. Pure awk so we don't take a python
+# dependency for this.
+cell_stats() {
     local phase="$1" rate="$2" dir="$3" kind="$4"
     awk -F'\t' -v p="$phase" -v r="$rate" -v d="$dir" -v k="$kind" \
-        '$1==p && $2==r && $3==d && $4==k { print $5; found=1; exit }
-         END { if (!found) print "0" }' "$RESULTS_TSV"
+        '$1==p && $2==r && $3==d && $4==k { vals[++n] = $5+0 }
+         END {
+             if (n == 0) { print "0 0 0"; exit }
+             sum = 0
+             for (i = 1; i <= n; i++) sum += vals[i]
+             mean = sum / n
+             stddev = 0
+             if (n >= 2) {
+                 sq = 0
+                 for (i = 1; i <= n; i++) sq += (vals[i] - mean) * (vals[i] - mean)
+                 stddev = sqrt(sq / (n - 1))
+             }
+             printf "%.0f %d %.0f\n", mean, n, stddev
+         }' "$RESULTS_TSV"
+}
+
+# fmt_cell renders "mean ± stddev" when the cell has multiple samples,
+# just the mean otherwise. mean is bps, formatted as Mbps via fmt_bps.
+fmt_cell() {
+    local stats mean count stddev
+    stats="$1"
+    mean=$(echo "$stats" | awk '{print $1}')
+    count=$(echo "$stats" | awk '{print $2}')
+    stddev=$(echo "$stats" | awk '{print $3}')
+    if [ "$count" -le 1 ]; then
+        fmt_bps "$mean"
+    else
+        printf '%s ± %s' "$(fmt_bps "$mean")" "$(fmt_bps "$stddev")"
+    fi
 }
 
 # render_iperf_table emits the Workload 1 table: one block per direction,
-# rows = phase × rate. Uses $RATE_SWEEP as the column order.
+# rows = phase × rate. With PERF_RUNS > 1, each cell carries mean+stddev.
 render_iperf_table() {
     local dir
+    local col_width=25
+    if [ "$PERF_RUNS" -gt 1 ]; then col_width=32; fi
     for dir in ingress egress; do
-        printf '\nDirection: %s\n' "$dir"
-        printf 'Plugin                Rate     Elephant            Mice (%sx parallel)\n' "$MICE_PARALLEL"
+        printf '\nDirection: %s' "$dir"
+        if [ "$PERF_RUNS" -gt 1 ]; then printf ' (mean ± stddev across %d runs)' "$PERF_RUNS"; fi
+        printf '\n'
+        printf "Plugin                Rate     %-${col_width}s %s\n" \
+            "Elephant" "Mice (${MICE_PARALLEL}x parallel)"
         printf -- '-------------------------------------------------------------------------------\n'
         local phase phase_label rate
         for phase in baseline natra vanilla; do
@@ -1062,10 +1114,10 @@ render_iperf_table() {
                 vanilla)  phase_label="upstream bandwidth" ;;
             esac
             for rate in $RATE_SWEEP; do
-                printf '%-21s %-8s %-19s %s\n' \
+                printf "%-21s %-8s %-${col_width}s %s\n" \
                     "$phase_label" "$rate" \
-                    "$(fmt_bps "$(lookup "$phase" "$rate" "$dir" elephant)")" \
-                    "$(fmt_bps "$(lookup "$phase" "$rate" "$dir" mice)")"
+                    "$(fmt_cell "$(cell_stats "$phase" "$rate" "$dir" elephant)")" \
+                    "$(fmt_cell "$(cell_stats "$phase" "$rate" "$dir" mice)")"
             done
         done
     done

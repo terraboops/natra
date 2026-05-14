@@ -86,6 +86,17 @@ from both plugins. Override on metal:
 RATE_SWEEP="100M 1G 10G 40G" make perf-vs-vanilla
 ```
 
+For a tighter distribution estimate, take N samples per cell:
+
+```bash
+PERF_RUNS=3 make perf-vs-vanilla   # mean ± stddev in the output table
+```
+
+`PERF_RUNS` defaults to 1 (single sample, fast). Higher values
+multiply wall-clock proportionally — useful when chasing a real
+suspected regression and worth the cost; not needed for routine
+sanity-check runs.
+
 ### Results
 
 Single-rig sample, single annotated rate. Rig: colima on aarch64
@@ -172,8 +183,9 @@ and baseline. The bystander p99 gap from baseline (25 ms → 43 ms)
 is consistent with the cost of having a paced elephant share a
 worker node — softirq time, NIC rings, cache pressure, bridge
 forwarding — which is structural to throttling an elephant on a
-shared NIC rather than specific to either plugin. Sample size is
-one; we haven't characterized the run-to-run distribution.
+shared NIC rather than specific to either plugin. Numbers above
+are single-sample; re-run with `PERF_RUNS=N` for a mean ± stddev
+distribution.
 
 ## What hasn't been measured
 
@@ -191,8 +203,11 @@ extent of the empirical claim. Specifically *not* yet validated:
   Linux kernel. Inter-node packets cross a software bridge, not a
   switch. ECN-CE is set but never observed as actual congestion;
   real queueing and real wire latency aren't tested.
-- **Run-to-run variance.** Each cell is a single sample. We don't
-  yet have a distribution to report mean/p99/p100 over.
+- **Run-to-run variance.** The tables above are single-sample runs.
+  Running with `PERF_RUNS=N` produces a mean ± stddev per cell, but
+  the distribution itself (p50 / p99 / p100) isn't currently
+  captured — each cell is summarized to two numbers, not a full
+  histogram.
 - **High-rate accuracy.** The `RATE_SWEEP=10G` rows show plugin
   behavior under a 10G annotation, but the wire on this rig is
   ~1 Gbps single-stream, so we're observing "natra didn't make
