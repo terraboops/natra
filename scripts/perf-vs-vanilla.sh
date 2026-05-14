@@ -342,6 +342,28 @@ render_mixed_manifests() {
 # configured rate.
 warmup_pod() {
     local namespace="natra-e2e" server="$1" client="$2"
+
+    # Connectivity probe before the real warmup. kubectl wait
+    # Pod=Ready returns before iperf3 -s has finished bind() on
+    # cold-started rancher/k3s nodes; the first measurement then
+    # sees a TCP RST and the // 0 fallback masks the failure as a
+    # legitimate 0-bps row. A 1-second iperf3 ping loop with a 30s
+    # deadline is cheap and fails the cell loudly if the server
+    # genuinely never binds.
+    local i
+    for i in $(seq 1 30); do
+        if kubectl exec -n "$namespace" "$client" -- \
+            iperf3 -c "$server" -t 1 -J >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$i" = 30 ] && \
+       ! kubectl exec -n "$namespace" "$client" -- \
+            iperf3 -c "$server" -t 1 -J >/dev/null 2>&1; then
+        echo "warn: $server never accepted an iperf3 connection in 30s; measurements will be 0" >&2
+    fi
+
     # 20s × ~100 Mbps line rate ≈ 250 MB transferred — enough to
     # fully drain vanilla's 193 MB HTB burst and natra's 2.5 MB
     # token bucket. -P 4 parallel streams to maximize throughput
