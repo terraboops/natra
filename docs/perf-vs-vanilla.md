@@ -4,6 +4,16 @@ Head-to-head against `containernetworking/plugins/bandwidth` on a
 k3d rig. Same workloads against three configurations: baseline
 (no rate-limiter), natra, upstream HTB.
 
+This doc covers the k3d-based comparison (single Linux kernel,
+software dataplane on colima/LinuxKit). For a real-kernel-isolated
+measurement of natra alone — two lima VMs, each running its own
+kernel, joined into one k3s cluster — see
+`scripts/vm-rig/README.md`. The vm-rig runs the bidi-iperf and
+hey-HTTP-mice assertions against the cross-VM virtual NIC pair;
+it's been built and unit-tested but not yet captured here as a
+table (blocked on `socket_vmnet` install on the operator's Mac;
+once that's in, `make test-vm` produces the numbers).
+
 ## Setup
 
 Three k3d clusters brought up in sequence:
