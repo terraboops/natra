@@ -35,10 +35,14 @@ Pre-measurement normalizations:
 
 ## Workload 1: iperf-only (rate sweep)
 
-iperf3 elephant + 20-stream mice in both directions, swept across
-`RATE_SWEEP` (default `10M 1G 10G`). One server pod per rate.
-Ingress = forward iperf3; egress = `iperf3 -R`. Goodput =
-receiver-side `end.sum_received.bits_per_second`.
+The rig deploys a separate iperf3 server pod for each annotated
+rate in `RATE_SWEEP` — by default three pods at 10 Mbps, 1 Gbps,
+and 10 Gbps — then runs an iperf3 elephant flow plus a 20-parallel
+"mice" run against each one. Ingress = forward `iperf3`; egress =
+`iperf3 -R` (server is the sender). Goodput is the receiver-side
+`end.sum_received.bits_per_second`. Repeating across three orders
+of magnitude catches plugin bugs that only surface at higher rates
+(token-bucket math overflow, fast-pass threshold scaling errors).
 
 | Direction | Plugin   | Elephant   | Mice (20× parallel) |
 |-----------|----------|------------|---------------------|
@@ -71,11 +75,11 @@ mice (HTTP responses, WebSocket frames) fit under that and
 fast-pass via CMS; iperf3 parallel streams cross after ~2 GRO
 super-packets and pay the bucket from there.
 
-The rate sweep above 1 Gbps is for catching plugin-induced
-regressions (bucket math overflow, fast-pass threshold scaling
-errors). `RATE_SWEEP=10G` rows report ~Gbps line rate from both
-plugins because the wire caps there — not 10 Gbps throttle
-accuracy.
+High-rate rows are bounded by the rig's wire, not the shaper:
+colima's host-gw via the docker bridge caps single-stream at
+~1 Gbps, so `RATE_SWEEP=10G` rows report ~Gbps from both plugins.
+They confirm the plugins don't break under a 10G annotation; they
+don't confirm 10G throttle accuracy.
 
 ## Workload 2: mixed (elephant + annotated mice + bystander mice)
 
