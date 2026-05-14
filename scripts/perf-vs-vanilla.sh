@@ -294,32 +294,50 @@ wait_rate_sweep_servers() {
         -n natra-e2e --timeout=180s
 }
 
-# Patch the upstream bandwidth plugin's HTB classes to use a sane
-# burst. Kubelet provides no per-pod burst override, so kubelet sends
-# (and the plugin uses) a huge default — observed as
-# burst=193MB / cburst=386MB on a 10 Mbps annotation. That's
+# Patch the upstream bandwidth plugin's per-pod TBF qdiscs to use a
+# sane burst. Kubelet provides no per-pod burst override, so kubelet
+# sends (and the plugin uses) a huge default — observed as
+# burst=193 MB / latency=275 s on a 10 Mbps annotation. That's
 # ~150 seconds of credit, enough that a 30s measurement runs entirely
 # inside the burst window without rate-shaping engaging. Apply 1 MB
-# burst / 1 MB cburst directly via tc so the measured rate reflects
-# the configured rate, not the initial burst.
+# burst directly via tc so the measured rate reflects the configured
+# rate, not the initial burst.
 #
-# Idempotent: skips classes that don't exist or already match. Run
-# AFTER pods are Ready (so the plugin has installed the qdiscs).
-fix_vanilla_htb_burst() {
-    local cluster="$1"
+# Implementation notes for the current k3s images (v1.31.4 / k3s 1.31)
+# bundling containernetworking/plugins bandwidth v1.6.0:
+#   - The plugin uses TBF (token bucket filter), not HTB. v1.5.1 used
+#     HTB; v1.6.0 switched. The previous version of this function
+#     targeted `htb` class 1:30 and silently no-ops on TBF.
+#   - The k3s node container doesn't ship the `tc` userspace tool, so
+#     `docker exec $node tc ...` fails with ENOENT (which `|| true`
+#     swallowed). Reach into the node netns via nsenter from the
+#     host's kernel (colima VM on Mac, host directly on Linux).
+#
+# Idempotent: skips qdiscs that don't exist or are non-TBF. Run AFTER
+# pods are Ready (so the plugin has installed the qdiscs).
+fix_vanilla_tbf_burst() {
+    local cluster="$1" node node_pid script
+    # Single inline script that lists every TBF qdisc in the netns
+    # and rewrites the burst. Keeps the original rate (varies with
+    # annotation: 10mbit / 1gbit / 10gbit).
+    script='
+        for dev in $(tc qdisc show | awk "/qdisc tbf/ {print \$5}" | sort -u); do
+            rate=$(tc qdisc show dev "$dev" | sed -n "s/.*rate \\([0-9A-Za-z]*\\).*/\\1/p" | head -1)
+            [ -n "$rate" ] || continue
+            tc qdisc change dev "$dev" root tbf rate "$rate" burst 1mb latency 50ms 2>/dev/null || true
+        done
+    '
     for node in $(nodes_for "$cluster"); do
-        docker exec "$node" sh -c '
-            for dev in $(tc qdisc show 2>/dev/null | awk "/htb/ {print \$5}" | sort -u); do
-                # class 1:30 (hex) = ShapedClassMinorID 48 in the
-                # bandwidth plugin. The unshaped class 1:1 has rate
-                # 800Gbit and is untouched.
-                tc class change dev "$dev" classid 1:30 htb \
-                    rate 10mbit ceil 20mbit burst 1mb cburst 1mb \
-                    2>/dev/null || true
-            done
-        '
+        node_pid=$(docker inspect "$node" --format '{{.State.Pid}}' 2>/dev/null) || continue
+        [ -n "$node_pid" ] || continue
+        if command -v colima >/dev/null 2>&1 && colima status >/dev/null 2>&1; then
+            colima ssh -- sudo nsenter -t "$node_pid" -n sh -c "$script" 2>/dev/null || true
+        else
+            sudo nsenter -t "$node_pid" -n sh -c "$script" 2>/dev/null || true
+        fi
     done
 }
+
 
 # Render the mixed-workload manifests (perf-server with iperf3+nginx,
 # perf-client with iperf3+hey, bystander with nginx only and no
@@ -1088,7 +1106,7 @@ kubectl wait --for=condition=Ready \
 # Without this, kubelet's default-huge burst lets the first ~150s of
 # traffic flow unshaped — measurements that fit inside that window
 # never see HTB engage.
-fix_vanilla_htb_burst "$VANILLA_CLUSTER"
+fix_vanilla_tbf_burst "$VANILLA_CLUSTER"
 
 sweep_rate_workload vanilla
 
