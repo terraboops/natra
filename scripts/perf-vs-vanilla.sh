@@ -84,6 +84,16 @@ MIXED_HEY_DURATION=20
 MIXED_HEY_CONCURRENCY=50
 
 cleanup() {
+    # NATRA_PERF_KEEP_CLUSTERS=1 leaves the k3d clusters running on
+    # script exit so an operator can kubectl into them and debug a
+    # mid-script failure (most commonly: vanilla iperf-server pods
+    # not becoming Ready). Manual `k3d cluster delete <name>` to
+    # clean up when done.
+    if [ "${NATRA_PERF_KEEP_CLUSTERS:-0}" = "1" ]; then
+        echo "==> NATRA_PERF_KEEP_CLUSTERS=1; leaving clusters running:" >&2
+        k3d cluster list --no-headers 2>/dev/null | awk '$1 ~ /natra-vs-vanilla/ {print "   "$1}' >&2
+        return
+    fi
     k3d cluster delete "$BASELINE_CLUSTER" 2>/dev/null || true
     k3d cluster delete "$NATRA_CLUSTER" 2>/dev/null || true
     k3d cluster delete "$VANILLA_CLUSTER" 2>/dev/null || true
@@ -1041,14 +1051,28 @@ for node in $(nodes_for "$VANILLA_CLUSTER"); do
 done
 
 kubectl apply -f "$TMPDIR/vanilla/namespace.yaml"
-# vanilla-installer.yaml's bin hostPath is /opt/cni/bin (the
-# standard containernetworking default); k3s wants
-# /var/lib/rancher/k3s/data/cni. sed at apply time.
-sed -e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' \
-    -e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' \
-    "${REPO_ROOT}/test/perf/realworld/vanilla-installer.yaml" \
-    | kubectl apply -f -
-kubectl rollout status daemonset/vanilla-bandwidth-installer -n kube-system --timeout=120s
+# Check whether k3s's default conflist already chains the
+# upstream bandwidth plugin. As of rancher/k3s v1.30+ the
+# stock 10-flannel.conflist ships with bandwidth pre-chained,
+# making vanilla-installer.yaml not just redundant but
+# actively harmful: the installer appends a second bandwidth
+# entry to a sibling 00-bandwidth-*.conflist, and the second
+# bandwidth plugin's CNI ADD fails on "ifb0 already exists",
+# leaving every annotated pod stuck in ContainerCreating.
+agent_node="$(nodes_for "$VANILLA_CLUSTER" | head -1)"
+if docker exec "$agent_node" sh -c \
+        'cat /var/lib/rancher/k3s/agent/etc/cni/net.d/*.conflist 2>/dev/null | grep -q "\"type\":\"bandwidth\""'; then
+    echo "==> k3s default conflist already chains bandwidth — skipping installer DaemonSet" >&2
+else
+    # vanilla-installer.yaml's bin hostPath is /opt/cni/bin (the
+    # standard containernetworking default); k3s wants
+    # /var/lib/rancher/k3s/data/cni. sed at apply time.
+    sed -e 's|path: /opt/cni/bin|path: /var/lib/rancher/k3s/data/cni|' \
+        -e 's|path: /etc/cni/net.d|path: /var/lib/rancher/k3s/agent/etc/cni/net.d|' \
+        "${REPO_ROOT}/test/perf/realworld/vanilla-installer.yaml" \
+        | kubectl apply -f -
+    kubectl rollout status daemonset/vanilla-bandwidth-installer -n kube-system --timeout=120s
+fi
 
 apply_rate_sweep_servers "$TMPDIR/vanilla"
 kubectl apply -f "$TMPDIR/vanilla/iperf-client.yaml"
