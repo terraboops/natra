@@ -102,8 +102,9 @@ The pipeline is two stages on the Pod-side veth:
    `STAT_ECN_MARKED`, `STAT_EDT_DELAYED`, `STAT_DROPPED` (their sum
    equals `STAT_THROTTLED`).
 
-The upstream bandwidth plugin (HTB qdisc on IFB) charges every packet,
-so one elephant flow eats every token and mice starve. The
+The upstream bandwidth plugin (single per-pod token-bucket qdisc on
+IFB — HTB in v1.5.1, TBF in v1.6.0+) charges every packet, so one
+elephant flow eats every token and mice starve. The
 CMS-then-bucket shape lets mice fast-pass, which is what the L5 test
 (`TestScenarioMixedVsVanilla` in both directions) measures.
 

@@ -17,8 +17,9 @@ Two stages on the BPF dataplane: a Count-Min Sketch classifies each
 flow, then heavy flows pay against a per-Pod token bucket while flows
 under the threshold take a fast pass. The upstream
 `containernetworking/plugins/bandwidth` plugin charges every packet
-against one HTB bucket, so an elephant flow drains the bucket and
-short-lived flows arrive empty-handed. natra's CMS-then-bucket
+against one per-pod token-bucket qdisc (HTB in v1.5.1, TBF in v1.6.0+),
+so an elephant flow drains the bucket and short-lived flows arrive
+empty-handed. natra's CMS-then-bucket
 arrangement targets that asymmetry; whether the difference matters on
 real workloads depends on the workload's flow-length distribution.
 

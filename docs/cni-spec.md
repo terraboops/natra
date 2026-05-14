@@ -216,4 +216,4 @@ and prints `prevResult`.
 - [CNI Specification](https://www.cni.dev/docs/spec/)
 - [containernetworking/cni](https://github.com/containernetworking/cni)
 - [containernetworking/plugins/bandwidth](https://github.com/containernetworking/plugins/tree/main/plugins/meta/bandwidth)
-  — the upstream HTB-on-IFB plugin natra coexists with or replaces
+  — the upstream token-bucket-on-IFB plugin natra coexists with or replaces
