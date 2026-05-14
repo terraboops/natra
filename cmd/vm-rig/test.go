@@ -48,9 +48,77 @@ func cmdTest(c *Config) error {
 	if err := testIperfThrottle(c, env, namespace, serverNode, workerNode); err != nil {
 		return err
 	}
+	if err := testEgressOnly(c, env, namespace, serverNode, workerNode); err != nil {
+		return err
+	}
 	if err := testHeyFastPass(c, env, namespace, serverNode, workerNode); err != nil {
 		return err
 	}
+	return nil
+}
+
+// testEgressOnly: Topology B in L4-suite terms — server pod has only
+// the egress annotation, no ingress. iperf3 -R measures egress
+// (server → client). natra should attach the egress program and
+// throttle to 10 Mbps; the absence of an ingress annotation should
+// mean natra skips the ingress attach entirely. A regression that
+// attaches both programs regardless of annotation would still pass
+// the bidi test (where both are annotated) but is caught here by
+// the asymmetric configuration.
+func testEgressOnly(c *Config, env []string, namespace, serverNode, workerNode string) error {
+	const (
+		rateBitsPS  = 10_000_000
+		slackFactor = 1.30
+		podName     = "iperf-server-egress"
+	)
+
+	fmt.Println("==> [egress-only] deploying egress-annotated server")
+	manifest, err := renderE2EManifest(c, "iperf-server-egress.yaml", namespace, serverNode, workerNode)
+	if err != nil {
+		return err
+	}
+	if err := kubectl(env, strings.NewReader(manifest), "apply", "-f", "-"); err != nil {
+		return err
+	}
+
+	fmt.Println("==> [egress-only] waiting for pod Ready")
+	if err := kubectl(env, nil,
+		"wait", "--for=condition=Ready",
+		"pod/"+podName,
+		"-n", namespace, "--timeout=120s"); err != nil {
+		return err
+	}
+
+	// Reuse the existing iperf-client (already deployed by the
+	// bidi step). Drain the egress bucket before measuring.
+	fmt.Println("==> [egress-only] warming up (draining egress bucket)")
+	_ = kubectl(env, nil,
+		"exec", "-n", namespace, "iperf-client", "--",
+		"iperf3", "-c", podName, "-t", "20", "-P", "4", "-R")
+
+	fmt.Println("==> [egress-only] measuring throttled throughput")
+	out, err := captureKubectl(env,
+		"exec", "-n", namespace, "iperf-client", "--",
+		"iperf3", "-c", podName, "-t", "15", "-R", "-J")
+	if err != nil {
+		return err
+	}
+	var res iperfResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		return fmt.Errorf("parse iperf JSON: %w", err)
+	}
+
+	measured := res.End.SumReceived.BitsPerSecond
+	cap := float64(rateBitsPS) * slackFactor
+
+	fmt.Printf("  [egress-only] reverse direction, measured: %s\n", fmtBps(measured))
+	fmt.Printf("  [egress-only] cap: %s (rate × %.2f slack)\n", fmtBps(cap), slackFactor)
+
+	if measured > cap {
+		return fmt.Errorf("[egress-only] measured throughput %s exceeds cap %s",
+			fmtBps(measured), fmtBps(cap))
+	}
+	fmt.Println("PASS [egress-only]: egress throttled even with no ingress annotation.")
 	return nil
 }
 

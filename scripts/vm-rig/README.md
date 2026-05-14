@@ -61,6 +61,12 @@ across the VM boundary:
   (`iperf3 -R`) for egress. Asserts the receiver-side bps stays
   within the 1.30× slack cap on *each* direction. Same shape as
   Topology C in the L4 e2e suite.
+- **iperf3 throttle (egress-only)**: a second server pod annotated
+  with `kubernetes.io/egress-bandwidth: "10M"` and no ingress
+  annotation. iperf3 `-R` against it; asserts the egress direction
+  throttles to within the slack cap. Catches a regression that
+  attaches both programs regardless of which annotations are
+  present (Topology B in the L4 e2e suite).
 - **hey HTTP fast-pass**: 15 seconds of hey at -c 50
   -disable-keepalive against an annotated nginx target (same 10
   Mbps cap as the iperf elephant). Asserts RPS clears a generous

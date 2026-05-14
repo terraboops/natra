@@ -92,11 +92,6 @@ From `docs/ARCHITECTURE.md§Open ends`:
   library API with marshalable `Metrics`. Worth doing when we
   want richer per-percentile output than `hey -o csv` produces.
 
-- [ ] **vm-rig egress-only topology (Topology B).** Same shape as
-  the current bidi-iperf path but with a server pod annotated only
-  on egress. Smallest possible expansion of vm-rig coverage and
-  validates the egress-only attach path in cross-kernel mode.
-
 ## Deferred (not on the roadmap right now)
 
 These exist as `PIt` specs in `test/e2e/chaos_test.go` and stay
