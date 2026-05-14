@@ -112,9 +112,10 @@ type NetConfDefaults struct {
 	//
 	// Three modes:
 	//   ""/"auto" (default): try to install fq on pod-eth0; if it
-	//     succeeds use EDT pacing, if it fails fall back to drop
-	//     semantics. Best-effort optimal config — operator never
-	//     has to think about it.
+	//     succeeds use EDT pacing, if it fails fall back to the
+	//     ingress disposition (ECN-mark on ECN-capable, else drop).
+	//     Best-effort optimal config — operator never has to think
+	//     about it.
 	//   "on": require fq install; fail attach if it doesn't work.
 	//     Useful when you know the environment supports it and
 	//     want any failure surfaced loudly.
