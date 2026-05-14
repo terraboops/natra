@@ -375,20 +375,28 @@ static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps
 // throttle_disposition returns the TC verdict for an above-rate packet
 // and bumps the matching stat. Preference order:
 //
-//   1. ECN-mark via bpf_skb_ecn_set_ce. Helper returns 1 on an
-//      ECN-capable packet (ECT(0) or ECT(1) in IP TOS bits 0-1) and
-//      sets the CE bit. Receiver's TCP backs off without retrans.
-//      Works on both ingress and egress.
+//   1. EDT pacing (egress with cfg->edt_pacing != 0). Compute a
+//      release time per bytes/rate_bps, advance the bucket's
+//      next_release_ns past it, stamp skb->tstamp; the downstream
+//      fq qdisc holds the skb until that time. EDT preserves the
+//      sender's TCP cwnd — no backoff, no retrans — and the
+//      bucket releases at exactly rate_bps, so the measured
+//      receiver bps converges to the configured rate.
 //
-//   2. EDT pacing (egress only). When the packet isn't ECN-capable,
-//      compute a release time per bytes/rate_bps, advance the
-//      bucket's next_release_ns past it, and stamp skb->tstamp.
-//      The downstream fq qdisc holds the skb until that time. No
-//      drop → no retrans. Ingress has no transmission-side qdisc to
-//      honor skb->tstamp, so this path is egress-only.
+//      EDT is preferred over ECN on egress because ECN-mark on
+//      every above-rate packet repeatedly halves cwnd; the
+//      sender backs off well below the cap, causing measurable
+//      under-throttling. EDT alone keeps the flow at the cap.
+//      RED-style probabilistic ECN would be a better blend, but
+//      we don't currently have it.
 //
-//   3. Drop (TC_ACT_SHOT). Only reached for ingress non-ECN traffic
-//      that nothing else can pace.
+//   2. ECN-mark via bpf_skb_ecn_set_ce. Helper returns 1 on an
+//      ECN-capable packet (ECT(0) or ECT(1) in IP TOS bits 0-1)
+//      and sets the CE bit. Reached on ingress (no fq downstream
+//      so EDT doesn't apply) and on egress without EDT enabled.
+//
+//   3. Drop (TC_ACT_SHOT). Reached for non-ECN traffic that
+//      neither EDT nor ECN-mark could handle.
 //
 // `bytes` and `rate_bps` come from the caller; passed in so the helper
 // is independent of the natra_config / skb layout.
@@ -399,11 +407,6 @@ static __always_inline int throttle_disposition(struct __sk_buff *skb,
 						__u64 bytes,
 						__u64 edt_pacing)
 {
-	if (bpf_skb_ecn_set_ce(skb) > 0) {
-		bump_stat(dir, STAT_ECN_MARKED);
-		return TC_ACT_OK;
-	}
-
 	if (dir == DIR_EGRESS && edt_pacing != 0) {
 		struct token_bucket *tb = bpf_map_lookup_elem(&natra_bucket_map, &dir);
 		if (tb && rate_bps > 0) {
@@ -424,6 +427,11 @@ static __always_inline int throttle_disposition(struct __sk_buff *skb,
 			bump_stat(dir, STAT_EDT_DELAYED);
 			return TC_ACT_OK;
 		}
+	}
+
+	if (bpf_skb_ecn_set_ce(skb) > 0) {
+		bump_stat(dir, STAT_ECN_MARKED);
+		return TC_ACT_OK;
 	}
 
 	bump_stat(dir, STAT_DROPPED);

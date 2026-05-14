@@ -318,9 +318,10 @@ func TestNatraEDTPacingOnEgress(t *testing.T) {
 
 // TestNatraECNMarkOnAboveRate confirms that an ECN-capable above-rate
 // packet returns TC_ACT_OK with STAT_ECN_MARKED bumped instead of
-// being dropped or EDT-delayed. The bucket stays empty (no token
-// deduction in the disposition path); the contract is "marked CE,
-// peer's TCP will back off".
+// being dropped. Runs without EDT (cfg.EDTPacing=0 by default), so
+// the disposition order on egress is the same as ingress: ECN-mark,
+// then drop. The EDT-preferred path is exercised separately by
+// TestNatraEDTPreferredOverECNOnEgress.
 func TestNatraECNMarkOnAboveRate(t *testing.T) {
 	_, cfgMap, bucketMap, statsMap, progIngress, progEgress := loadNatraColl(t)
 	for _, dc := range directionCases(progIngress, progEgress) {
@@ -369,9 +370,64 @@ func TestNatraECNMarkOnAboveRate(t *testing.T) {
 				t.Errorf("STAT_DROPPED delta=%d, want 0 (ECN preferred over drop)", got)
 			}
 			if got := readPerCPUStat(t, statsMap, dc.statKey(statEDTDelayed)) - beforeEDT; got != 0 {
-				t.Errorf("STAT_EDT_DELAYED delta=%d, want 0 (ECN preferred over EDT)", got)
+				t.Errorf("STAT_EDT_DELAYED delta=%d, want 0 (EDT path skipped without cfg.EDTPacing)", got)
 			}
 		})
+	}
+}
+
+// TestNatraEDTPreferredOverECNOnEgress pins the disposition contract:
+// on egress, when cfg.EDTPacing is set and the packet is over the
+// rate, the BPF program EDT-paces (advances skb->tstamp via fq)
+// instead of ECN-marking. ECN-mark backs off the sender's TCP cwnd
+// repeatedly when every above-rate packet gets CE, which drives
+// measured throughput well below the configured rate. EDT pacing
+// keeps cwnd intact and the bucket releases at exactly rate_bps,
+// so the receiver's measured bps converges to the rate. A
+// regression that flips this order back will surface here.
+func TestNatraEDTPreferredOverECNOnEgress(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, _, progEgress := loadNatraColl(t)
+	dir := uint32(bpf.DirectionEgress)
+	cfg := natraConfig{
+		RateBps:     1,
+		BurstBytes:  64,
+		HHThreshold: 0,
+		EDTPacing:   1,
+	}
+	if err := cfgMap.Update(&dir, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	tb := tokenBucket{Tokens: 64}
+	if err := bucketMap.Update(&dir, &tb, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	statKey := func(slot uint32) uint32 { return bpf.StatKey(bpf.DirectionEgress, slot) }
+	beforeECN := readPerCPUStat(t, statsMap, statKey(statECNMarked))
+	beforeEDT := readPerCPUStat(t, statsMap, statKey(statEDTDelayed))
+
+	pkt := withECT(synthEthIPpkt())
+
+	// Packet 1 (bucket has tokens): passes via the normal path.
+	if ret, _, err := progEgress.Test(pkt); err != nil {
+		t.Fatalf("packet 1: %v", err)
+	} else if ret != 0 {
+		t.Fatalf("packet 1 ret=%d, want 0", ret)
+	}
+
+	// Packet 2 (bucket empty, ECN-capable, EDT enabled): EDT wins.
+	ret, _, err := progEgress.Test(pkt)
+	if err != nil {
+		t.Fatalf("packet 2: %v", err)
+	}
+	if ret != 0 {
+		t.Errorf("packet 2 ret=%d, want 0 (EDT-delayed)", ret)
+	}
+	if got := readPerCPUStat(t, statsMap, statKey(statEDTDelayed)) - beforeEDT; got != 1 {
+		t.Errorf("STAT_EDT_DELAYED delta=%d, want 1 (EDT preferred over ECN on egress)", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statKey(statECNMarked)) - beforeECN; got != 0 {
+		t.Errorf("STAT_ECN_MARKED delta=%d, want 0 (ECN should be bypassed when EDT is enabled)", got)
 	}
 }
 
