@@ -73,15 +73,21 @@ NATRA_K3S_TOKEN="$(limactl shell "$SERVER_NAME" -- cat /etc/natra-node-token)"
 NATRA_SERVER_IP="$(limactl shell "$SERVER_NAME" -- cat /etc/natra-server-ip)"
 echo "==> server up at ${NATRA_SERVER_IP}, token captured (${#NATRA_K3S_TOKEN} chars)"
 
-# Stage 2: agent VM. Pass the join URL + token via lima's --set
-# (overrides .env block in the template); the agent's provision
-# script consumes them.
+# Stage 2: agent VM. The agent's provision script needs the server's
+# join URL + token; bake those into a rendered copy of the template
+# (rather than relying on `limactl create --set` syntax, which
+# varies across lima versions). Idempotent: lima reuses the existing
+# VM if already created.
 echo "==> bringing up $AGENT_NAME"
+AGENT_YAML_RENDERED="$(mktemp /tmp/natra-vm-rig-agent.XXXXXX.yaml)"
+trap 'rm -f "$AGENT_YAML_RENDERED"' EXIT
+sed \
+    -e "s|NATRA_K3S_URL: \"\"|NATRA_K3S_URL: \"https://${NATRA_SERVER_IP}:6443\"|" \
+    -e "s|NATRA_K3S_TOKEN: \"\"|NATRA_K3S_TOKEN: \"${NATRA_K3S_TOKEN}\"|" \
+    "$RIG_DIR/lima-agent.yaml" > "$AGENT_YAML_RENDERED"
+
 if ! limactl list "$AGENT_NAME" --format '{{.Name}}' 2>/dev/null | grep -qx "$AGENT_NAME"; then
-    limactl create --name "$AGENT_NAME" \
-        --set ".env.NATRA_K3S_URL = \"https://${NATRA_SERVER_IP}:6443\"" \
-        --set ".env.NATRA_K3S_TOKEN = \"${NATRA_K3S_TOKEN}\"" \
-        "$RIG_DIR/lima-agent.yaml"
+    limactl create --name "$AGENT_NAME" "$AGENT_YAML_RENDERED"
 fi
 limactl start "$AGENT_NAME"
 
