@@ -179,9 +179,15 @@ struct {
 // so STAT_THROTTLED is the cardinality of all bucket-overflow events.
 // The disposition-specific stats below break it down:
 //
-//   STAT_ECN_MARKED   ≤ STAT_THROTTLED  (ECN-capable, marked CE, passed)
-//   STAT_EDT_DELAYED  ≤ STAT_THROTTLED  (egress non-ECN, paced via skb->tstamp)
-//   STAT_DROPPED      ≤ STAT_THROTTLED  (ingress non-ECN, TC_ACT_SHOT)
+//   STAT_EDT_DELAYED  ≤ STAT_THROTTLED  (egress with cfg.edt_pacing,
+//                                         paced via skb->tstamp; first
+//                                         choice when available)
+//   STAT_ECN_MARKED   ≤ STAT_THROTTLED  (ECN-capable; ingress or egress
+//                                         when EDT is off; marked CE,
+//                                         passed)
+//   STAT_DROPPED      ≤ STAT_THROTTLED  (non-ECN that neither EDT nor
+//                                         ECN-mark could handle;
+//                                         TC_ACT_SHOT)
 //
 // Their sum equals STAT_THROTTLED.
 enum {
@@ -332,7 +338,9 @@ static __always_inline int parse_flow(struct __sk_buff *skb, struct flow_key *ou
 
 // consume_tokens charges `bytes` against `dir`'s bucket. Returns 1 if
 // the charge succeeded (caller passes the packet), 0 if the bucket
-// lacks tokens (caller falls through to ECN-mark / EDT-pace / drop).
+// lacks tokens (caller falls through to throttle_disposition — EDT
+// on egress when cfg.edt_pacing, else ECN-mark on ECN-capable, else
+// drop).
 // Refill is computed lazily from elapsed time so the lock is held for
 // ~tens of ns per packet.
 static __always_inline int consume_tokens(__u32 dir, __u64 bytes, __u64 rate_bps, __u64 burst, __u64 now)
