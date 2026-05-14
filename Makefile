@@ -10,9 +10,12 @@ CONTAINER_TOOL ?= docker
 SHELL = /usr/bin/env bash -o pipefail
 .SHELLFLAGS = -ec
 
-# Host detection. Layers 2 and 4 invoke Docker on macOS; Layers 3 and 5
-# require lvh + KVM and skip on macOS by default (see TODO_LINUX.md for
-# the lima/orbstack escape hatch).
+# Host detection. On macOS, every layer that needs a Linux kernel
+# (L2, L3, L4, L5) goes through scripts/run-in-docker.sh, which runs
+# them inside a single Docker container on colima's LinuxKit VM —
+# one shared kernel across all test containers. No kernel isolation
+# locally; see docs/test-environments.md for what that doesn't cover
+# and what the next-step environments would add.
 UNAME_S := $(shell uname -s)
 
 # clang for BPF: Apple clang lacks the bpf target, so prefer Homebrew llvm
