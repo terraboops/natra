@@ -27,17 +27,23 @@ Three k3d clusters brought up in sequence:
 - Cluster 0: flannel only. Cluster A chains natra. Cluster B
   chains the upstream `bandwidth` plugin.
 
-Cluster B's init container fetches the `bandwidth` plugin from
-`containernetworking/plugins` v1.5.1 (k3d's base image doesn't
-ship it) and `modprobe ifb` on each node so HTB-on-IFB can
-install.
+k3s 1.30+ ships the `bandwidth` plugin (v1.6.0-k3s1) already
+chained into the default `10-flannel.conflist`, so Cluster B
+uses that directly — no init container needed. Earlier rigs
+that didn't bundle bandwidth used a `vanilla-bandwidth-installer`
+DaemonSet; the script detects the existing chain and skips it.
+`modprobe ifb` still runs on each node so the plugin can install
+its IFB device.
 
 Pre-measurement normalizations:
 
-- **HTB burst patch (vanilla only).** kubelet sets HTB burst to
-  ~150 seconds of credit (~193 MB on a 10 Mbps annotation). The
-  script overrides each pod's HTB class to `burst 1mb cburst 1mb`
-  before measuring. natra's bucket defaults to 0.5 sec of credit
+- **TBF burst patch (vanilla only).** kubelet sets the upstream
+  bandwidth plugin's per-pod TBF burst to ~150 seconds of credit
+  (~193 MB on a 10 Mbps annotation). The script reaches into the
+  node netns via nsenter and rewrites each pod's TBF qdisc to
+  `burst 1mb latency 50ms` before measuring. (v1.5.1 of the
+  plugin used HTB; v1.6.0 uses TBF. The script targets whichever
+  is present.) natra's bucket defaults to 0.5 sec of credit
   (`config.DefaultBurstRatio`), which is in the same envelope
   without an explicit override.
 - **Bucket warmup.** 20s forward + 20s reverse priming flows
@@ -69,17 +75,16 @@ same cell under concurrent traffic in Workload 2 measures 9.79
 Mbps, 2% under). At higher rates natra lands within 5% of cap
 (1028 Mbps on 1G, 10142/10106 Mbps on 10G).
 
-Upstream's 21/42 Mbps elephants are not a regression in vanilla —
-they reflect the HTB-burst-patch helper (`fix_vanilla_htb_burst`
-in `scripts/perf-vs-vanilla.sh`) not reaching the qdiscs that
-the k3s-bundled bandwidth plugin sets up. The patch was written
-against the older containernetworking/plugins v1.5.1 binary
-shape; the k3s-shipped binary uses a different class layout, so
-the `tc class change` calls no-op silently and HTB's default
-~150-second burst credit covers the entire 15s measurement
-window. Tracked for a follow-up iteration; on a rig where the
-burst patch lands, upstream's 10M elephant historically sits at
-~10.04 Mbps.
+Upstream's 21/42 Mbps elephants in this run reflect a fix that
+landed after capture: the previous `fix_vanilla_htb_burst`
+targeted HTB class 1:30 via `tc class change` and silently
+no-op'd on the v1.6.0-k3s1 binary (which uses TBF, not HTB, and
+ships in a k3s node container with no `tc` userspace tool). The
+current `fix_vanilla_tbf_burst` reaches the node netns via
+nsenter from the host kernel and rewrites the TBF qdisc burst
+directly. The next perf-vs-vanilla run will replace this
+upstream row with the patched-burst measurement, expected at
+~10 Mbps on the 10M cell.
 
 Heavy-hitter threshold scales with rate:
 `max(16 KiB, rate_bytes × 100ms)`. 10 Mbps pod → ~125 KiB. Tail
@@ -126,8 +131,9 @@ three pieces:
 
 - **Elephant cap.** natra ingress 10.52 Mbps and egress 9.79 Mbps
   — both inside 6% of the 10M cap. Upstream ingress 17.02 Mbps
-  reflects the same HTB-burst-patch issue as Workload 1; on a
-  rig where the patch lands, upstream tracks natra's envelope.
+  reflects the pre-fix TBF-burst-patch issue (Workload 1 caption);
+  on a rig with the new patch active, upstream tracks natra's
+  envelope.
 - **Annotated mice.** natra 4709 RPS / p99 82 ms vs upstream 92
   RPS / p99 5655 ms. CMS classification lets each fresh-flow
   hey request bypass the bucket; HTB queues everything against
