@@ -168,15 +168,24 @@ plumbing without committing to multi-host infra. Catches: NIC
 offload skew, real veth/bridge handoff, cross-kernel BPF version
 mismatch, real network namespaces, MTU.
 
-**Status: built.** Orchestration lives in `cmd/vm-rig/` (Go,
-subcommands `up / install / test / down / all`); lima VM templates
-live in `scripts/vm-rig/*.yaml`. The rig brings up two VMs — server
+**Status: built; cross-VM pod traffic currently blocked.**
+Orchestration lives in `cmd/vm-rig/` (Go, subcommands
+`up / install / test / down / all`); lima VM templates live in
+`scripts/vm-rig/*.yaml`. The rig brings up two VMs — server
 (control-plane) and agent (worker), each on its own Linux kernel —
-joined via the lima `shared` network so pod-to-pod traffic between
-annotated pods crosses a real virtual NIC pair. Invoke with
-`make test-vm`. macOS prerequisite: `brew install socket_vmnet` for
-VM-to-VM L2 reachability; Linux uses libvirt/KVM bridged networks
-directly.
+joined via the lima `shared` network. The k3s control plane joins
+cleanly; pod-to-pod traffic between annotated pods *should* cross
+a real virtual NIC pair, but on macOS with Debian VMs under lima's
+shared (socket_vmnet) network, cross-VM ARP for the statically-
+assigned IPs gets dropped by vmnet, and flannel `host-gw` can't
+resolve next-hops. The test's connectivity gate fails loudly
+instead of producing a silent 0-bps PASS. See
+`scripts/vm-rig/README.md` for the three plausible unblock paths
+(Ubuntu distro, VXLAN backend, Linux host).
+
+Invoke with `make test-vm`. macOS prerequisite:
+`brew install socket_vmnet` for VM-to-VM L2 reachability; Linux
+uses libvirt/KVM bridged networks directly.
 
 See `scripts/vm-rig/README.md` for the layout, kernel-version
 override path (swap the `images:` block in either
