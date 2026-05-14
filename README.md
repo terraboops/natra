@@ -106,6 +106,7 @@ make test-vm       # two-VM kernel-isolated k3s cluster via lima
 - [Development](docs/development.md) — build, test, debug
 - [Troubleshooting](docs/troubleshooting.md) — common failure modes
 - [TODO_LINUX.md](TODO_LINUX.md) — per-layer test details
+- [TODO.md](TODO.md) — open items across the project
 
 ## License
 
