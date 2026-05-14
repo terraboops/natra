@@ -156,6 +156,23 @@ Watch `passed`, `throttled`, `hh_hits`. If `hh_hits` is most of the
 traffic, every flow is classified heavy. Drop the threshold to see the
 fast pass take effect; raise it to give more flows the fast pass.
 
+Two cluster-wide knobs on the installer DaemonSet adjust the
+threshold behavior:
+
+```bash
+# Pin every pod to the same threshold (bytes), ignoring rate-scaling
+kubectl set env -n kube-system daemonset/natra-installer \
+  NATRA_DEFAULT_HH_THRESHOLD=262144
+
+# Raise the per-pod time constant (ms) — more honeymoon before a
+# flow crosses to heavy. Defaults to 100.
+kubectl set env -n kube-system daemonset/natra-installer \
+  NATRA_FASTPASS_TIME_CONSTANT_MS=250
+```
+
+For per-pod tuning use the JSON annotation form
+(`{"rate":"10M","heavyHitterThreshold":131072}`) instead.
+
 ## L4 e2e on the local rig
 
 The L4 test brings up a k3d cluster and asserts iperf throughput is
