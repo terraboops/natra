@@ -72,6 +72,23 @@ spec:
             # workloads with many parallel long-lived flows.
             - name: NATRA_FASTPASS_TIME_CONSTANT_MS
               value: ""
+            # NATRA_DEFAULT_HH_THRESHOLD overrides the rate-scaled
+            # threshold with a fixed cluster-wide byte value. Unset
+            # (default): per-pod threshold scales with annotated
+            # rate per FASTPASS_TIME_CONSTANT_MS. Set to a positive
+            # integer to pin every pod to the same threshold —
+            # useful when cluster workloads are homogeneous and the
+            # per-rate scaling would over- or under-shoot.
+            - name: NATRA_DEFAULT_HH_THRESHOLD
+              value: ""
+            # NATRA_DEFAULT_BURST_RATIO sets the bucket-capacity
+            # multiplier on the configured rate. Default 2 (so a
+            # 10 Mbps pod gets a 2.5 MB bucket = 2 seconds of credit).
+            # Raise for spikier workloads that need more burst
+            # headroom; lower for stricter caps with shorter burst
+            # tolerance.
+            - name: NATRA_DEFAULT_BURST_RATIO
+              value: ""
           command:
             - /bin/sh
             - -ec
