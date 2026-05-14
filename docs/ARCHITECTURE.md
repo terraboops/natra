@@ -96,7 +96,17 @@ The pipeline is two stages on the Pod-side veth:
    on every above-rate packet, which under-throttles below the
    annotated rate (cwnd drops faster than the bucket refills). EDT
    alone keeps the flow exactly at the cap with no retransmit
-   amplifier and no bystander-bleed cost.
+   amplifier.
+
+   Trade-off: EDT preserves packets where a pure-drop disposition
+   destroys them, so the queued packets still take kernel softirq
+   time and NIC ring slots when fq releases them. In the
+   perf-vs-vanilla mixed workload (`docs/perf-vs-vanilla.md`
+   Workload 2), an unannotated same-node neighbor sees p99 ≈ 61 ms
+   under natra vs 34 ms under upstream's drop-based shaping. The
+   annotated pod's own mice gain 226× RPS in the same scenario —
+   the trade is "annotated pod's small flows escape the elephant"
+   for "fractional p99 cost to neighbors."
 
    Per-direction stats break the throttled-packet count down into
    `STAT_ECN_MARKED`, `STAT_EDT_DELAYED`, `STAT_DROPPED` (their sum

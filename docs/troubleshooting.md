@@ -174,6 +174,25 @@ kubectl set env -n kube-system daemonset/natra-installer \
 For per-pod tuning use the JSON annotation form
 (`{"rate":"10M","heavyHitterThreshold":131072}`) instead.
 
+### Unannotated pod tail latency went up after enabling natra
+
+Expected — modest cost on same-node neighbors. natra's EDT-pacing
+disposition (`docs/ARCHITECTURE.md § Throttle disposition`) holds
+above-rate packets in `fq` and releases them on schedule rather
+than dropping them. The held packets still consume softirq time
+and NIC ring slots downstream, so a bystander pod sharing the
+node sees fractional p99 inflation. The perf-vs-vanilla mixed
+workload measures bystander p99 ≈ 61 ms under natra vs 34 ms
+under upstream's drop-based shaping.
+
+If you need to optimize for bystanders rather than the annotated
+pod's own mice, switch `NATRA_EDT_PACING=off` on the installer
+DS — above-rate egress packets fall through to ECN-mark or drop
+just like ingress, matching upstream's "drop the excess" cost
+profile. The annotated pod's elephant cap stays correct; the
+trade-off is that its mice no longer get the 200× RPS gain
+EDT enables.
+
 ## L4 e2e on the local rig
 
 The L4 test brings up a k3d cluster and asserts iperf throughput is
