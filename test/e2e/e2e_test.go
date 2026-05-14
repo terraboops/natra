@@ -55,9 +55,12 @@ const (
 	natraImage   = "ghcr.io/terraboops/natra:e2e"
 	bandwidthBps = 10_000_000 // 10 Mbps annotation under test
 	// burstSeconds is how many seconds of free traffic a freshly-full
-	// bucket grants. natra clamps burst = 2 × rate; in time terms
-	// that's 2 seconds at the configured rate.
-	burstSeconds = 2.0
+	// bucket grants. natra's default burst is 0.5 × rate
+	// (config.DefaultBurstRatio); in time terms that's 0.5 seconds
+	// of credit at the configured rate. The calibration math uses
+	// this to pick the throttleDuration that amortizes the
+	// front-loaded burst below the cap.
+	burstSeconds = 0.5
 	// throttleDurationFloor / Ceiling clamp the calibrated duration
 	// so pathological calibrations can't make tests trivially short
 	// or runaway-slow.
@@ -86,7 +89,7 @@ const (
 
 // throttleDuration is the iperf3 -t value the per-direction throttle
 // assertions use. Set by calibrateRig in BeforeSuite based on measured
-// kindnet jitter; falls back to 15 if calibration fails.
+// jitter; falls back to 15 if calibration fails.
 //
 // The bucket-saturation math: starting from a full bucket, an iperf3
 // run of d seconds averages rate × (1 + burstSeconds/d). To keep that
@@ -95,7 +98,9 @@ const (
 //	(1 + burstSeconds/d) × (1 + 2j) < (cap / rate)
 //	d > burstSeconds / ((cap/rate) / (1 + 2j) - 1)
 //
-// At j=2% this gives d≈13s; at j=5% it gives d≈22s.
+// At burstSeconds=0.5 and j=2% this gives d≈2s; at j=5% it gives d≈5s.
+// The floor at throttleDurationFloor (10s) binds in both — short
+// measurements are statistically noisy regardless of the burst math.
 var throttleDuration = 15
 
 // throttledCap and chaosBpsCap are derived from calibration: the rig
