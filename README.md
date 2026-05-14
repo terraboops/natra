@@ -53,6 +53,8 @@ make build         # CNI binary, with the BPF object embedded
 make docker-build  # container image for the DaemonSet
 make test          # Layer 1 unit/fuzz/bench
 make ci            # full matrix (lint, licenses, L1-L5)
+make test-vm       # two-VM kernel-isolated k3s cluster via lima
+                   # (Mac needs socket_vmnet; see scripts/vm-rig/README.md)
 ```
 
 ## Requirements

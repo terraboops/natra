@@ -160,19 +160,27 @@ classification on the same skb.
 
 Roughly in order of incremental value vs. setup pain:
 
-### 1. Multi-VM cluster on a single host (lvh, kubevirt, or vagrant)
+### 1. Multi-VM cluster on a single host — **vm-rig (lima)**
 
 Same physical machine, but each k8s node is its own VM with its
 own kernel and its own (virtual) NIC. Validates kernel-to-kernel
-plumbing without committing to multi-host infra. Cheapest way to
-catch: NIC offload skew, ECN behavior, cross-kernel BPF version
+plumbing without committing to multi-host infra. Catches: NIC
+offload skew, real veth/bridge handoff, cross-kernel BPF version
 mismatch, real network namespaces, MTU.
 
-This *might* be feasible on a beefy laptop with KVM-on-KVM
-nested virt — colima/QEMU on Mac can in theory run nested KVM,
-but performance is poor. Linux dev hosts with hardware virt
-support are the natural home for this. Not feasible on standard
-GH runners (no nested virt).
+**Status: built.** `scripts/vm-rig/` runs a two-VM k3s cluster
+under lima — server (control-plane) and agent (worker) each on
+their own Linux kernel, joined via the lima `shared` network so
+pod-to-pod traffic between annotated pods crosses a real virtual
+NIC pair. Invoke with `make test-vm`. macOS prerequisite:
+`brew install socket_vmnet` for VM-to-VM L2 reachability; Linux
+uses libvirt/KVM bridged networks directly.
+
+See `scripts/vm-rig/README.md` for the layout, kernel-version
+override path (set a different cloud image in
+`lima-server.yaml` / `lima-agent.yaml` to test e.g. clsact on 5.x
+against tcx on 6.6+), and known limits (the underlying transport
+is software vmnet, not hardware NICs).
 
 ### 2. Multi-host cluster on cloud VMs
 

@@ -1,0 +1,55 @@
+# Lima VM template for the k3s agent node (worker). Pairs with
+# lima-server.yaml. up.sh starts the server first, reads the join
+# token + IP via `limactl shell natra-server cat ...`, exports them
+# as env vars before starting the agent, and this provision script
+# reads them via the lima `env` channel below.
+#
+# Same kernel/image/network choices as server — see lima-server.yaml.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+
+networks:
+  - lima: shared
+
+mounts: []
+
+# These come from `limactl start --set='.env.NATRA_K3S_URL=...'`
+# in up.sh after the server is ready.
+env:
+  NATRA_K3S_URL: ""
+  NATRA_K3S_TOKEN: ""
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      if [ -z "${NATRA_K3S_URL:-}" ] || [ -z "${NATRA_K3S_TOKEN:-}" ]; then
+        echo "natra vm-rig: NATRA_K3S_URL / NATRA_K3S_TOKEN must be set on the agent VM" >&2
+        exit 1
+      fi
+
+      for _ in $(seq 1 60); do
+        if ip -4 addr show lima0 2>/dev/null | grep -q 'inet '; then
+          break
+        fi
+        sleep 1
+      done
+
+      LIMA_IP=$(ip -4 addr show lima0 | awk '/inet /{print $2}' | cut -d/ -f1)
+
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="v1.31.4+k3s1" \
+        K3S_URL="${NATRA_K3S_URL}" \
+        K3S_TOKEN="${NATRA_K3S_TOKEN}" \
+        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP}" \
+        sh -

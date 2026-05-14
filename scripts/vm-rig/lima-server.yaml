@@ -1,0 +1,67 @@
+# Lima VM template for the k3s server node (control-plane). One of
+# two VMs that form the natra kernel-isolated test cluster.
+#
+# Each VM runs its own Linux kernel. Inter-VM traffic crosses the
+# `lima` shared network (socket_vmnet on macOS, libvirt/KVM bridged
+# on Linux) — a real virtual NIC pair, not a shared bridge in one
+# kernel.
+#
+# Ubuntu 24.04 LTS ships kernel 6.8.x which supports TCX
+# (bpf_mprog, kernel 6.6+), so natra's preferred attach mode works
+# out of the box. clsact remains the kernel-5.x fallback inside the
+# loader if anything in the chain breaks.
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+
+# The shared network gives this VM and the agent VM L2 reachability
+# via socket_vmnet (Mac) / lima's default-bridged (Linux). Required
+# for k3s server↔agent join and pod-to-pod traffic.
+networks:
+  - lima: shared
+
+# No host mounts — the natra image is copied in explicitly by the
+# up script via `limactl copy`, and tests drive the cluster from
+# the host's kubectl after the kubeconfig is exported.
+mounts: []
+
+# Install k3s server on first boot. --disable=traefik,servicelb
+# trims the default k3s addons we don't need; --node-ip pins the
+# advertised address to the shared-network interface so the agent
+# can reach it. Token is written to a known path the agent picks
+# up via `limactl shell`.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      # Wait for the lima-shared interface to come up. lima
+      # provisions it asynchronously; without this wait, k3s starts
+      # advertising the wrong IP.
+      for _ in $(seq 1 60); do
+        if ip -4 addr show lima0 2>/dev/null | grep -q 'inet '; then
+          break
+        fi
+        sleep 1
+      done
+
+      LIMA_IP=$(ip -4 addr show lima0 | awk '/inet /{print $2}' | cut -d/ -f1)
+      echo "$LIMA_IP" > /etc/natra-server-ip
+
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="v1.31.4+k3s1" \
+        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \
+        sh -
+
+      # Token at a predictable path so up.sh can read it via shell
+      # exec. /var/lib/rancher/k3s/server/node-token is the canonical
+      # location; expose a world-readable copy for the rig.
+      install -m 0644 /var/lib/rancher/k3s/server/node-token /etc/natra-node-token

@@ -234,6 +234,10 @@ endif
 perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugin (~18-22 min; three k3d phases).
 	@bash scripts/perf-vs-vanilla.sh
 
+.PHONY: test-vm
+test-vm: ## Layer 4 (kernel-isolated): two-VM k3s cluster via lima, real cross-kernel pod traffic. macOS needs socket_vmnet.
+	@bash scripts/vm-rig/all.sh
+
 .PHONY: test-all
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.
 

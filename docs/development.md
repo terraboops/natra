@@ -59,10 +59,20 @@ make test-perf       # L5: BPF_PROG_RUN perf scenarios + synthetic vs-vanilla
 make ci              # All of the above + lint + license scan
 ```
 
-L2/L3/L4/L5 all run on macOS via Docker. None of them require lvh.
+L2/L3/L4/L5 all run on macOS via Docker. All four share one Linux
+kernel (colima's LinuxKit VM on Mac; the runner kernel on GH).
 
-For what each layer actually validates — and the kernel-to-kernel
-behaviors none of them cover — see `docs/test-environments.md`.
+For real kernel-to-kernel coverage there's a separate on-demand rig:
+
+```bash
+make test-vm        # two-VM k3s cluster under lima, real cross-kernel
+                    # pod traffic. macOS prereq: brew install socket_vmnet.
+                    # See scripts/vm-rig/README.md.
+```
+
+For what each layer actually validates — and the wire-level
+behaviors none of these reach (real NICs, switch queueing, etc.) —
+see `docs/test-environments.md`.
 
 A real-cluster head-to-head against the upstream
 `containernetworking/plugins/bandwidth` plugin is available
