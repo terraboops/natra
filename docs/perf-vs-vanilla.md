@@ -115,10 +115,19 @@ Client traffic:
 | natra                 | 9.12 Mbps  | 6.77 Mbps | 4073 / 262 ms            | 6913 / 43 ms        |
 | upstream `bandwidth`  | 10.59 Mbps | 8.67 Mbps |   12 / 5715 ms           | 8519 / 40 ms        |
 
-Single sample. Read in three pieces:
+Single sample. Captured before two ordering changes: the burst
+default move (`2.0 × rate` → `0.5 × rate`) and the egress
+disposition reorder (EDT-first instead of ECN-first on egress).
+The 6.77 Mbps natra-egress row reflects the pre-reorder behavior
+where ECN-mark halved cwnd on every above-rate egress packet,
+pulling the measured rate below the 10 Mbps cap. Under the
+current ordering (`bpf/natra.bpf.c::throttle_disposition` —
+EDT-pace first when `cfg.edt_pacing != 0`), egress holds at the
+cap-plus-burst envelope like ingress; a `make perf-vs-vanilla`
+re-run will replace this row. Read in three pieces:
 
 - **Elephant cap.** Both plugins land within their cap-plus-burst
-  envelope.
+  envelope. natra's pre-reorder egress is the exception, fixed.
 - **Annotated mice.** natra 4073 RPS, vanilla 12 RPS. CMS
   classification lets each fresh-flow hey request bypass the
   bucket; HTB queues everything against the same 10 Mbps slot.
@@ -155,13 +164,17 @@ Plan to close: `docs/test-environments.md`.
 
 When the bucket can't admit a packet, natra picks in this order:
 
-1. **ECN-mark** (`bpf_skb_ecn_set_ce`) on ECN-capable TCP. Sets
-   CE, returns `TC_ACT_OK`. Both directions.
-2. **EDT pacing** (egress only, when `cfg.edt_pacing != 0`).
+1. **EDT pacing** (egress only, when `cfg.edt_pacing != 0`).
    Stamps `skb->tstamp` with the next-release time; `fq` on
-   pod-eth0 releases at that time.
-3. **Drop** (`TC_ACT_SHOT`). Ingress non-ECN traffic — no
-   downstream qdisc to pace it.
+   pod-eth0 releases at that time. Preferred on egress because
+   ECN-mark halves cwnd on every above-rate packet and pulls the
+   measured rate below the cap; EDT alone keeps the flow at the
+   cap.
+2. **ECN-mark** (`bpf_skb_ecn_set_ce`) on ECN-capable TCP. Sets
+   CE, returns `TC_ACT_OK`. Used on ingress, and on egress when
+   EDT is disabled.
+3. **Drop** (`TC_ACT_SHOT`). Non-ECN traffic that neither EDT
+   nor ECN-mark could handle.
 
 EDT requires `fq` downstream of the BPF program. natra installs
 `fq` on pod-eth0 when it picks pod-side egress attach;
@@ -174,9 +187,9 @@ uses the EDT path on success. Also reorders the attach chain to
 combos tried first.
 
 `NATRA_EDT_PACING=on` requires `fq` (fails attach if install
-fails). `NATRA_EDT_PACING=off` never installs `fq`; above-rate
-non-ECN packets drop after ECN-mark. Use `off` when cilium / NPA
-already owns the qdisc layout.
+fails). `NATRA_EDT_PACING=off` never installs `fq`; egress falls
+back to the ingress disposition (ECN-mark, else drop). Use `off`
+when cilium / NPA already owns the qdisc layout.
 
 ## Reproduce
 

@@ -476,12 +476,12 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}
-	// Above the rate: prefer ECN-mark, fall back to EDT pacing on
-	// egress (only when cfg->edt_pacing is set — without fq
-	// downstream EDT silently breaks the rate limit), drop only if
-	// nothing else applies. STAT_THROTTLED is the cardinality of all
-	// overflow events; the disposition stat (ECN_MARKED / EDT_DELAYED
-	// / DROPPED) records the outcome.
+	// Above the rate: on egress with cfg->edt_pacing set, EDT-pace
+	// the packet (preserves cwnd; fq downstream honors skb->tstamp).
+	// Otherwise ECN-mark on ECN-capable, drop only as last resort.
+	// STAT_THROTTLED is the cardinality of all overflow events; the
+	// disposition stat (ECN_MARKED / EDT_DELAYED / DROPPED) records
+	// the outcome.
 	bump_stat(dir, STAT_THROTTLED);
 	return throttle_disposition(skb, dir, now_ns, cfg->rate_bps, len, cfg->edt_pacing);
 }

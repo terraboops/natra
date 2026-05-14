@@ -82,8 +82,9 @@ NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e
 
 natra's default is `edtPacing: auto`. At CNI ADD, the plugin tries
 `tc qdisc replace dev eth0 root fq` inside the pod netns; on success
-the BPF program EDT-stamps above-rate egress packets, on failure it
-falls back to drop after ECN-mark.
+the BPF program EDT-stamps above-rate egress packets before any
+ECN-mark or drop decision, on failure egress falls back to the
+ingress disposition (ECN-mark, else drop).
 
 ```bash
 # Force on (fail attach if fq install fails)

@@ -22,12 +22,15 @@ short-lived flows arrive empty-handed. natra's CMS-then-bucket
 arrangement targets that asymmetry; whether the difference matters on
 real workloads depends on the workload's flow-length distribution.
 
-Above-rate packets aren't dropped by default. natra tries
-`bpf_skb_ecn_set_ce` first (ECN-mark on ECN-capable flows, no
-retransmits), then EDT pacing on egress (`skb->tstamp` honored by an
-`fq` qdisc on pod-eth0), and only drops as a last resort for ingress
-non-ECN traffic. Both attach mode and EDT are auto-detected per pod
-at CNI ADD; operators can pin either if they need to. See
+Above-rate packets aren't dropped by default. On egress with EDT
+pacing available, natra stamps `skb->tstamp` to the next release
+time and lets `fq` on pod-eth0 hold the packet — the sender keeps
+cwnd, so the flow paces at the cap instead of collapsing below it.
+On ingress (and on egress when EDT isn't available), natra tries
+`bpf_skb_ecn_set_ce` so ECN-capable flows back off without a
+retransmit, and only drops as a last resort for non-ECN traffic.
+Both attach mode and EDT are auto-detected per pod at CNI ADD;
+operators can pin either if they need to. See
 [docs/perf-vs-vanilla.md](docs/perf-vs-vanilla.md) for measured
 results.
 

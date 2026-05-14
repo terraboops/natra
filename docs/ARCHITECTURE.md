@@ -68,27 +68,35 @@ The pipeline is two stages on the Pod-side veth:
    protected by `bpf_spin_lock`. Mice (below threshold) bypass the
    bucket entirely and return `TC_ACT_OK`. Heavy flows pay tokens
    proportional to `skb->len`; when the bucket is starved, the
-   disposition helper picks the next action (ECN-mark → EDT pace →
-   drop, see below). `bpf_ktime_get_ns()` is read *outside* the
+   disposition helper picks the next action (EDT-pace on egress
+   when available, else ECN-mark, else drop — see below).
+   `bpf_ktime_get_ns()` is read *outside* the
    spin-locked region — helper calls inside `bpf_spin_lock` are
    verifier-rejected.
 
 3. **Throttle disposition.** When the bucket can't admit a packet,
    natra picks the disposition in this order:
 
-   - `bpf_skb_ecn_set_ce` — set CE on ECN-capable packets and pass
-     (TC_ACT_OK). Receiver's TCP backs off without a retransmit.
-     Works on both directions. Requires the peer to have negotiated
-     ECN (`tcp_ecn=1` on either end of the connection).
    - **EDT pacing** (egress only, when `cfg.edt_pacing != 0`) —
      advance the bucket's `next_release_ns` by
      `bytes * 8e9 / rate_bps`, stamp `skb->tstamp = next_release_ns`,
      and pass. The `fq` qdisc on pod-eth0 holds the packet until
-     that time. Drop becomes "delay" — no TCP retransmit amplifier,
-     and the bystander-bleed cost disappears.
-   - **Drop** (`TC_ACT_SHOT`) — fallback for ingress non-ECN
-     traffic. No transmission-side qdisc on the receive path, so
-     EDT can't apply.
+     that time. Drop becomes "delay", with no congestion signal back
+     to the sender — TCP keeps cwnd, just gets paced.
+   - `bpf_skb_ecn_set_ce` — set CE on ECN-capable packets and pass
+     (TC_ACT_OK). Receiver's TCP backs off without a retransmit.
+     Used on ingress and on egress when EDT is disabled. Requires
+     the peer to have negotiated ECN (`tcp_ecn=1` on either end of
+     the connection).
+   - **Drop** (`TC_ACT_SHOT`) — fallback for traffic neither EDT
+     nor ECN-mark could handle (ingress non-ECN; egress non-ECN
+     with EDT disabled).
+
+   EDT precedes ECN on egress-with-EDT because ECN-mark halves cwnd
+   on every above-rate packet, which under-throttles below the
+   annotated rate (cwnd drops faster than the bucket refills). EDT
+   alone keeps the flow exactly at the cap with no retransmit
+   amplifier and no bystander-bleed cost.
 
    Per-direction stats break the throttled-packet count down into
    `STAT_ECN_MARKED`, `STAT_EDT_DELAYED`, `STAT_DROPPED` (their sum
