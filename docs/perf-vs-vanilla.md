@@ -107,11 +107,19 @@ dataplane). One run; numbers below are not averaged across runs.
 
 > **Stale numbers.** Captured when natra's default burst was 2.0 ×
 > rate (2 sec of credit) — see commit history. The default is now
-> 0.5 × rate (0.5 sec credit) which over a 15-second iperf window
-> drops the theoretical overshoot from ~13% to ~3.3%. A fresh
-> `make perf-vs-vanilla` run is needed to replace this table;
-> expected: natra elephant columns land near 10.3-10.7 Mbps, in
-> the same envelope as the upstream HTB rows below.
+> 0.5 × rate (0.5 sec credit). Empirical confirmation from the L4
+> e2e calibration on a GH runner under the new defaults:
+>
+> ```
+> calibration: mean=10.10Mbps stddev=0.20Mbps jitter=1.94% overshoot=1.0% → throttleDuration=10s
+> ```
+>
+> A fresh `make perf-vs-vanilla` would replace the table below;
+> expected: natra elephant columns near 10.0-10.5 Mbps, in the
+> same envelope as the upstream HTB rows (the L4 measurement is
+> on GH-runner kindnet-ish networking, not colima, so the perf-rig
+> numbers will differ in absolute throughput floor but the
+> overshoot percentage should match).
 
 | Direction | Plugin                | Elephant   | Mice (20× parallel)  |
 |-----------|-----------------------|------------|----------------------|
