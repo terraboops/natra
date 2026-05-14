@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // cmdTest runs two assertions back-to-back against the vm-rig:
@@ -69,6 +70,7 @@ func testEgressOnly(c *Config, env []string, namespace, serverNode, workerNode s
 	const (
 		rateBitsPS  = 10_000_000
 		slackFactor = 1.30
+		floorFactor = 0.50
 		podName     = "iperf-server-egress"
 	)
 
@@ -111,12 +113,18 @@ func testEgressOnly(c *Config, env []string, namespace, serverNode, workerNode s
 	measured := res.End.SumReceived.BitsPerSecond
 	cap := float64(rateBitsPS) * slackFactor
 
+	floor := float64(rateBitsPS) * floorFactor
 	fmt.Printf("  [egress-only] reverse direction, measured: %s\n", fmtBps(measured))
-	fmt.Printf("  [egress-only] cap: %s (rate × %.2f slack)\n", fmtBps(cap), slackFactor)
+	fmt.Printf("  [egress-only] floor=%s cap=%s (rate × %.2f / %.2f)\n",
+		fmtBps(floor), fmtBps(cap), floorFactor, slackFactor)
 
 	if measured > cap {
 		return fmt.Errorf("[egress-only] measured throughput %s exceeds cap %s",
 			fmtBps(measured), fmtBps(cap))
+	}
+	if measured < floor {
+		return fmt.Errorf("[egress-only] measured throughput %s below floor %s (iperf likely failed to connect)",
+			fmtBps(measured), fmtBps(floor))
 	}
 	fmt.Println("PASS [egress-only]: egress throttled even with no ingress annotation.")
 	return nil
@@ -131,6 +139,12 @@ func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNod
 	const (
 		rateBitsPS  = 10_000_000 // 10 Mbps annotation, both directions
 		slackFactor = 1.30
+		// Lower bound: measured must be at least 50% of the
+		// annotated rate. Generous floor — catches "iperf never
+		// connected, measured 0 bps" without tripping on
+		// reasonable variance. Tighter checks (the ±5% target)
+		// would need stable measurement on a less noisy rig.
+		floorFactor = 0.50
 	)
 
 	// Use the bidi-annotated manifest (both ingress and egress at
@@ -162,6 +176,16 @@ func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNod
 		"pod/iperf-client", "pod/iperf-server",
 		"-n", namespace, "--timeout=120s"); err != nil {
 		return err
+	}
+
+	// Pod Ready ≠ cross-node pod network ready. flannel takes a
+	// moment after pod IP assignment to program the host-gw route
+	// and propagate ARP. Poll a short iperf connect until it
+	// succeeds before doing real measurements; bail loudly if it
+	// never works.
+	fmt.Println("==> [iperf] waiting for cross-VM pod connectivity")
+	if err := waitForIperfConnect(env, namespace, "iperf-server", 30); err != nil {
+		return fmt.Errorf("[iperf] cross-VM pod traffic never came up: %w", err)
 	}
 
 	// Drain both directions' buckets. natra's burst defaults to
@@ -199,11 +223,17 @@ func testIperfThrottle(c *Config, env []string, namespace, serverNode, workerNod
 		}
 		measured := res.End.SumReceived.BitsPerSecond
 
+		floor := float64(rateBitsPS) * floorFactor
 		fmt.Printf("  [%s] %s direction, measured: %s\n", leg.label, leg.direction, fmtBps(measured))
-		fmt.Printf("  [%s] cap: %s (rate × %.2f slack)\n", leg.label, fmtBps(cap), slackFactor)
+		fmt.Printf("  [%s] floor=%s cap=%s (rate × %.2f / %.2f)\n",
+			leg.label, fmtBps(floor), fmtBps(cap), floorFactor, slackFactor)
 		if measured > cap {
 			return fmt.Errorf("[iperf/%s] measured throughput %s exceeds cap %s",
 				leg.label, fmtBps(measured), fmtBps(cap))
+		}
+		if measured < floor {
+			return fmt.Errorf("[iperf/%s] measured throughput %s below floor %s (iperf likely failed to connect)",
+				leg.label, fmtBps(measured), fmtBps(floor))
 		}
 	}
 	fmt.Println("PASS [iperf]: both directions throttled within cap on a real two-kernel cluster.")
@@ -293,6 +323,33 @@ func testHeyFastPass(c *Config, env []string, namespace, serverNode, workerNode 
 
 func fmtBps(bps float64) string {
 	return fmt.Sprintf("%.2f Mbps", bps/1e6)
+}
+
+// waitForIperfConnect runs a 1-second iperf3 against the named
+// server, repeating with a short delay until it succeeds or
+// attempts run out. Used as a connectivity gate before the real
+// measurements so transient post-Ready routing delays don't show
+// up as silent 0-bps PASSes downstream.
+func waitForIperfConnect(env []string, namespace, server string, attempts int) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		out, err := captureKubectl(env,
+			"exec", "-n", namespace, "iperf-client", "--",
+			"iperf3", "-c", server, "-t", "1", "-J")
+		if err == nil {
+			var res iperfResult
+			if jerr := json.Unmarshal([]byte(out), &res); jerr == nil &&
+				res.End.SumReceived.BitsPerSecond > 0 {
+				return nil
+			}
+		}
+		lastErr = err
+		time.Sleep(2 * time.Second)
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("no successful iperf connect after %d attempts", attempts)
 }
 
 // renderE2EManifest reads test/e2e/manifests/<name>, swaps the

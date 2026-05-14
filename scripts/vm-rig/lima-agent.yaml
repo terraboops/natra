@@ -7,9 +7,9 @@
 # Same kernel/image/network choices as server — see lima-server.yaml.
 
 images:
-  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
     arch: "aarch64"
-  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
     arch: "x86_64"
 
 cpus: 2
@@ -39,13 +39,17 @@ provision:
       fi
 
       for _ in $(seq 1 60); do
-        if ip -4 addr show lima0 2>/dev/null | grep -q 'inet '; then
+        if ip link show lima0 2>/dev/null | grep -q 'state UP'; then
           break
         fi
         sleep 1
       done
 
-      LIMA_IP=$(ip -4 addr show lima0 | awk '/inet /{print $2}' | cut -d/ -f1)
+      # Static IP in the lima-shared subnet. See lima-server.yaml
+      # for the rationale (DHCP-on-shared-network is flaky across
+      # lima/socket_vmnet/distro combos).
+      LIMA_IP=192.168.105.11
+      ip addr add ${LIMA_IP}/24 dev lima0 2>/dev/null || true
 
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \

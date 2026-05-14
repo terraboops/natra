@@ -71,17 +71,18 @@ func cmdUp(c *Config) error {
 		return err
 	}
 
-	// Stage 3: export kubeconfig. k3s writes the kubeconfig with
-	// server: https://127.0.0.1:6443 — rewrite to the shared-network
-	// IP so the host's kubectl can reach the API server.
+	// Stage 3: export kubeconfig. k3s writes it with
+	// server: https://127.0.0.1:6443 — and that's exactly where
+	// the lima portForward (see lima-server.yaml) lands the VM's
+	// 6443 on the host, so we keep the address as-is. The agent
+	// VM joins via the lima-shared static IP (192.168.105.10:6443)
+	// because socket_vmnet doesn't route the host's loopback to
+	// the agent.
 	fmt.Printf("==> exporting kubeconfig to %s\n", c.KubeconfigPath)
 	kc, err := capture("limactl", "shell", c.ServerName, "--", "sudo", "cat", "/etc/rancher/k3s/k3s.yaml")
 	if err != nil {
 		return err
 	}
-	kc = strings.Replace(kc,
-		"server: https://127.0.0.1:6443",
-		"server: https://"+serverIP+":6443", 1)
 	if err := os.WriteFile(c.KubeconfigPath, []byte(kc), 0o600); err != nil {
 		return err
 	}
@@ -145,23 +146,32 @@ func waitForFile(vm, path string, attempts int, delay time.Duration) error {
 
 func waitForNodesReady(c *Config, want, attempts int, delay time.Duration) error {
 	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
+	lastReady := 0
+	lastErr := ""
 	for i := 0; i < attempts; i++ {
 		out, err := captureKubectl(env, "get", "nodes", "--no-headers")
-		if err == nil {
-			ready := 0
+		if err != nil {
+			lastErr = err.Error()
+		} else {
+			lastErr = ""
+			lastReady = 0
 			for _, line := range strings.Split(out, "\n") {
 				fields := strings.Fields(line)
 				if len(fields) >= 2 && fields[1] == "Ready" {
-					ready++
+					lastReady++
 				}
 			}
-			if ready >= want {
+			if lastReady >= want {
 				return nil
 			}
 		}
 		time.Sleep(delay)
 	}
-	return fmt.Errorf("only %d/%d nodes Ready after %d attempts", -1, want, attempts)
+	if lastErr != "" {
+		return fmt.Errorf("only %d/%d nodes Ready after %d attempts (kubectl: %s)",
+			lastReady, want, attempts, lastErr)
+	}
+	return fmt.Errorf("only %d/%d nodes Ready after %d attempts", lastReady, want, attempts)
 }
 
 // renderAgentYAML reads lima-agent.yaml, substitutes the empty
