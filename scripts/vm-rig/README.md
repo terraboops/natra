@@ -116,19 +116,74 @@ Environment:
 
 ## Pinning a kernel version
 
-The default base image is Ubuntu 24.04 LTS (kernel 6.8.x). To
-exercise an older kernel — say, the clsact fallback path on 5.x —
-replace the `images:` block in one of the YAMLs with a 22.04 or
-20.04 cloud image, or any custom kernel image lima understands.
-The agent and server can run *different* kernels independently.
+The default base image is Debian 13 trixie genericcloud (kernel
+6.12). To exercise an older kernel — say, the clsact fallback
+path on 5.x — replace the `images:` block in one of the YAMLs
+with any other cloud image lima understands (Debian 12, Ubuntu
+20.04/22.04/24.04, Fedora cloud, etc.). The agent and server can
+run *different* kernels independently.
+
+The image was switched from Ubuntu to Debian because
+`cloud-images.ubuntu.com` is DNS-blocked on some constrained
+networks; `cloud.debian.org` is more widely mirrored.
 
 ## Known limits
 
-- First-time VM bring-up downloads the Ubuntu cloud image (~600 MB
-  per arch). Cached after that.
+- First-time VM bring-up downloads the cloud image (~600 MB per
+  arch). Cached after that. lima 2.0+ requires `qemu-img` for
+  qcow2→raw conversion under `vmType: vz` (`brew install qemu`).
 - On Apple Silicon with lima's `vmType: vz` (the default), the
   shared network still needs `socket_vmnet` — vz's own NAT doesn't
   expose VM-to-VM L2.
 - Tests run from the host's kubectl against the server VM's k3s
   API. If the lima shared network drops (rare), the test will see
   the API as unreachable; rerun `go run ./cmd/vm-rig up`.
+
+### Cross-VM pod traffic blocker (current)
+
+On Debian 13 under lima's `shared` network, systemd-networkd's
+DHCPv4 client doesn't complete on `lima0` — networkd has the
+interface set to `DHCP=ipv4` but the client never logs an
+attempt. The current workaround (`scripts/vm-rig/lima-*.yaml`
+provision scripts) assigns static IPs `192.168.105.10` (server)
+and `192.168.105.11` (agent).
+
+The k3s control-plane join works fine with statics — it routes
+via lima-usernet NAT, which doesn't depend on vmnet's ARP table.
+But pod-to-pod traffic via flannel `host-gw` fails: macOS
+`socket_vmnet` only learns ARP entries for IPs it assigned via
+DHCP, so cross-VM ARP for the static addresses gets dropped, and
+host-gw's "route pod CIDR via the other node's lima0 IP" never
+resolves a next-hop.
+
+Symptom: the `cmd/vm-rig/test.go` connectivity gate
+(`waitForIperfConnect`) fails loudly instead of producing a
+silent 0-bps PASS. The cluster is up, kubectl works, single-VM
+pod traffic works — only cross-VM pod traffic is dead.
+
+Paths to unblock (rough order of likelihood):
+
+1. **Different distro.** Ubuntu 24.04's cloud-init + netplan
+   stack DHCPs cleanly under lima where Debian/networkd
+   doesn't. Simplest swap — change the `images:` block, drop the
+   static-IP provisioning.
+2. **flannel-VXLAN with explicit MTU.** Tunnels pod traffic over
+   UDP, so cross-VM ARP for pod CIDRs becomes irrelevant. A
+   previous attempt failed at "1/2 nodes Ready," almost certainly
+   an MTU mismatch (VXLAN adds 50 bytes of overhead; pod MTU
+   needs to be 1450 on a 1500-byte underlay).
+3. **Run vm-rig on Linux, not macOS.** lima's macOS networking
+   quirks evaporate — libvirt/KVM bridged gives real L2. A
+   small Linux VM accessed via SSH ends up simpler than fighting
+   socket_vmnet on the developer's Mac.
+
+## Planned direction
+
+The vm-rig is the long-term shape for `make perf-vs-vanilla` on
+developer machines. The current `scripts/perf-vs-vanilla.sh` uses
+k3d (containers as nodes, one shared colima kernel) and will stay
+the path for CI runs. Once cross-VM connectivity is unblocked,
+`cmd/vm-rig` will gain a `perf-vs-vanilla` subcommand that drives
+the same three-phase (baseline / natra / vanilla) comparison
+across real two-kernel pods, and `make perf-vs-vanilla` will
+dispatch to vm-rig on macOS / k3d in CI.
