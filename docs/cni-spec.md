@@ -99,7 +99,7 @@ with `version.All`).
   "attachMode": "auto",       // optional; one of: auto (default), tcx-hostside, tcx-podside, clsact-hostside, clsact-podside
   "defaults": {               // optional cluster-wide knobs
     "hhThreshold": 50,        // CMS count above which a flow is "heavy"
-    "burstRatio": 2.0,        // bucket size = rate * burstRatio (seconds)
+    "burstRatio": 0.5,        // bucket size = rate * burstRatio (seconds)
     "edtPacing": "auto"       // one of: auto (default), on, off
   },
   "capabilities": {
