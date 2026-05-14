@@ -123,9 +123,11 @@ includes a direction when the matching annotation is present.
 `runtimeConfig.bandwidth.{ingress,egress}Rate` is in **bits per
 second** (matching kubelet's convention); natra divides by 8 to get
 bytes/sec for the BPF program. Each direction's burst is clamped to
-2× that direction's rate when unspecified or larger; without that
-clamp, the kubelet default of `MaxUint32` (~4 GB) would let any flow
-saturate the link for ~30s before the bucket caught up.
+`rate × defaults.burstRatio` (compiled default 0.5 — half a second
+of credit at the configured rate), floored at 64 KiB so one
+max-GRO super-packet always fits. Without the clamp, kubelet's
+default `MaxUint32` (~4 GB) burst would let any flow saturate the
+link for tens of seconds before the bucket caught up.
 
 ## Annotation forms
 
