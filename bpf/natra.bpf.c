@@ -423,17 +423,36 @@ static __always_inline int throttle_disposition(struct __sk_buff *skb,
 			// modest rates (e.g., 1500 B at 1 Mbps → 12 ms).
 			__u64 add_ns = (bytes * 8000ULL) * 1000000ULL / rate_bps;
 			__u64 release_at;
+			__u64 delay_ns;
 			bpf_spin_lock(&tb->lock);
 			__u64 base = tb->next_release_ns;
 			if (base < now_ns)
 				base = now_ns;
 			release_at = base + add_ns;
+			// Always advance the bucket's debt counter — the rate
+			// cap stays correct regardless of how this packet is
+			// eventually delivered (EDT / ECN / drop).
 			tb->next_release_ns = release_at;
 			bpf_spin_unlock(&tb->lock);
+			delay_ns = release_at - now_ns;
 
-			skb->tstamp = release_at;
-			bump_stat(dir, STAT_EDT_DELAYED);
-			return TC_ACT_OK;
+			// Bounded EDT: cap the queue-in-fq depth at 50 ms.
+			// Above this, fall through to ECN-mark or drop. Without
+			// the bound, a sustained over-rate flow accumulates
+			// EDT-stamped packets in fq, taking softirq cycles
+			// from same-node neighbors (measured: bystander p99
+			// ~61 ms vs ~34 ms with drop disposition — see
+			// docs/troubleshooting.md "Unannotated pod tail
+			// latency"). 50 ms is generous against typical TCP
+			// retransmit timers (~200 ms) and well past
+			// intra-cluster RTT (sub-ms), so the per-flow shape
+			// stays "EDT'd most of the time, ECN-marked when over."
+			if (delay_ns <= 50000000ULL) {
+				skb->tstamp = release_at;
+				bump_stat(dir, STAT_EDT_DELAYED);
+				return TC_ACT_OK;
+			}
+			// Fall through to ECN-mark / drop below.
 		}
 	}
 

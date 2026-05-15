@@ -253,7 +253,14 @@ func TestNatraEDTPacingOnEgress(t *testing.T) {
 	for _, dc := range directionCases(progIngress, progEgress) {
 		t.Run(dc.name, func(t *testing.T) {
 			cfg := natraConfig{
-				RateBps:     1,
+				// 20 kbps in the BPF formula's (bytes × 8e9 / rate)
+				// units — yields a 25.6 ms EDT delay per 64-byte
+				// packet, well under the 50 ms bound while still
+				// keeping inter-call bucket refill (<1 byte per
+				// µs of gap) below burst. RateBps=1 would push
+				// delay past the bound and trigger the
+				// fall-through path instead of EDT.
+				RateBps:     20000,
 				BurstBytes:  64,
 				HHThreshold: 0, // every packet is heavy
 			}
@@ -389,7 +396,12 @@ func TestNatraEDTPreferredOverECNOnEgress(t *testing.T) {
 	_, cfgMap, bucketMap, statsMap, _, progEgress := loadNatraColl(t)
 	dir := uint32(bpf.DirectionEgress)
 	cfg := natraConfig{
-		RateBps:     1,
+		// 20 kbps — see TestNatraEDTPacingOnEgress's note. Gives a
+		// 25.6 ms EDT delay per 64-byte packet, under the 50 ms
+		// bound. RateBps=1 would push delay past the bound and
+		// trigger ECN-mark fall-through, which is the opposite of
+		// what this test pins.
+		RateBps:     20000,
 		BurstBytes:  64,
 		HHThreshold: 0,
 		EDTPacing:   1,
@@ -428,6 +440,71 @@ func TestNatraEDTPreferredOverECNOnEgress(t *testing.T) {
 	}
 	if got := readPerCPUStat(t, statsMap, statKey(statECNMarked)) - beforeECN; got != 0 {
 		t.Errorf("STAT_ECN_MARKED delta=%d, want 0 (ECN should be bypassed when EDT is enabled)", got)
+	}
+}
+
+// TestNatraEDTBoundedDelay pins the bounded-EDT contract: when the
+// computed EDT delay would exceed 50 ms, fall through to ECN-mark
+// (on ECN-capable packets) instead of holding the packet in fq.
+// Without the bound, a sustained over-rate flow accumulates
+// EDT-stamped packets in the pod's fq, costing softirq cycles for
+// same-node neighbors. The bound caps queue depth and lets ECN
+// signal back to the sender on the truly hot packets — measured to
+// reduce bystander p99 in docs/perf-vs-vanilla.md Workload 2.
+//
+// Rate of 1 byte/sec makes the first above-rate packet's EDT delay
+// huge (effectively infinite for the test's measurement window),
+// guaranteeing the bound trips on the very first throttle event.
+func TestNatraEDTBoundedDelay(t *testing.T) {
+	_, cfgMap, bucketMap, statsMap, _, progEgress := loadNatraColl(t)
+	dir := uint32(bpf.DirectionEgress)
+	cfg := natraConfig{
+		RateBps:     1, // delay = bytes × 8e9 / rate → seconds, well past 50 ms
+		BurstBytes:  64,
+		HHThreshold: 0,
+		EDTPacing:   1,
+	}
+	if err := cfgMap.Update(&dir, &cfg, ebpf.UpdateAny); err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	tb := tokenBucket{Tokens: 64}
+	if err := bucketMap.Update(&dir, &tb, ebpf.UpdateAny); err != nil {
+		t.Fatalf("bucket: %v", err)
+	}
+
+	statKey := func(slot uint32) uint32 { return bpf.StatKey(bpf.DirectionEgress, slot) }
+	beforeECN := readPerCPUStat(t, statsMap, statKey(statECNMarked))
+	beforeEDT := readPerCPUStat(t, statsMap, statKey(statEDTDelayed))
+	beforeDrop := readPerCPUStat(t, statsMap, statKey(statDropped))
+
+	pkt := withECT(synthEthIPpkt())
+
+	// Packet 1 fits in the burst, passes via the normal path.
+	if ret, _, err := progEgress.Test(pkt); err != nil {
+		t.Fatalf("packet 1: %v", err)
+	} else if ret != 0 {
+		t.Fatalf("packet 1 ret=%d, want 0", ret)
+	}
+
+	// Packet 2: bucket empty. EDT would compute a multi-second
+	// delay (>> 50 ms bound), so the BPF should fall through to
+	// ECN-mark (the packet is ECT-capable). Result: TC_ACT_OK
+	// with STAT_ECN_MARKED bumped and STAT_EDT_DELAYED unchanged.
+	ret, _, err := progEgress.Test(pkt)
+	if err != nil {
+		t.Fatalf("packet 2: %v", err)
+	}
+	if ret != 0 {
+		t.Errorf("packet 2 ret=%d, want 0 (ECN-marked, EDT bound exceeded)", ret)
+	}
+	if got := readPerCPUStat(t, statsMap, statKey(statECNMarked)) - beforeECN; got != 1 {
+		t.Errorf("STAT_ECN_MARKED delta=%d, want 1 (EDT bound should yield ECN-mark)", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statKey(statEDTDelayed)) - beforeEDT; got != 0 {
+		t.Errorf("STAT_EDT_DELAYED delta=%d, want 0 (EDT bound should not bump EDT_DELAYED)", got)
+	}
+	if got := readPerCPUStat(t, statsMap, statKey(statDropped)) - beforeDrop; got != 0 {
+		t.Errorf("STAT_DROPPED delta=%d, want 0 (ECN-capable packet should not drop)", got)
 	}
 }
 
