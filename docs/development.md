@@ -147,5 +147,9 @@ To read live counters from a running attachment:
 
 ```bash
 # inside a node, with bpftool installed:
-natra dump-stats <containerID>
+natra dump-stats <pod-sandbox-id>
 ```
+
+The argument is the pod *sandbox* ID (what containerd passes via
+CNI_CONTAINERID), not the kubectl-visible app container ID. See
+`docs/troubleshooting.md` for how to find it via crictl.

@@ -96,14 +96,32 @@ kubectl set env -n kube-system daemonset/natra-installer \
   NATRA_EDT_PACING=off
 ```
 
-Inspect the active disposition on a pod via `dump-stats`:
+Inspect the active disposition on a pod via `dump-stats`. The
+argument is the **pod sandbox ID** — the infra/pause container
+that kubelet asks the CNI plugin to wire up, *not* the app
+container ID that `kubectl get pod -o jsonpath='{.status.
+containerStatuses[0].containerID}'` returns. The two are
+different IDs; natra pins maps under the sandbox ID because
+that's what containerd passes in CNI_CONTAINERID.
 
 ```bash
-docker exec <node> /opt/cni/bin/natra dump-stats <containerID>
+# On the node, get the pod sandbox ID via crictl:
+SANDBOX=$(docker exec <node> crictl \
+    --runtime-endpoint unix:///run/k3s/containerd/containerd.sock \
+    pods --name <pod-name> -q | head -1)
+docker exec <node> /opt/cni/bin/natra dump-stats "$SANDBOX"
 ```
+
+(The `--runtime-endpoint` flag is k3s-specific; on other distros
+crictl typically auto-detects from `/etc/crictl.yaml` and the
+flag can be omitted.)
 
 `ecn_marked`, `edt_delayed`, and `dropped` slots break down what
 natra did with each above-rate packet. Their sum equals `throttled`.
+Under sustained over-rate egress traffic with EDT pacing enabled,
+expect mostly `edt_delayed` with occasional `ecn_marked` events
+when the 50 ms EDT-delay bound trips (see ARCHITECTURE.md §
+Throttle disposition for the bound's rationale).
 
 ## bpffs and pin paths
 
@@ -150,8 +168,12 @@ the design.
 To see the live classification on a pod:
 
 ```bash
-docker exec <node> /opt/cni/bin/natra dump-stats <containerID>
+docker exec <node> /opt/cni/bin/natra dump-stats <pod-sandbox-id>
 ```
+
+(See the "Inspect the active disposition on a pod via `dump-stats`"
+section above for how to find the sandbox ID — it's *not* the
+kubectl-visible container ID.)
 
 Watch `passed`, `throttled`, `hh_hits`. If `hh_hits` is most of the
 traffic, every flow is classified heavy. Drop the threshold to see the
