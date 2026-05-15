@@ -154,6 +154,15 @@ struct {
 // inside u32 wrap (2^32 ticks × 68.7 s ≈ 9300 years).
 #define CMS_DECAY_INTERVAL_NS (1ULL << 36)
 
+// Max EDT-stamped delay before disposition falls through to ECN-mark
+// or drop. Caps fq queue depth at MAX_EDT_DELAY_NS × rate (≈ 42
+// MTU packets at 10 Mbps) so a sustained over-rate flow can't
+// starve same-node neighbors of softirq time. 50 ms is generous
+// against typical TCP retransmit timers (~200 ms) and well past
+// intra-cluster RTT (sub-ms). See `throttle_disposition` and the
+// `Bystander cost from EDT preservation` resolution in TODO_LINUX.md.
+#define MAX_EDT_DELAY_NS 50000000ULL
+
 // Cell layout: u64 + u32 = 12 bytes of fields, padded to 16 bytes
 // for 8-byte alignment of `bytes` in array-of-struct. Per-pod CMS
 // cost = WIDTH × DEPTH × DIR_MAX × 16 = 4 MiB.
@@ -436,18 +445,9 @@ static __always_inline int throttle_disposition(struct __sk_buff *skb,
 			bpf_spin_unlock(&tb->lock);
 			delay_ns = release_at - now_ns;
 
-			// Bounded EDT: cap the queue-in-fq depth at 50 ms.
-			// Above this, fall through to ECN-mark or drop. Without
-			// the bound, a sustained over-rate flow accumulates
-			// EDT-stamped packets in fq, taking softirq cycles
-			// from same-node neighbors (measured: bystander p99
-			// ~61 ms vs ~34 ms with drop disposition — see
-			// docs/troubleshooting.md "Unannotated pod tail
-			// latency"). 50 ms is generous against typical TCP
-			// retransmit timers (~200 ms) and well past
-			// intra-cluster RTT (sub-ms), so the per-flow shape
-			// stays "EDT'd most of the time, ECN-marked when over."
-			if (delay_ns <= 50000000ULL) {
+			// Bounded EDT — see MAX_EDT_DELAY_NS comment up top.
+			// Above the bound, fall through to ECN-mark or drop.
+			if (delay_ns <= MAX_EDT_DELAY_NS) {
 				skb->tstamp = release_at;
 				bump_stat(dir, STAT_EDT_DELAYED);
 				return TC_ACT_OK;
