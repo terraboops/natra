@@ -72,6 +72,7 @@ func dumpStats(args []string) error {
 		}
 		fmt.Printf("[%s] config: rate=%d burst=%d hh_threshold=%d\n", dir, rate, burst, hh)
 
+		counters := map[string]uint64{}
 		for _, slot := range []struct {
 			name string
 			idx  uint32
@@ -92,7 +93,21 @@ func dumpStats(args []string) error {
 			for _, v := range values {
 				sum += v
 			}
+			counters[slot.name] = sum
 			fmt.Printf("[%s] stats: %s=%d (per-cpu sum)\n", dir, slot.name, sum)
+		}
+
+		// Disposition mix: percentage of above-rate events by outcome.
+		// Under sustained over-rate egress with EDT pacing, expect
+		// mostly edt_delayed with occasional ecn_marked when the 50 ms
+		// EDT-delay bound trips (MAX_EDT_DELAY_NS in bpf/natra.bpf.c).
+		// Ingress (and egress with EDT off) will show ecn_marked +
+		// dropped. The three counters sum to throttled by construction.
+		if t := counters["throttled"]; t > 0 {
+			pct := func(c uint64) float64 { return 100 * float64(c) / float64(t) }
+			fmt.Printf("[%s] disposition mix: EDT=%.0f%% ECN=%.0f%% drop=%.0f%% (of %d throttled)\n",
+				dir, pct(counters["edt_delayed"]), pct(counters["ecn_marked"]),
+				pct(counters["dropped"]), t)
 		}
 	}
 
