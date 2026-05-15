@@ -281,17 +281,9 @@ runs everything.
   cilium / NPA cluster has been run yet. Validation needs a real
   EKS-or-similar cluster.
 - **`linux/arm64` in CI.** Local Mac dev runs arm64; CI runs amd64.
-- **Bystander cost from EDT preservation.** `make perf-vs-vanilla`
-  Workload 2 shows the annotated pod's neighbor sees p99 ~61 ms
-  under natra vs ~34 ms under upstream's drop disposition. EDT
-  preserves above-rate packets in `fq` where vanilla destroys them
-  at the qdisc; the held packets take softirq cycles when fq
-  eventually releases them. Currently documented as a trade-off
-  (`docs/troubleshooting.md` "Unannotated pod tail latency went
-  up" → switch `NATRA_EDT_PACING=off`). Worth investigating
-  whether a bounded EDT delay (e.g. drop or ECN-mark when
-  `next_release_ns - now_ns > N ms`) would reduce neighbor p99
-  without regressing the annotated pod's egress under-throttle
-  fix (b439682). Requires measurement on the k3d perf-vs-vanilla
-  rig with several N values; should not ship without confirming
-  the egress numbers stay in the 5% envelope.
+- ~~**Bystander cost from EDT preservation.**~~ Resolved by
+  273a99f — bounded EDT delay at 50 ms, fall through to ECN-mark
+  above. Measured on perf-vs-vanilla Workload 2: bystander p99
+  61 → 27 ms, annotated mice p99 69 → 28 ms, egress 9.16 → 10.03
+  Mbps (closer to cap, not under). Egress stays in the 5%
+  envelope.

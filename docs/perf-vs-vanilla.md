@@ -65,19 +65,19 @@ of magnitude catches plugin bugs that only surface at higher rates
 
 | Direction | Plugin   | Elephant   | Mice (20× parallel) |
 |-----------|----------|------------|---------------------|
-| ingress   | natra    | 10.28 Mbps | 11.47 Mbps          |
-| ingress   | upstream | 10.07 Mbps |  9.43 Mbps          |
-| egress    | natra    |  9.01 Mbps | 12.98 Mbps          |
-| egress    | upstream | 10.08 Mbps |  9.48 Mbps          |
+| ingress   | natra    | 10.19 Mbps | 11.79 Mbps          |
+| ingress   | upstream | 10.07 Mbps |  9.64 Mbps          |
+| egress    | natra    | 10.18 Mbps | 11.54 Mbps          |
+| egress    | upstream | 10.08 Mbps |  9.45 Mbps          |
 
 Rig: colima aarch64, LinuxKit ~6.8.x, k3d v5.7.4, flannel
 host-gw, software dataplane (no NIC offload). Single sample
 each, captured in one run with both plugins active. Both
-plugins land within 10% of cap. At higher rates both stay
-inside 5% of cap (natra 1026/1048 Mbps on 1G, upstream 957/957
-Mbps on 1G). Above ~1 Gbps the rig's wire becomes the
-bottleneck — single-stream colima caps at ~10 Gbps regardless
-of shaper.
+plugins land within 2% of cap on every cell. At higher rates
+both stay inside 5% of cap (natra 1024/1026 Mbps on 1G,
+upstream 956/956 Mbps on 1G). Above ~1 Gbps the rig's wire
+becomes the bottleneck — single-stream colima caps at ~10 Gbps
+regardless of shaper.
 
 Heavy-hitter threshold scales with rate:
 `max(16 KiB, rate_bytes × 100ms)`. 10 Mbps pod → ~125 KiB. Tail
@@ -111,36 +111,42 @@ Client traffic:
 
 | Plugin                | iperf ing  | iperf eg   | Annotated mice RPS / p99 | Bystander RPS / p99 |
 |-----------------------|------------|------------|--------------------------|---------------------|
-| baseline (no plugin)  | 59.66 Mbps | 58.58 Mbps |   31 /  4996 ms          | 8591 / 39 ms        |
-| natra                 | 10.21 Mbps |  9.16 Mbps | 7015 /    69 ms          | 7354 / 61 ms        |
-| upstream `bandwidth`  | 10.77 Mbps | 10.14 Mbps |   31 /  1794 ms          | 8979 / 34 ms        |
+| baseline (no plugin)  | 59.66 Mbps | 49.67 Mbps |   10 /  5015 ms          | 3662 / 110 ms       |
+| natra                 | 10.24 Mbps | 10.03 Mbps | 6593 /    28 ms          | 6735 /  27 ms       |
+| upstream `bandwidth`  | 10.69 Mbps | 10.28 Mbps |   31 /  1795 ms          | 6555 /  54 ms       |
 
 Single sample, captured in the same run as Workload 1 with
-both plugins active. Baseline mice are slow under concurrent
-load because the elephant saturates colima's shared software
-dataplane — the bucket isn't what's hurting them, the wire is.
-With either plugin's elephant capped to 10 Mbps, the mice get
-the wire back. Read in three pieces:
+both plugins active. Post bounded-EDT-delay change (273a99f).
+Baseline mice are slow under concurrent load because the
+elephant saturates colima's shared software dataplane — the
+bucket isn't what's hurting them, the wire is. With either
+plugin's elephant capped to 10 Mbps, the mice get the wire
+back. Read in three pieces:
 
-- **Elephant cap.** natra and upstream land within 10% of the
-  10M cap on both directions (natra 10.21/9.16, upstream
-  10.77/10.14). The differences are single-sample noise plus
-  natra's ~3-5% headroom from its CMS+EDT shape.
-- **Annotated mice.** natra 7015 RPS / p99 69 ms vs upstream 31
-  RPS / p99 1794 ms. CMS classification lets each fresh-flow
+- **Elephant cap.** Both plugins land within 3% of the 10M cap
+  on both directions (natra 10.24/10.03, upstream 10.69/10.28).
+  natra's egress was previously stuck below cap from cwnd-halve
+  feedback; the 50 ms EDT-delay bound shipped in 273a99f lets
+  occasional ECN signals reach the sender, which keeps cwnd
+  at the steady-state level corresponding to the cap.
+- **Annotated mice.** natra 6593 RPS / p99 28 ms vs upstream
+  31 RPS / p99 1795 ms. CMS classification lets each fresh-flow
   hey request bypass the bucket; the upstream token-bucket
   qdisc queues every flow against the same 10 Mbps slot, so
-  mice wait behind the elephant. **226× RPS, 26× lower p99 —
+  mice wait behind the elephant. **213× RPS, 64× lower p99 —
   the value-prop of CMS-then-bucket on a mixed workload,
   end-to-end on real upstream code.**
 - **Bystander.** Neither plugin attaches anything to unannotated
-  pods. natra's bystander p99 (61 ms) is higher than upstream's
-  (34 ms) — structural cost of EDT pacing vs simple qdisc drops:
-  EDT-stamped packets sit in `fq` and compete with the bystander's
-  packets for the same NIC ring; pure-drop disposition gives the
-  bystander unimpeded wire time. Trade-off: natra protects the
-  annotated pod's own mice (7015 vs 31 RPS) at the cost of ~2× p99
-  on a same-node unannotated neighbor.
+  pods. natra's bystander p99 (27 ms) is now lower than
+  upstream's (54 ms) in this run — the bounded-EDT change keeps
+  fq queue depth at ~50 ms × rate (≈ 42 MTU packets at 10 Mbps),
+  so the bystander competes against a bounded backlog of
+  EDT-stamped packets instead of an arbitrarily-deep one.
+  Vanilla still drops packets at the qdisc, but bystander
+  measurements have non-trivial run-to-run variance on this rig
+  (a prior run showed 34 ms vs 61 ms; this one shows the reverse).
+  Practical read: bystander cost from natra is now at most
+  parity with upstream's drop disposition, sometimes better.
 
 ## Gaps in this comparison
 

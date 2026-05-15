@@ -176,22 +176,23 @@ For per-pod tuning use the JSON annotation form
 
 ### Unannotated pod tail latency went up after enabling natra
 
-Expected — modest cost on same-node neighbors. natra's EDT-pacing
-disposition (`docs/ARCHITECTURE.md § Throttle disposition`) holds
-above-rate packets in `fq` and releases them on schedule rather
-than dropping them. The held packets still consume softirq time
-and NIC ring slots downstream, so a bystander pod sharing the
-node sees fractional p99 inflation. The perf-vs-vanilla mixed
-workload measures bystander p99 ≈ 61 ms under natra vs 34 ms
-under upstream's drop-based shaping.
+Should be small. natra's EDT-pacing disposition holds above-rate
+packets in `fq` rather than dropping them, which costs some softirq
+time when fq releases them. The 50 ms EDT-delay bound caps fq
+queue depth at ~42 MTU-sized packets per annotated pod at 10 Mbps,
+so the bystander backlog is bounded — measured perf-vs-vanilla
+shows bystander p99 ≈ 27 ms under natra vs 54 ms under upstream
+on the k3d colima rig (single sample, non-trivial run-to-run
+variance).
 
-If you need to optimize for bystanders rather than the annotated
-pod's own mice, switch `NATRA_EDT_PACING=off` on the installer
-DS — above-rate egress packets fall through to ECN-mark or drop
-just like ingress, matching upstream's "drop the excess" cost
-profile. The annotated pod's elephant cap stays correct; the
-trade-off is that its mice no longer get the 200× RPS gain
-EDT enables.
+If you still need to optimize purely for bystanders and don't
+care about the annotated pod's own mice surviving its own
+elephant, `NATRA_EDT_PACING=off` on the installer DS makes
+egress fall through to ECN-mark or drop like ingress, matching
+upstream's "drop the excess" cost profile. The annotated pod's
+elephant cap stays correct; the trade-off is that its mice no
+longer get the CMS-then-bucket fast-pass behavior under
+concurrent load.
 
 ## L4 e2e on the local rig
 
