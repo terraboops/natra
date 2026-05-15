@@ -1040,14 +1040,18 @@ echo "  natra mixed bystander rps=$natra_mixed_by_rps  p50=$natra_mixed_by_p50  
 # Failure modes: empty output means dump-stats can't find the pin
 # dir (natra wasn't attached) or the pod was already deleted.
 echo "==> natra dispositional stats (perf-server)"
+# natra pins by pod sandbox ID (the infra/pause container that CNI
+# wires up), not by the app container ID. status.containerStatuses
+# returns the latter; crictl pods --name surfaces the former.
 ps_node=$(kubectl get pod perf-server -n natra-e2e -o jsonpath='{.spec.nodeName}' 2>/dev/null)
-ps_cid=$(kubectl get pod perf-server -n natra-e2e -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null \
-            | sed 's|^containerd://||')
+if [ -n "$ps_node" ]; then
+    ps_cid=$(docker exec "$ps_node" crictl pods --name perf-server -q 2>/dev/null | head -1)
+fi
 if [ -n "$ps_node" ] && [ -n "$ps_cid" ]; then
     docker exec "$ps_node" /opt/cni/bin/natra dump-stats "$ps_cid" 2>&1 \
         | sed 's/^/  /' || echo "  (dump-stats failed)"
 else
-    echo "  (couldn't resolve perf-server node/containerID)"
+    echo "  (couldn't resolve perf-server node/sandbox-id)"
 fi
 
 k3d cluster delete "$NATRA_CLUSTER"
