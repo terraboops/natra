@@ -1043,9 +1043,14 @@ echo "==> natra dispositional stats (perf-server)"
 # natra pins by pod sandbox ID (the infra/pause container that CNI
 # wires up), not by the app container ID. status.containerStatuses
 # returns the latter; crictl pods --name surfaces the former.
+# k3s images don't pre-configure /etc/crictl.yaml, so pass the
+# k3s-specific containerd socket explicitly.
 ps_node=$(kubectl get pod perf-server -n natra-e2e -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+ps_cid=""
 if [ -n "$ps_node" ]; then
-    ps_cid=$(docker exec "$ps_node" crictl pods --name perf-server -q 2>/dev/null | head -1)
+    ps_cid=$(docker exec "$ps_node" crictl \
+            --runtime-endpoint unix:///run/k3s/containerd/containerd.sock \
+            pods --name perf-server -q 2>/dev/null | head -1)
 fi
 if [ -n "$ps_node" ] && [ -n "$ps_cid" ]; then
     docker exec "$ps_node" /opt/cni/bin/natra dump-stats "$ps_cid" 2>&1 \
