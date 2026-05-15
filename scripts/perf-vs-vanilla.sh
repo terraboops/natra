@@ -1030,6 +1030,26 @@ echo "  natra mixed iperf ingress=$natra_mixed_iperf_ing bps  egress=$natra_mixe
 echo "  natra mixed pod hey  rps=$natra_mixed_pod_rps  p50=$natra_mixed_pod_p50  p99=$natra_mixed_pod_p99"
 echo "  natra mixed bystander rps=$natra_mixed_by_rps  p50=$natra_mixed_by_p50  p99=$natra_mixed_by_p99"
 
+# Capture per-disposition stats from the annotated server pod. After
+# both Workload 1 (iperf-only sweep) and Workload 2 (mixed) have run,
+# the BPF stats map carries cumulative throttled / EDT_DELAYED /
+# ECN_MARKED / DROPPED counts. The ratio between them is the load-
+# bearing evidence that the bounded EDT (MAX_EDT_DELAYED_NS = 50 ms)
+# is doing what its design predicts: most above-rate packets EDT'd
+# within the window, occasional ECN-marks when the bound trips.
+# Failure modes: empty output means dump-stats can't find the pin
+# dir (natra wasn't attached) or the pod was already deleted.
+echo "==> natra dispositional stats (perf-server)"
+ps_node=$(kubectl get pod perf-server -n natra-e2e -o jsonpath='{.spec.nodeName}' 2>/dev/null)
+ps_cid=$(kubectl get pod perf-server -n natra-e2e -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null \
+            | sed 's|^containerd://||')
+if [ -n "$ps_node" ] && [ -n "$ps_cid" ]; then
+    docker exec "$ps_node" /opt/cni/bin/natra dump-stats "$ps_cid" 2>&1 \
+        | sed 's/^/  /' || echo "  (dump-stats failed)"
+else
+    echo "  (couldn't resolve perf-server node/containerID)"
+fi
+
 k3d cluster delete "$NATRA_CLUSTER"
 
 # ---- Phase B: upstream bandwidth plugin ----
