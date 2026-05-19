@@ -147,27 +147,29 @@ back. Read in three pieces:
 
 ## Gaps in this comparison
 
-What these numbers don't support, and what would close each:
+Cross-kernel wire is closed — `make perf-vs-vanilla-vm` runs the
+comparison on two real kernels over a real inter-VM wire (see
+"Two-kernel (vm-rig) results"). What these numbers still don't
+support:
 
-- **Real-NIC behavior**: TSO/GRO/LRO, hardware TX timestamping —
-  none exercised. The BPF programs see whatever GRO shape colima
-  produces. → cloud-VM or bare-metal rig.
-- **Cross-kernel wire**: k3d "nodes" share one Linux kernel; the
-  inter-node fabric is a software bridge. *Now covered* by
-  `make perf-vs-vanilla-vm` (two lima VMs, two real kernels, real
-  inter-VM vmnet wire — see "Two-kernel (vm-rig) results" below).
-  Real *hardware* NICs/switches still need cloud-VM/bare-metal.
-- **Run-to-run distribution**: single sample per cell. Re-run with
-  `PERF_RUNS=N` for mean ± stddev; full p50/p99/p100 histograms
-  aren't currently captured.
-- **>1 Gbps accuracy**: colima's host-gw caps single-stream at
-  ~1 Gbps. 10G annotation rows report behavior under the cap,
-  not throttle accuracy at 10 Gbps.
-- **cilium / aws-network-policy-agent composition**: claimed by
-  construction (bpf_mprog on kernel 6.6+), not measured. Needs a
-  cluster with cilium chained alongside natra.
+- **Hardware NIC / wire.** Both rigs use software networking
+  (k3d: docker bridge; vm-rig: vmnet). No hardware TSO/GRO/LRO,
+  no NIC TX timestamping, no real switch queueing. The vm-rig
+  software wire also tops out ~1.9 Gbps, so the 10G-annotation
+  rows test "doesn't break at 10G", not "caps accurately at
+  10G". Closing this needs cloud-VM or bare-metal with real
+  NICs, which isn't available.
+- **Run-to-run distribution.** One sample per cell; no
+  mean ± stddev or p50/p99/p100 histograms. The k3d script
+  takes `PERF_RUNS=N`; the vm-rig path measures once per phase.
+  No hardware needed to close — it's sampling cost.
+- **cilium / AWS NPA composition.** natra composes at the TCX
+  hook via bpf_mprog (kernel 6.6+) by construction; unmeasured.
+  Closing needs a cluster with cilium (also TCX) chained
+  alongside natra. cilium runs in kind/k3d/lima, so this is
+  local work, not cloud-bound.
 
-Plan to close: `docs/test-environments.md`.
+Escalation rigs: `docs/test-environments.md`.
 
 ## Two-kernel (vm-rig) results
 
