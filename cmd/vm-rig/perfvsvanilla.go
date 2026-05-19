@@ -9,107 +9,123 @@ import (
 	"time"
 )
 
-// cmdPerfVsVanilla is the planned local-developer driver for the
-// natra-vs-upstream-bandwidth comparison. The script equivalent is
-// scripts/perf-vs-vanilla.sh; that's the k3d path used in CI, where
-// "nodes" are containers in one shared kernel and the dataplane is
-// software-only.
+// cmdPerfVsVanilla is the local-developer driver for the
+// natra-vs-upstream-bandwidth comparison on two REAL kernels —
+// the cross-kernel measurement docs/perf-vs-vanilla.md's "Gaps"
+// section flagged as missing. The k3d counterpart
+// (scripts/perf-vs-vanilla.sh, `make perf-vs-vanilla`) is the
+// CI path: cheap, but "nodes" are containers in one shared
+// kernel. This is the high-fidelity path: two lima VMs, two
+// kernels, a real inter-VM vmnet wire.
 //
-// vm-rig perfvsvanilla will run the same three-phase comparison
-// (baseline / natra / upstream bandwidth) against the two-VM lima
-// cluster, where each "node" is a real Linux kernel with its own
-// veth+IFB. That's the comparison the docs/perf-vs-vanilla.md gaps
-// section calls "Cross-kernel wire" — currently a known unmet need
-// at the L4 e2e and k3d perf layers.
+// Three phases, each on its OWN pristine cluster (full
+// down → up → stage → measure → down per phase). It owns the VM
+// lifecycle itself — do NOT `vm-rig up` first; `make
+// perf-vs-vanilla-vm` just runs this subcommand.
 //
-// IMPLEMENTATION STATUS: scaffolding. Currently bails with a
-// blocker message if connectivity is dead, or "not yet implemented"
-// if it works. The phase code is intentionally absent — it'll get
-// filled in once the cross-VM connectivity blocker is unblocked
-// (see scripts/vm-rig/README.md "Cross-VM pod traffic blocker"
-// section for the unblock paths).
+//  1. baseline — k3s default. k3s v1.30+ bundles the upstream
+//     bandwidth plugin in its conflist, so the annotated
+//     perf-server already gets a TBF qdisc, but with kubelet's
+//     ~193 MB default burst → effectively unshaped over a short
+//     run. This is the congested-shared-wire reference, NOT an
+//     idle wire.
+//  2. vanilla — same bundled bandwidth plugin, but its per-pod
+//     TBF burst patched down to 1 MB via `limactl shell <vm>
+//     sudo tc` (each k8s node IS a VM here, so no k3d-style
+//     docker/nsenter dance). Elephant now actually capped.
+//  3. natra — cmdInstall chains natra; its CMS fast-passes the
+//     small fresh-flow HTTP requests around the token bucket
+//     while the elephant pays.
 //
-// Planned phases (mirror of scripts/perf-vs-vanilla.sh's structure):
+// Per phase: deploy perf-server (annotated 10M/10M, on the agent
+// VM) + perf-client (on the server VM, so traffic crosses the
+// kernel boundary), iperf3-warm + http-warm, then measure iperf3
+// elephant both directions + hey fresh-connection HTTP mice.
 //
-//  1. Baseline: uninstall natra DS, deploy unannotated server,
-//     measure iperf-only rate sweep + mixed workload. Captures the
-//     wire ceiling for the underlying lima/socket_vmnet path.
-//  2. natra: reinstall natra DS, deploy annotated server (both
-//     directions 10M), warmup buckets, measure same workloads.
-//  3. upstream bandwidth: replace natra's conflist with the
-//     upstream bandwidth chain (k3s already bundles it), warmup,
-//     measure same workloads. Apply the same TBF-burst patch the
-//     k3d script does (fix_vanilla_tbf_burst), reaching the lima
-//     VM netns via limactl shell + tc.
+// Independent clusters per phase deliberately trade ~3x bring-up
+// cost for zero cross-phase confound — no warm-cache / kernel-
+// state / ordering bias, which is required for the per-phase
+// *latency* numbers to mean anything.
 //
-// Phase 1 reuses the existing cmdUp/cmdInstall plumbing — it just
-// runs without the install step. Phase 2 is what `vm-rig test`
-// already exercises end-to-end. Phase 3 is the new work.
-//
-// Output: same comparison table shape as
-// /tmp/natra-perf-vs-vanilla-result.txt, written to a vm-rig-
-// specific path so the two rigs don't fight for the same file.
+// Output: a comparison table on stdout and at
+// /tmp/natra-vm-rig-perf-vs-vanilla-result.txt (distinct from the
+// k3d script's file so the two rigs don't clobber each other).
 func cmdPerfVsVanilla(c *Config) error {
-	if _, err := os.Stat(c.KubeconfigPath); err != nil {
-		return fmt.Errorf("%s not found — run 'vm-rig up' first", c.KubeconfigPath)
-	}
-	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
-
-	// Ensure the namespace exists (idempotent apply, same shape as
-	// cmdTest). Cross-VM connectivity is verified per-phase inside
-	// pvvMeasurePhase via waitForIperfConnect against perf-server
-	// once it's deployed — a probe here would race pod creation and
-	// reference pods that don't exist yet.
 	const namespace = "natra-vm-rig"
-	if err := kubectl(env,
-		strings.NewReader("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: "+namespace+"\n"),
-		"apply", "-f", "-"); err != nil {
-		return fmt.Errorf("create namespace %s: %w", namespace, err)
-	}
-	fmt.Println("==> [perfvsvanilla] namespace ready; starting three-phase comparison")
-
 	const serverNode = "lima-natra-server" // lima sets hostname to lima-<vm>
 	const workerNode = "lima-natra-agent"
 
-	// One two-VM cluster, shaper swapped in place across three
-	// phases. (k3d uses three throwaway clusters because they cost
-	// ~30s each; a real two-kernel vm-rig cluster costs minutes, so
-	// build-once / swap-shaper is both faster and a stricter
-	// comparison — identical kernels, wire, and pods, only the
-	// shaper changes.) Order baseline → vanilla → natra: vanilla's
-	// tc patch is transient (gone when the pod is recreated); natra
-	// installs a persistent DaemonSet + conflist, so it goes last
-	// and never needs uninstalling.
-	if err := importImage(c, c.PerfclientImage, "Dockerfile.perfclient"); err != nil {
-		return fmt.Errorf("import perfclient image: %w", err)
+	// Each phase runs on its OWN pristine two-VM cluster: full
+	// down → up → stage → measure → down. This costs 3x bring-up
+	// (~12-15 min each on the static-IP architecture) but is the
+	// only design that supports trustworthy per-phase *latency*
+	// numbers: a shared, fixed-order, no-teardown cluster leaks
+	// warm page/containerd cache, accumulated kernel networking
+	// state, and natra's persistent BPF into later phases, so the
+	// last phase (warm) is unfairly faster than the first (cold).
+	// Independent clusters also dissolve the phase-ordering
+	// constraint — each phase is self-contained, order-irrelevant.
+	phases := []struct {
+		name  string
+		natra bool         // cmdInstall (chain natra) before measuring
+		setup func() error // shaper hook, runs after pods are Ready
+	}{
+		{"baseline", false, nil},
+		{"vanilla", false, func() error { return pvvPatchVanillaTBF(c) }},
+		{"natra", true, nil},
 	}
 
-	var results []pvvResult
-
-	base, err := pvvMeasurePhase(c, env, namespace, serverNode, workerNode, "baseline", nil)
-	if err != nil {
-		return fmt.Errorf("baseline phase: %w", err)
+	results := make([]pvvResult, 0, len(phases))
+	for _, ph := range phases {
+		fmt.Printf("\n========== PHASE %s — fresh cluster ==========\n", ph.name)
+		r, err := pvvRunPhase(c, namespace, serverNode, workerNode, ph.name, ph.natra, ph.setup)
+		if err != nil {
+			return fmt.Errorf("%s phase: %w", ph.name, err)
+		}
+		results = append(results, r)
 	}
-	results = append(results, base)
-
-	van, err := pvvMeasurePhase(c, env, namespace, serverNode, workerNode, "vanilla",
-		func() error { return pvvPatchVanillaTBF(c) })
-	if err != nil {
-		return fmt.Errorf("vanilla phase: %w", err)
-	}
-	results = append(results, van)
-
-	fmt.Println("==> [natra] installing natra (DaemonSet + chained conflist)")
-	if err := cmdInstall(c); err != nil {
-		return fmt.Errorf("natra install: %w", err)
-	}
-	nat, err := pvvMeasurePhase(c, env, namespace, serverNode, workerNode, "natra", nil)
-	if err != nil {
-		return fmt.Errorf("natra phase: %w", err)
-	}
-	results = append(results, nat)
-
 	return pvvReport(results)
+}
+
+// pvvRunPhase stands up a pristine two-VM cluster, optionally
+// installs natra, deploys the workload, measures, and ALWAYS tears
+// the cluster down (even on error) so zero state leaks into the
+// next phase. The defer guarantees teardown on every exit path —
+// a half-measured phase must not pollute the next one.
+func pvvRunPhase(c *Config, namespace, serverNode, workerNode, phase string,
+	withNatra bool, setup func() error) (pvvResult, error) {
+	var r pvvResult
+	r.phase = phase
+
+	// Clean any stale instance first so cmdUp builds genuinely
+	// fresh (cmdUp skips create when the instance already exists).
+	_ = cmdDown(c)
+	defer func() {
+		fmt.Printf("==> [%s] tearing down cluster\n", phase)
+		_ = cmdDown(c)
+	}()
+
+	fmt.Printf("==> [%s] bringing up a fresh two-VM cluster\n", phase)
+	if err := cmdUp(c); err != nil {
+		return r, fmt.Errorf("cluster up: %w", err)
+	}
+
+	if withNatra {
+		fmt.Printf("==> [%s] installing natra (image + chained conflist)\n", phase)
+		if err := cmdInstall(c); err != nil { // imports natra + perfclient, applies DS
+			return r, fmt.Errorf("natra install: %w", err)
+		}
+	} else if err := importImage(c, c.PerfclientImage, "Dockerfile.perfclient"); err != nil {
+		return r, fmt.Errorf("import perfclient image: %w", err)
+	}
+
+	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
+	if err := kubectl(env,
+		strings.NewReader("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: "+namespace+"\n"),
+		"apply", "-f", "-"); err != nil {
+		return r, fmt.Errorf("create namespace %s: %w", namespace, err)
+	}
+	return pvvMeasurePhase(c, env, namespace, serverNode, workerNode, phase, setup)
 }
 
 // pvvResult is one phase's measurement of the annotated perf-server
@@ -216,6 +232,16 @@ func pvvMeasurePhase(c *Config, env []string, namespace, serverNode, workerNode,
 		}
 		*leg.dst = ir.End.SumReceived.BitsPerSecond
 	}
+
+	// HTTP warmup before the measured hey: prime nginx, the
+	// perf-client tools image, conntrack, and the CMS/bucket so
+	// the measured window is steady-state, not first-touch. (With
+	// fresh-cluster-per-phase every phase is equally cold so this
+	// no longer corrects an asymmetry — but it still removes
+	// first-touch noise from each phase's own number.)
+	fmt.Printf("==> [%s/hey] warming up HTTP path\n", phase)
+	_, _ = captureKubectl(env, "exec", "-n", namespace, "perf-client", "-c", "tools", "--",
+		"hey", "-z", "5s", "-c", "50", "-disable-keepalive", "http://perf-server:80/")
 
 	fmt.Printf("==> [%s/hey] measuring HTTP mice (fresh-conn, CMS fast-pass)\n", phase)
 	const heyDur = 15

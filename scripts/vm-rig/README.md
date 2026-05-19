@@ -112,8 +112,8 @@ Subcommands:
   up             bring up the two-VM k3s cluster
   install        build and import the natra image, apply installer
   test           iperf throttle + hey HTTP-mice fast-pass assertions
-  perfvsvanilla  baseline/natra/upstream-bandwidth comparison on
-                 the live two-kernel cluster (run after `up`)
+  perfvsvanilla  baseline/natra/upstream-bandwidth comparison;
+                 owns the VM lifecycle (fresh cluster per phase)
   down           tear down both VMs
   all            up + install + test (down on exit unless -keep)
 
@@ -126,18 +126,24 @@ Environment:
 `perfvsvanilla` is the local-developer counterpart of the k3d
 `make perf-vs-vanilla` — same baseline/natra/upstream-bandwidth
 comparison, but on two real kernels instead of containers sharing
-one. It runs against the live cluster from `up` and swaps the
-shaper in place across three phases (build-once / swap-shaper
-rather than k3d's three throwaway clusters — a vm-rig cluster
-costs minutes, not seconds, and the in-place swap is a stricter
-comparison: identical kernels, wire, and pods, only the shaper
-changes). Phase order baseline → vanilla → natra: vanilla's tc
-burst patch is transient, natra installs a persistent
-DaemonSet/conflist so it goes last. Run it with:
+one. It **owns the VM lifecycle**: each phase runs on its own
+pristine cluster (full down → up → stage → measure → down), so
+do not `vm-rig up` first.
+
+Independent clusters per phase is a deliberate cost/correctness
+trade. An earlier design swapped the shaper in place on one
+shared cluster — cheaper, but it leaked warm page/containerd
+cache, accumulated kernel networking state, and natra's
+persistent BPF into later phases, so the last (warm) phase was
+unfairly faster than the first (cold). That's fatal for the
+per-phase *latency* numbers. Fresh-cluster-per-phase removes
+every cross-phase confound (and dissolves the phase-ordering
+constraint — phases are now independent) at the price of ~3x
+bring-up (~40 min total on the static-IP architecture).
 
 ```
-make perf-vs-vanilla-vm      # vm-rig up + perfvsvanilla
-# or, against an already-up rig:
+make perf-vs-vanilla-vm                 # owns lifecycle, no `up` first
+# equivalently:
 go run ./cmd/vm-rig perfvsvanilla
 ```
 
@@ -213,9 +219,9 @@ Both exist on purpose, different cost/fidelity trade-offs:
   containers as nodes, one shared colima kernel. Cheap, fast,
   runs in CI. Single-kernel — no real cross-kernel wire.
 - **`make perf-vs-vanilla-vm`** (`cmd/vm-rig perfvsvanilla`):
-  two lima VMs, two real kernels, real inter-VM vmnet wire.
-  Minutes to stand up; the high-fidelity local-dev rig. This is
-  the cross-kernel measurement the k3d "Gaps in this comparison"
+  two lima VMs, two real kernels, real inter-VM vmnet wire, a
+  fresh cluster per phase (~40 min). The high-fidelity local-dev
+  rig. This is the cross-kernel measurement the k3d "Gaps in this comparison"
   note (`docs/perf-vs-vanilla.md`) called out as missing.
 
 The k3d path stays the CI path (no nested virt on GH runners).
