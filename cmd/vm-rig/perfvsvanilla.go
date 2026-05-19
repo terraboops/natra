@@ -55,27 +55,18 @@ func cmdPerfVsVanilla(c *Config) error {
 	}
 	env := []string{"KUBECONFIG=" + c.KubeconfigPath}
 
-	// Connectivity gate: cross-VM iperf must work for the comparison
-	// to mean anything. If it doesn't, every "measured" cell will be
-	// 0 bps and the comparison is noise. The gate's failure mode is
-	// the cross-VM connectivity blocker documented in
-	// scripts/vm-rig/README.md; we emit a clear pointer to that and
-	// bail rather than producing a misleading zero-row table.
+	// Ensure the namespace exists (idempotent apply, same shape as
+	// cmdTest). Cross-VM connectivity is verified per-phase inside
+	// pvvMeasurePhase via waitForIperfConnect against perf-server
+	// once it's deployed — a probe here would race pod creation and
+	// reference pods that don't exist yet.
 	const namespace = "natra-vm-rig"
-	const probeTarget = "iperf-server"
-	fmt.Println("==> [perfvsvanilla] probing cross-VM pod connectivity")
-	if err := waitForIperfConnect(env, namespace, probeTarget, 10); err != nil {
-		return fmt.Errorf(
-			"cross-VM iperf probe failed: %w\n"+
-				"  vm-rig perfvsvanilla needs cross-VM pod traffic to work. The\n"+
-				"  current macOS+lima+Debian rig has a known blocker; see\n"+
-				"  scripts/vm-rig/README.md '### Cross-VM pod traffic blocker'\n"+
-				"  for the three plausible unblock paths.\n"+
-				"  Workaround for now: use the k3d-based comparison instead:\n"+
-				"    make perf-vs-vanilla", err)
+	if err := kubectl(env,
+		strings.NewReader("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: "+namespace+"\n"),
+		"apply", "-f", "-"); err != nil {
+		return fmt.Errorf("create namespace %s: %w", namespace, err)
 	}
-
-	fmt.Println("==> [perfvsvanilla] cross-VM connectivity OK")
+	fmt.Println("==> [perfvsvanilla] namespace ready; starting three-phase comparison")
 
 	const serverNode = "lima-natra-server" // lima sets hostname to lima-<vm>
 	const workerNode = "lima-natra-agent"
@@ -173,8 +164,28 @@ func pvvMeasurePhase(c *Config, env []string, namespace, serverNode, workerNode,
 		}
 	}
 
-	if err := waitForIperfConnect(env, namespace, "perf-server", 30); err != nil {
-		return r, fmt.Errorf("cross-VM connectivity: %w", err)
+	// Cross-VM connectivity gate (pvv uses perf-client/tools →
+	// perf-server, not test.go's iperf-client convention, so we
+	// can't reuse waitForIperfConnect). Poll a 1s iperf3 until it
+	// reports nonzero throughput or attempts run out.
+	connected := false
+	for i := 0; i < 30; i++ {
+		out, perr := captureKubectl(env, "exec", "-n", namespace,
+			"perf-client", "-c", "tools", "--",
+			"iperf3", "-c", "perf-server", "-t", "1", "-J")
+		if perr == nil {
+			var ir iperfResult
+			if json.Unmarshal([]byte(out), &ir) == nil &&
+				ir.End.SumReceived.BitsPerSecond > 0 {
+				connected = true
+				break
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !connected {
+		return r, fmt.Errorf("[%s] cross-VM pod traffic never came up "+
+			"(perf-client → perf-server)", phase)
 	}
 
 	// Warm up: drain the initial token/burst allowance in both
