@@ -164,10 +164,14 @@ support:
   takes `PERF_RUNS=N`; the vm-rig path measures once per phase.
   No hardware needed to close — it's sampling cost.
 - **cilium / AWS NPA composition.** natra composes at the TCX
-  hook via bpf_mprog (kernel 6.6+) by construction; unmeasured.
-  Closing needs a cluster with cilium (also TCX) chained
-  alongside natra. cilium runs in kind/k3d/lima, so this is
-  local work, not cloud-bound.
+  hook via bpf_mprog (kernel 6.6+) by construction; the rig to
+  measure it is `make cilium-compose` (`scripts/cilium-compose.sh`
+  — k3d, cilium as the CNI with kube-proxy/flannel disabled,
+  natra chained after it, asserting both programs sit at the pod
+  TCX hook and natra still rate-limits). Scaffold landed;
+  end-to-end verification pending (the natra-installer conflist
+  patch was written against flannel and may need work for
+  cilium's conflist shape).
 
 Escalation rigs: `docs/test-environments.md`.
 
