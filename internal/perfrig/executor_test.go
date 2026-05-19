@@ -3,22 +3,46 @@ package perfrig
 import (
 	"bytes"
 	"context"
+	"io"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// repoRoot returns the natra/ root for the test, derived from this
+// source file's location. Lets stagePhase render real manifests
+// even though kubectl is stubbed.
+func repoRoot() string {
+	_, here, _, _ := runtime.Caller(0)
+	return filepath.Join(filepath.Dir(here), "..", "..")
+}
+
+// planContractOnly is a workload-less Plan, used by the phase-
+// loop tests so they don't touch real kubectl. Constructed
+// directly rather than via Apply (which rightly rejects empty
+// workloads) — these tests are about the substrate call sequence,
+// not the workload code.
+func planContractOnly() Plan {
+	return Plan{
+		Phases:    DefaultSpec.Phases,
+		Rates:     []Rate{Rate10M},
+		Workloads: nil,
+		Samples:   1,
+		Profile:   "test",
+	}
+}
 
 // TestExecutor_FreshClusterPerPhase — the executor's central
 // contract. Each phase must see Down → Up at the top and a
 // trailing Down at the bottom, regardless of phase. Tested via
 // the call log on the fake substrate.
 func TestExecutor_FreshClusterPerPhase(t *testing.T) {
+	withStubKubectl(t)
 	fake := NewFakeSubstrate()
-	plan, err := Apply(DefaultSpec, ProfileCI)
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
+	plan := planContractOnly()
 	var logBuf bytes.Buffer
-	e := &Executor{Plan: plan, Substrate: fake, Log: &logBuf}
+	e := &Executor{Plan: plan, Substrate: fake, RepoRoot: repoRoot(), Log: &logBuf}
 	if _, err := e.Run(context.Background()); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -54,13 +78,11 @@ func TestExecutor_FreshClusterPerPhase(t *testing.T) {
 // fresh-cluster contract, not order. But the test pins the
 // expected sequence so accidental reordering shows up in the diff.
 func TestExecutor_PhaseOrder(t *testing.T) {
+	withStubKubectl(t)
 	fake := NewFakeSubstrate()
-	plan, err := Apply(DefaultSpec, ProfileCI)
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
+	plan := planContractOnly()
 	var logBuf bytes.Buffer
-	e := &Executor{Plan: plan, Substrate: fake, Log: &logBuf}
+	e := &Executor{Plan: plan, Substrate: fake, RepoRoot: repoRoot(), Log: &logBuf}
 	rep, err := e.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -84,20 +106,20 @@ func TestExecutor_PhaseOrder(t *testing.T) {
 // appear in every phase's report (so the report writer can render
 // every cell, even if a workload's data is empty pending wiring).
 func TestExecutor_WorkloadsRecorded(t *testing.T) {
+	withStubKubectl(t)
 	fake := NewFakeSubstrate()
-	plan, err := Apply(DefaultSpec, ProfileCI)
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	e := &Executor{Plan: plan, Substrate: fake, Log: &bytes.Buffer{}}
+	// Workload-less plan: the workload dispatch is exercised by the
+	// individual workload tests; this one only asserts the phase
+	// loop preserves the empty workload list per phase.
+	plan := planContractOnly()
+	e := &Executor{Plan: plan, Substrate: fake, RepoRoot: repoRoot(), Log: &bytes.Buffer{}}
 	rep, err := e.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	for _, p := range rep.Phases {
-		if len(p.Workloads) != len(plan.Workloads) {
-			t.Errorf("phase %s: got %d workloads, want %d",
-				p.Phase, len(p.Workloads), len(plan.Workloads))
+		if len(p.Workloads) != 0 {
+			t.Errorf("phase %s: got %d workloads, want 0 (none in plan)", p.Phase, len(p.Workloads))
 		}
 	}
 }
@@ -107,14 +129,12 @@ func TestExecutor_WorkloadsRecorded(t *testing.T) {
 // starts from a clean slate. The fresh-cluster guarantee has to
 // hold on the error path too, not just the happy path.
 func TestExecutor_DeferredDownOnError(t *testing.T) {
+	withStubKubectl(t)
 	fake := NewFakeSubstrate()
 	fake.UpErr = errBoom
-	plan, err := Apply(DefaultSpec, ProfileCI)
-	if err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-	e := &Executor{Plan: plan, Substrate: fake, Log: &bytes.Buffer{}}
-	_, err = e.Run(context.Background())
+	plan := planContractOnly()
+	e := &Executor{Plan: plan, Substrate: fake, RepoRoot: repoRoot(), Log: &bytes.Buffer{}}
+	_, err := e.Run(context.Background())
 	if err == nil {
 		t.Fatal("Run with Up error: expected error, got nil")
 	}
@@ -142,3 +162,25 @@ var errBoom = &boomError{}
 type boomError struct{}
 
 func (*boomError) Error() string { return "boom" }
+
+// withStubKubectl swaps the package-level kubectl/captureKubectl
+// for no-ops + a tiny canned iperf JSON, restoring on test
+// cleanup. The phase-contract tests do not exercise the workload
+// code, but stagePhase calls kubectl for the namespace + manifest
+// apply + wait; this stub keeps them honest about the call shape
+// without needing a real cluster.
+func withStubKubectl(t *testing.T) {
+	t.Helper()
+	prevK := kubectl
+	prevC := captureKubectl
+	kubectl = func(_ context.Context, _ string, _ io.Reader, _ ...string) error { return nil }
+	captureKubectl = func(_ context.Context, _ string, _ ...string) (string, error) {
+		// Connectivity-gate poll expects nonzero
+		// end.sum_received.bits_per_second to declare "connected".
+		return `{"end":{"sum_received":{"bits_per_second":1.0}}}`, nil
+	}
+	t.Cleanup(func() {
+		kubectl = prevK
+		captureKubectl = prevC
+	})
+}

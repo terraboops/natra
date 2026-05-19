@@ -22,8 +22,29 @@ import (
 type Executor struct {
 	Plan      Plan
 	Substrate Substrate
-	// Log is where progress prints; nil → os.Stdout via the rig's
-	// CLI. The executor is otherwise side-effect-free in tests.
+
+	// RepoRoot is the absolute path to natra/ on the machine
+	// orchestrating the run. The executor opens manifest templates
+	// under test/perf/realworld/ relative to this.
+	RepoRoot string
+
+	// Namespace is the workload namespace. Created once per phase
+	// after the fresh cluster comes up. Default "natra-perfrig".
+	Namespace string
+
+	// PerfclientImage is the iperf3+hey image tag that's been
+	// imported into the substrate's nodes. The perf-server /
+	// perf-client manifests reference it via the template
+	// placeholder.
+	PerfclientImage string
+
+	// MemoryNPodCount is the N in the memory workload's 1→N pod
+	// slope. Default 8; configurable so a future tighter or looser
+	// pod sweep can be requested without re-coding.
+	MemoryNPodCount int
+
+	// Log is where progress prints; nil silences. The executor is
+	// otherwise side-effect-free in tests.
 	Log io.Writer
 }
 
@@ -47,15 +68,13 @@ func (e *Executor) Run(ctx context.Context) (Report, error) {
 }
 
 // runPhase implements the fresh-cluster contract: down → up →
-// optionally install → workloads → down (always). The deferred
-// Down catches the error path so a workload failure never leaves
-// a stale cluster to bias the next phase.
+// optionally install → stage workload pods → workloads → down
+// (always). The deferred Down catches the error path so a workload
+// failure never leaves a stale cluster to bias the next phase.
 func (e *Executor) runPhase(ctx context.Context, phase Phase) (PhaseReport, error) {
 	pr := PhaseReport{Phase: phase}
 
-	// Clean any pre-existing cluster so Up genuinely starts fresh.
-	_ = e.Substrate.Down(ctx)
-
+	_ = e.Substrate.Down(ctx) // wipe any stale state before Up
 	defer func() {
 		e.logf("==> [%s] tearing down cluster\n", phase)
 		_ = e.Substrate.Down(ctx)
@@ -73,17 +92,41 @@ func (e *Executor) runPhase(ctx context.Context, phase Phase) (PhaseReport, erro
 		}
 	}
 
-	// Workloads land in the next slice; for now the phase loop just
-	// proves the fresh-cluster contract end-to-end and records that
-	// each workload was visited. The TODO is deliberate and visible
-	// — anything missing in the report will surface as zeros, which
-	// the report writer flags.
-	for _, w := range e.Plan.Workloads {
-		e.logf("==> [%s] workload %s (samples=%d) — pending wiring\n", phase, w, e.Plan.Samples)
-		pr.Workloads = append(pr.Workloads, WorkloadReport{Kind: w})
+	// One-time per-phase stage: namespace, perf-server, perf-client,
+	// connectivity gate, vanilla TBF patch (vanilla phase only), and
+	// warmup. Done once so the workloads below run against a stable
+	// steady state.
+	if err := e.stagePhase(ctx, phase); err != nil {
+		return pr, fmt.Errorf("stage phase: %w", err)
 	}
 
+	for _, w := range e.Plan.Workloads {
+		e.logf("==> [%s] workload %s (samples=%d)\n", phase, w, e.Plan.Samples)
+		wr, err := e.runWorkload(ctx, phase, w)
+		if err != nil {
+			return pr, fmt.Errorf("workload %s: %w", w, err)
+		}
+		pr.Workloads = append(pr.Workloads, wr)
+	}
 	return pr, nil
+}
+
+// runWorkload dispatches to the per-workload implementation. New
+// workloads add a case here and a workload_*.go file; the
+// interface for each is uniform — they return a fully-populated
+// WorkloadReport for the (phase, plan) combination.
+func (e *Executor) runWorkload(ctx context.Context, phase Phase, kind WorkloadKind) (WorkloadReport, error) {
+	wr := WorkloadReport{Kind: kind}
+	switch kind {
+	case WorkloadIperfSweep:
+		return e.runIperfSweep(ctx, phase)
+	case WorkloadMixed:
+		return e.runMixed(ctx, phase)
+	case WorkloadMemory:
+		return e.runMemory(ctx, phase)
+	default:
+		return wr, fmt.Errorf("unknown workload kind %q", kind)
+	}
 }
 
 func (e *Executor) logf(format string, args ...any) {
