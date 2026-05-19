@@ -5,17 +5,14 @@ k3d rig. Same workloads against three configurations: baseline
 (no rate-limiter), natra, upstream token-bucket qdisc (HTB in
 v1.5.1, TBF in v1.6.0+).
 
-This doc covers the k3d-based comparison (single Linux kernel,
-software dataplane on colima/LinuxKit). For a real-kernel-isolated
-measurement of natra alone — two lima VMs, each running its own
-kernel, joined into one k3s cluster — see
-`scripts/vm-rig/README.md`. The vm-rig runs the bidi-iperf and
-hey-HTTP-mice assertions against the cross-VM virtual NIC pair;
-cross-VM pod traffic is currently blocked on a Debian/networkd
-DHCP issue under lima (see the vm-rig README for the unblock
-paths). Once unblocked, the vm-rig will gain a `perf-vs-vanilla`
-subcommand and become the local-developer driver, with the k3d
-script reserved for CI.
+This doc's main tables are the k3d-based comparison (single Linux
+kernel, software dataplane on colima/LinuxKit). The same
+three-phase comparison now also runs on **two real kernels** via
+the vm-rig (`make perf-vs-vanilla-vm`; two lima VMs, each its own
+kernel, real inter-VM vmnet wire) — the cross-kernel measurement
+the "Gaps" section below long flagged as missing. See
+`scripts/vm-rig/README.md` for the rig; results below under
+"Two-kernel (vm-rig) results".
 
 ## Setup
 
@@ -156,9 +153,10 @@ What these numbers don't support, and what would close each:
   none exercised. The BPF programs see whatever GRO shape colima
   produces. → cloud-VM or bare-metal rig.
 - **Cross-kernel wire**: k3d "nodes" share one Linux kernel; the
-  inter-node fabric is a software bridge, not a switch. ECN-CE
-  fires but no router queues. → `make test-vm` (lima two-VM rig,
-  partial coverage), cloud-VM (full).
+  inter-node fabric is a software bridge. *Now covered* by
+  `make perf-vs-vanilla-vm` (two lima VMs, two real kernels, real
+  inter-VM vmnet wire — see "Two-kernel (vm-rig) results" below).
+  Real *hardware* NICs/switches still need cloud-VM/bare-metal.
 - **Run-to-run distribution**: single sample per cell. Re-run with
   `PERF_RUNS=N` for mean ± stddev; full p50/p99/p100 histograms
   aren't currently captured.
@@ -170,6 +168,40 @@ What these numbers don't support, and what would close each:
   cluster with cilium chained alongside natra.
 
 Plan to close: `docs/test-environments.md`.
+
+## Two-kernel (vm-rig) results
+
+`make perf-vs-vanilla-vm` — two lima VMs, each its own Linux
+kernel (Debian 13, 6.12), joined into one k3s cluster over a real
+inter-VM vmnet wire. perf-server (annotated 10M/10M) on the agent
+VM, perf-client on the server VM, so every packet crosses the
+kernel boundary. iperf3 elephant (receiver-side bps) + hey
+fresh-connection HTTP mice. One sample:
+
+| Phase    | iperf ing  | iperf eg   | hey rps | p50 ms | p99 ms |
+|----------|------------|------------|---------|--------|--------|
+| baseline | 21.17 Mbps | 20.76 Mbps |    1057 |   47.4 |   48.3 |
+| vanilla  | 10.07 Mbps | 10.07 Mbps |    1057 |   47.4 |   48.3 |
+| natra    | 10.25 Mbps | 10.07 Mbps |   16386 |    2.9 |    6.7 |
+
+Reads the same as the k3d story, now on real kernels:
+
+- **Elephant cap.** natra (~10/10) holds the annotation as
+  tightly as the upstream token bucket (~10/10); baseline is the
+  ~21 Mbps vmnet wire ceiling.
+- **Mice survival.** At the *same* elephant cap, natra serves
+  16386 hey rps @ 6.7 ms p99 vs upstream's 1057 @ 48 ms — ~15×
+  RPS, ~7× lower tail. CMS fast-passes the small fresh-flow
+  requests around the bucket; the upstream single bucket queues
+  them behind the elephant.
+- **Caveat.** vanilla's hey row is identical to baseline's to
+  the decimal (1057 / 47.4 / 48.3). The elephant clearly shaped
+  (21→10), so the TBF burst patch engaged — but the exact match
+  suggests hey under baseline/vanilla is pinned by the same
+  contention bottleneck (mice starved either way), not that
+  vanilla measurement failed. Single sample; worth a second run
+  and a closer look at that one cell. The natra-vs-upstream
+  contrast is unambiguous regardless.
 
 ## Throttle disposition
 
