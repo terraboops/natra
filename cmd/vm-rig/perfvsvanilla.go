@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -74,10 +75,23 @@ func cmdPerfVsVanilla(c *Config) error {
 		{"natra", true, nil},
 	}
 
+	// PVV_RUNS: measurement samples per phase (deploy + warmup once
+	// per fresh cluster, then measure N times). >1 → the report
+	// shows mean ± stddev so run-to-run variance is visible. The
+	// cluster is still fresh per *phase* (cross-phase isolation);
+	// repeated samples capture within-phase measurement noise.
+	runs := 1
+	if v := os.Getenv("PVV_RUNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runs = n
+		}
+	}
+	fmt.Printf("==> [perfvsvanilla] %d sample(s) per phase\n", runs)
+
 	results := make([]pvvResult, 0, len(phases))
 	for _, ph := range phases {
 		fmt.Printf("\n========== PHASE %s — fresh cluster ==========\n", ph.name)
-		r, err := pvvRunPhase(c, namespace, serverNode, workerNode, ph.name, ph.natra, ph.setup)
+		r, err := pvvRunPhase(c, namespace, serverNode, workerNode, ph.name, ph.natra, ph.setup, runs)
 		if err != nil {
 			return fmt.Errorf("%s phase: %w", ph.name, err)
 		}
@@ -86,13 +100,34 @@ func cmdPerfVsVanilla(c *Config) error {
 	return pvvReport(results)
 }
 
+// meanStd returns the arithmetic mean and the sample standard
+// deviation (n-1). std is 0 for fewer than two samples.
+func meanStd(xs []float64) (mean, std float64) {
+	if len(xs) == 0 {
+		return 0, 0
+	}
+	for _, x := range xs {
+		mean += x
+	}
+	mean /= float64(len(xs))
+	if len(xs) < 2 {
+		return mean, 0
+	}
+	var v float64
+	for _, x := range xs {
+		d := x - mean
+		v += d * d
+	}
+	return mean, math.Sqrt(v / float64(len(xs)-1))
+}
+
 // pvvRunPhase stands up a pristine two-VM cluster, optionally
 // installs natra, deploys the workload, measures, and ALWAYS tears
 // the cluster down (even on error) so zero state leaks into the
 // next phase. The defer guarantees teardown on every exit path —
 // a half-measured phase must not pollute the next one.
 func pvvRunPhase(c *Config, namespace, serverNode, workerNode, phase string,
-	withNatra bool, setup func() error) (pvvResult, error) {
+	withNatra bool, setup func() error, runs int) (pvvResult, error) {
 	var r pvvResult
 	r.phase = phase
 
@@ -124,18 +159,19 @@ func pvvRunPhase(c *Config, namespace, serverNode, workerNode, phase string,
 		"apply", "-f", "-"); err != nil {
 		return r, fmt.Errorf("create namespace %s: %w", namespace, err)
 	}
-	return pvvMeasurePhase(c, env, namespace, serverNode, workerNode, phase, setup)
+	return pvvMeasurePhase(c, env, namespace, serverNode, workerNode, phase, setup, runs)
 }
 
-// pvvResult is one phase's measurement of the annotated perf-server
-// (10M ingress + egress) on the real two-kernel cluster.
+// pvvResult holds one phase's measurement samples (one entry per
+// PVV_RUNS iteration) of perf-server on the real two-kernel
+// cluster. The report aggregates to mean ± stddev.
 type pvvResult struct {
-	phase     string
-	ingestBps float64 // forward iperf3 → server ingress
-	egressBps float64 // reverse iperf3 -R → server egress
-	heyRPS    float64
-	heyP50ms  float64
-	heyP99ms  float64
+	phase  string
+	ingest []float64 // forward iperf3 → server ingress, bps
+	egress []float64 // reverse iperf3 -R → server egress, bps
+	heyRPS []float64
+	heyP50 []float64 // ms
+	heyP99 []float64 // ms
 }
 
 // pvvMeasurePhase (re)deploys perf-server + perf-client, runs the
@@ -144,7 +180,7 @@ type pvvResult struct {
 // Recreating the pods each phase guarantees a fresh CNI ADD so the
 // phase's shaper attaches cleanly.
 func pvvMeasurePhase(c *Config, env []string, namespace, serverNode, workerNode, phase string,
-	setup func() error) (pvvResult, error) {
+	setup func() error, runs int) (pvvResult, error) {
 	var r pvvResult
 	r.phase = phase
 	fmt.Printf("\n==> [%s] (re)deploying perf-server + perf-client\n", phase)
@@ -222,62 +258,68 @@ func pvvMeasurePhase(c *Config, env []string, namespace, serverNode, workerNode,
 			"(perf-client → perf-server)", phase)
 	}
 
-	// Warm up: drain the initial token/burst allowance in both
-	// directions so the measured second reflects steady state.
-	fmt.Printf("==> [%s] warming up (draining burst, both directions)\n", phase)
+	// One-time warmup (NOT per sample): drain the iperf burst in
+	// both directions and prime the HTTP path (nginx, conntrack,
+	// CMS/bucket) so every sample below is steady-state.
+	fmt.Printf("==> [%s] warming up (iperf burst both directions + HTTP)\n", phase)
 	_ = kubectl(env, nil, "exec", "-n", namespace, "perf-client", "-c", "tools", "--",
 		"iperf3", "-c", "perf-server", "-t", "20", "-P", "4")
 	_ = kubectl(env, nil, "exec", "-n", namespace, "perf-client", "-c", "tools", "--",
 		"iperf3", "-c", "perf-server", "-t", "20", "-P", "4", "-R")
-
-	for _, leg := range []struct {
-		label string
-		args  []string
-		dst   *float64
-	}{
-		{"ingress", []string{"iperf3", "-c", "perf-server", "-t", "15", "-J"}, &r.ingestBps},
-		{"egress", []string{"iperf3", "-c", "perf-server", "-t", "15", "-R", "-J"}, &r.egressBps},
-	} {
-		fmt.Printf("==> [%s/%s] measuring elephant\n", phase, leg.label)
-		args := append([]string{"exec", "-n", namespace, "perf-client", "-c", "tools", "--"}, leg.args...)
-		out, err := captureKubectl(env, args...)
-		if err != nil {
-			return r, fmt.Errorf("%s iperf: %w", leg.label, err)
-		}
-		var ir iperfResult
-		if err := json.Unmarshal([]byte(out), &ir); err != nil {
-			return r, fmt.Errorf("parse %s iperf JSON: %w", leg.label, err)
-		}
-		*leg.dst = ir.End.SumReceived.BitsPerSecond
-	}
-
-	// HTTP warmup before the measured hey: prime nginx, the
-	// perf-client tools image, conntrack, and the CMS/bucket so
-	// the measured window is steady-state, not first-touch. (With
-	// fresh-cluster-per-phase every phase is equally cold so this
-	// no longer corrects an asymmetry — but it still removes
-	// first-touch noise from each phase's own number.)
-	fmt.Printf("==> [%s/hey] warming up HTTP path\n", phase)
 	_, _ = captureKubectl(env, "exec", "-n", namespace, "perf-client", "-c", "tools", "--",
 		"hey", "-z", "5s", "-c", "50", "-disable-keepalive", "http://perf-server:80/")
 
-	fmt.Printf("==> [%s/hey] measuring HTTP mice (fresh-conn, CMS fast-pass)\n", phase)
+	// Sample loop: deploy + warmup happened once on this fresh
+	// cluster; repeat the measurement `runs` times to capture
+	// run-to-run variance (reported as mean ± stddev).
 	const heyDur = 15
-	heyOut, err := captureKubectl(env,
-		"exec", "-n", namespace, "perf-client", "-c", "tools", "--",
-		"hey", "-z", strconv.Itoa(heyDur)+"s", "-c", "50",
-		"-disable-keepalive", "-o", "csv", "http://perf-server:80/")
-	if err != nil {
-		return r, fmt.Errorf("hey: %w", err)
+	measureIperf := func(label string, args ...string) (float64, error) {
+		full := append([]string{"exec", "-n", namespace, "perf-client", "-c", "tools", "--"}, args...)
+		out, err := captureKubectl(env, full...)
+		if err != nil {
+			return 0, fmt.Errorf("%s iperf: %w", label, err)
+		}
+		var ir iperfResult
+		if err := json.Unmarshal([]byte(out), &ir); err != nil {
+			return 0, fmt.Errorf("parse %s iperf JSON: %w", label, err)
+		}
+		return ir.End.SumReceived.BitsPerSecond, nil
 	}
-	hr, err := parseHeyCSV([]byte(heyOut), float64(heyDur))
-	if err != nil {
-		return r, fmt.Errorf("parse hey: %w", err)
+	for s := 1; s <= runs; s++ {
+		fmt.Printf("==> [%s] sample %d/%d\n", phase, s, runs)
+		ing, err := measureIperf("ingress", "iperf3", "-c", "perf-server", "-t", "15", "-J")
+		if err != nil {
+			return r, err
+		}
+		eg, err := measureIperf("egress", "iperf3", "-c", "perf-server", "-t", "15", "-R", "-J")
+		if err != nil {
+			return r, err
+		}
+		heyOut, err := captureKubectl(env,
+			"exec", "-n", namespace, "perf-client", "-c", "tools", "--",
+			"hey", "-z", strconv.Itoa(heyDur)+"s", "-c", "50",
+			"-disable-keepalive", "-o", "csv", "http://perf-server:80/")
+		if err != nil {
+			return r, fmt.Errorf("hey: %w", err)
+		}
+		hr, err := parseHeyCSV([]byte(heyOut), float64(heyDur))
+		if err != nil {
+			return r, fmt.Errorf("parse hey: %w", err)
+		}
+		r.ingest = append(r.ingest, ing)
+		r.egress = append(r.egress, eg)
+		r.heyRPS = append(r.heyRPS, hr.RPS())
+		r.heyP50 = append(r.heyP50, hr.P50*1000)
+		r.heyP99 = append(r.heyP99, hr.P99*1000)
+		fmt.Printf("  [%s s%d] ingress=%s egress=%s | hey %.0f rps p50=%.1fms p99=%.1fms\n",
+			phase, s, fmtBps(ing), fmtBps(eg), hr.RPS(), hr.P50*1000, hr.P99*1000)
 	}
-	r.heyRPS, r.heyP50ms, r.heyP99ms = hr.RPS(), hr.P50*1000, hr.P99*1000
 
-	fmt.Printf("  [%s] ingress=%s egress=%s | hey %.0f rps p50=%.1fms p99=%.1fms\n",
-		phase, fmtBps(r.ingestBps), fmtBps(r.egressBps), r.heyRPS, r.heyP50ms, r.heyP99ms)
+	im, is := meanStd(r.ingest)
+	em, es := meanStd(r.egress)
+	rm, rs := meanStd(r.heyRPS)
+	fmt.Printf("  [%s mean±sd over %d] ingress=%s±%.2fMbps egress=%s±%.2fMbps hey=%.0f±%.0f rps\n",
+		phase, runs, fmtBps(im), is/1e6, fmtBps(em), es/1e6, rm, rs)
 	return r, nil
 }
 
@@ -315,14 +357,33 @@ func pvvReport(results []pvvResult) error {
 	fmt.Fprintf(&b, "kernel. baseline has no bandwidth annotation (unshaped wire);\n")
 	fmt.Fprintf(&b, "vanilla and natra annotate 10M/10M. iperf3 elephant\n")
 	fmt.Fprintf(&b, "(receiver-side bps); hey = fresh-connection HTTP mice.\n")
-	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "%-10s  %-12s  %-12s  %10s  %9s  %9s\n",
-		"Phase", "iperf ing", "iperf eg", "hey rps", "p50 ms", "p99 ms")
-	fmt.Fprintf(&b, "%s\n", strings.Repeat("-", 72))
+	n := 0
+	if len(results) > 0 {
+		n = len(results[0].ingest)
+	}
+	fmt.Fprintf(&b, "Generated %s — %d sample(s)/phase", time.Now().UTC().Format(time.RFC3339), n)
+	if n > 1 {
+		fmt.Fprintf(&b, ", cells are mean±stddev")
+	}
+	fmt.Fprintf(&b, "\n\n")
+
+	// cell renders mean (and ±stddev when >1 sample) at the given
+	// scale; e.g. scale 1e6 for bps→Mbps, 1 for rps/ms.
+	cell := func(xs []float64, scale float64, dp int) string {
+		m, s := meanStd(xs)
+		if len(xs) < 2 {
+			return fmt.Sprintf("%.*f", dp, m/scale)
+		}
+		return fmt.Sprintf("%.*f±%.*f", dp, m/scale, dp, s/scale)
+	}
+	fmt.Fprintf(&b, "%-10s  %-14s  %-14s  %-14s  %-11s  %-11s\n",
+		"Phase", "iperf ing Mbps", "iperf eg Mbps", "hey rps", "p50 ms", "p99 ms")
+	fmt.Fprintf(&b, "%s\n", strings.Repeat("-", 84))
 	for _, r := range results {
-		fmt.Fprintf(&b, "%-10s  %-12s  %-12s  %10.0f  %9.1f  %9.1f\n",
-			r.phase, fmtBps(r.ingestBps), fmtBps(r.egressBps),
-			r.heyRPS, r.heyP50ms, r.heyP99ms)
+		fmt.Fprintf(&b, "%-10s  %-14s  %-14s  %-14s  %-11s  %-11s\n",
+			r.phase,
+			cell(r.ingest, 1e6, 1), cell(r.egress, 1e6, 1),
+			cell(r.heyRPS, 1, 0), cell(r.heyP50, 1, 1), cell(r.heyP99, 1, 1))
 	}
 	out := b.String()
 	fmt.Print("\n" + out)
