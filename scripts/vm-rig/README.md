@@ -112,8 +112,8 @@ Subcommands:
   up             bring up the two-VM k3s cluster
   install        build and import the natra image, apply installer
   test           iperf throttle + hey HTTP-mice fast-pass assertions
-  perfvsvanilla  natra-vs-upstream-bandwidth comparison (scaffolding;
-                 currently bails on the cross-VM connectivity blocker)
+  perfvsvanilla  baseline/natra/upstream-bandwidth comparison on
+                 the live two-kernel cluster (run after `up`)
   down           tear down both VMs
   all            up + install + test (down on exit unless -keep)
 
@@ -123,13 +123,26 @@ Environment:
   NATRA_VM_KEEP=1       used by `all` to skip teardown on exit
 ```
 
-The `perfvsvanilla` subcommand is the planned local-developer driver
-for the natra-vs-upstream comparison documented in
-`docs/perf-vs-vanilla.md`. The scaffolding is in place
-(`cmd/vm-rig/perfvsvanilla.go`); it currently probes cross-VM
-connectivity and exits cleanly if the blocker is hit. The three-phase
-implementation (baseline / natra / upstream-bandwidth measurements)
-fills in once cross-VM pod traffic works.
+`perfvsvanilla` is the local-developer counterpart of the k3d
+`make perf-vs-vanilla` — same baseline/natra/upstream-bandwidth
+comparison, but on two real kernels instead of containers sharing
+one. It runs against the live cluster from `up` and swaps the
+shaper in place across three phases (build-once / swap-shaper
+rather than k3d's three throwaway clusters — a vm-rig cluster
+costs minutes, not seconds, and the in-place swap is a stricter
+comparison: identical kernels, wire, and pods, only the shaper
+changes). Phase order baseline → vanilla → natra: vanilla's tc
+burst patch is transient, natra installs a persistent
+DaemonSet/conflist so it goes last. Run it with:
+
+```
+make perf-vs-vanilla-vm      # vm-rig up + perfvsvanilla
+# or, against an already-up rig:
+go run ./cmd/vm-rig perfvsvanilla
+```
+
+Output: a comparison table on stdout and at
+`/tmp/natra-vm-rig-perf-vs-vanilla-result.txt`.
 
 ## Pinning a kernel version
 
@@ -192,13 +205,18 @@ socket under `/opt/homebrew/var/run/`, that's the stray
 brew-services one — `sudo brew services stop socket_vmnet` and
 restart the VMs.
 
-## Planned direction
+## Two perf-vs-vanilla rigs
 
-The vm-rig is the long-term shape for `make perf-vs-vanilla` on
-developer machines. The current `scripts/perf-vs-vanilla.sh` uses
-k3d (containers as nodes, one shared colima kernel) and will stay
-the path for CI runs. Once cross-VM connectivity is unblocked,
-`cmd/vm-rig` will gain a `perf-vs-vanilla` subcommand that drives
-the same three-phase (baseline / natra / vanilla) comparison
-across real two-kernel pods, and `make perf-vs-vanilla` will
-dispatch to vm-rig on macOS / k3d in CI.
+Both exist on purpose, different cost/fidelity trade-offs:
+
+- **`make perf-vs-vanilla`** (`scripts/perf-vs-vanilla.sh`, k3d):
+  containers as nodes, one shared colima kernel. Cheap, fast,
+  runs in CI. Single-kernel — no real cross-kernel wire.
+- **`make perf-vs-vanilla-vm`** (`cmd/vm-rig perfvsvanilla`):
+  two lima VMs, two real kernels, real inter-VM vmnet wire.
+  Minutes to stand up; the high-fidelity local-dev rig. This is
+  the cross-kernel measurement the k3d "Gaps in this comparison"
+  note (`docs/perf-vs-vanilla.md`) called out as missing.
+
+The k3d path stays the CI path (no nested virt on GH runners).
+The vm-rig path is the developer-machine high-fidelity check.

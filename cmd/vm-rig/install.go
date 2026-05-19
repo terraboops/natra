@@ -83,6 +83,39 @@ func cmdInstall(c *Config) error {
 	return nil
 }
 
+// importImage builds one image from deploy/docker/<dockerfile> on
+// the host, then exports + copies + imports it into both VMs'
+// k3s-embedded containerd. Standalone (not used by cmdInstall,
+// which has its own two-image loop) so callers that need only one
+// image — e.g. perfvsvanilla's perfclient — don't drag in the
+// natra DaemonSet apply. Same mechanics as cmdInstall's loop.
+func importImage(c *Config, image, dockerfile string) error {
+	fmt.Printf("==> building image %s (%s)\n", image, dockerfile)
+	if err := run("docker", "build", "-q", "-t", image,
+		"-f", filepath.Join(c.RepoRoot, "deploy", "docker", dockerfile),
+		c.RepoRoot); err != nil {
+		return err
+	}
+	tarFile := "/tmp/natra-vm-rig-importimage.tar"
+	defer func() { _ = os.Remove(tarFile) }()
+	if err := run("docker", "save", "-o", tarFile, image); err != nil {
+		return err
+	}
+	for _, vm := range []string{c.ServerName, c.AgentName} {
+		fmt.Printf("==> copying %s to %s\n", image, vm)
+		if err := run("limactl", "copy", tarFile, vm+":/tmp/natra-vm-rig-importimage.tar"); err != nil {
+			return err
+		}
+		fmt.Printf("==> importing %s in %s\n", image, vm)
+		if err := run("limactl", "shell", vm, "--",
+			"sudo", "k3s", "ctr", "-n", "k8s.io", "images", "import",
+			"/tmp/natra-vm-rig-importimage.tar"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // renderInstallerManifest reads deploy/cni-installer.yaml and
 // rewrites it for the vm-rig:
 //   - image: pinned to the local vm-rig tag built above

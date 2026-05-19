@@ -238,6 +238,10 @@ perf-vs-vanilla: ## Real-cluster head-to-head: natra vs upstream bandwidth plugi
 test-vm: ## Layer 4 (kernel-isolated): two-VM k3s cluster via lima, real cross-kernel pod traffic. macOS needs socket_vmnet.
 	@go run ./cmd/vm-rig all
 
+.PHONY: perf-vs-vanilla-vm
+perf-vs-vanilla-vm: ## natra vs upstream bandwidth on the two-real-kernel lima rig (vm-rig up first). Local-dev counterpart of the k3d perf-vs-vanilla.
+	@go run ./cmd/vm-rig up && go run ./cmd/vm-rig perfvsvanilla
+
 .PHONY: test-all
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.
 
