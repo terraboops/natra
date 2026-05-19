@@ -46,3 +46,7 @@ results/
 *.pprof
 heap-*
 snapshots-*.jsonl
+
+# Local working notes from the superpowers skill (specs/plans/etc).
+# Stays on disk for reference; never tracked.
+docs/superpowers/
