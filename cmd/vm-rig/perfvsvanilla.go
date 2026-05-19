@@ -57,13 +57,12 @@ func cmdPerfVsVanilla(c *Config) error {
 
 	// Each phase runs on its OWN pristine two-VM cluster: full
 	// down → up → stage → measure → down. This costs 3x bring-up
-	// (~12-15 min each on the static-IP architecture) but is the
-	// only design that supports trustworthy per-phase *latency*
-	// numbers: a shared, fixed-order, no-teardown cluster leaks
-	// warm page/containerd cache, accumulated kernel networking
-	// state, and natra's persistent BPF into later phases, so the
-	// last phase (warm) is unfairly faster than the first (cold).
-	// Independent clusters also dissolve the phase-ordering
+	// (~12-15 min each on the static-IP architecture); the reason
+	// is per-phase latency. A shared, fixed-order, no-teardown
+	// cluster leaks warm page/containerd cache, accumulated kernel
+	// networking state, and natra's persistent BPF into later
+	// phases, so the last phase (warm) reads faster than the first
+	// (cold). Independent clusters also dissolve the phase-ordering
 	// constraint — each phase is self-contained, order-irrelevant.
 	phases := []struct {
 		name  string
@@ -311,10 +310,11 @@ func pvvReport(results []pvvResult) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "natra vs upstream bandwidth — vm-rig (two real kernels, lima)\n")
 	fmt.Fprintf(&b, "================================================================\n")
-	fmt.Fprintf(&b, "perf-server annotated 10M ingress + egress, on %s; perf-client\n", "lima-natra-agent")
-	fmt.Fprintf(&b, "on lima-natra-server — traffic crosses the inter-VM vmnet wire,\n")
-	fmt.Fprintf(&b, "each node its own kernel. iperf3 elephant (receiver-side bps);\n")
-	fmt.Fprintf(&b, "hey = fresh-connection HTTP mice (CMS fast-pass demonstrator).\n")
+	fmt.Fprintf(&b, "perf-server on lima-natra-agent, perf-client on lima-natra-server\n")
+	fmt.Fprintf(&b, "— traffic crosses the inter-VM vmnet wire, each node its own\n")
+	fmt.Fprintf(&b, "kernel. baseline has no bandwidth annotation (unshaped wire);\n")
+	fmt.Fprintf(&b, "vanilla and natra annotate 10M/10M. iperf3 elephant\n")
+	fmt.Fprintf(&b, "(receiver-side bps); hey = fresh-connection HTTP mice.\n")
 	fmt.Fprintf(&b, "Generated %s\n\n", time.Now().UTC().Format(time.RFC3339))
 	fmt.Fprintf(&b, "%-10s  %-12s  %-12s  %10s  %9s  %9s\n",
 		"Phase", "iperf ing", "iperf eg", "hey rps", "p50 ms", "p99 ms")
