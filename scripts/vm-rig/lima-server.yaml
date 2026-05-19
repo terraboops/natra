@@ -10,14 +10,23 @@
 # threshold for TCX (bpf_mprog), so natra's preferred attach
 # mode works out of the box. clsact remains the kernel-5.x
 # fallback inside the loader if anything in the chain breaks.
-# Debian rather than Ubuntu because cloud.debian.org is
-# better-mirrored than cloud-images.ubuntu.com from constrained
-# networks — same cloud-init / apt / systemd shape either way.
+#
+# Source the image from saimei.ftp.acc.umu.se (Academic Computer
+# Club, Umeå — primary Debian/Ubuntu push-mirror infra), NOT the
+# `cloud.debian.org` alias. cloud.debian.org round-robins across
+# backend mirrors and does not fail fast off a hung one: observed
+# TLS handshakes stalling 12-30s on the mirror.accum.se backend,
+# which then trips a lima digest-less-image bug (basedisk creation
+# fails after the last-modified Head times out). A specific
+# known-reliable mirror is more deterministic for a test rig.
+# Follow-up (separate): pin a versioned path + sha512 digest so
+# lima skips the network Head entirely (latest/ rotates daily,
+# so digest-pinning needs a dated URL — out of scope here).
 
 images:
-  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
     arch: "aarch64"
-  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
     arch: "x86_64"
 
 cpus: 2
@@ -35,12 +44,10 @@ networks:
 # the host's kubectl after the kubeconfig is exported.
 mounts: []
 
-# socket_vmnet on macOS only routes to IPs it assigned via DHCP;
-# our static lima0 addresses (see provision script) are visible
-# from the agent VM (VM↔VM is unaffected) but NOT from the host.
-# Forward the k3s API to host loopback so `kubectl` from the
-# host can reach it via the lima SSH tunnel. The agent VM still
-# reaches the server directly at 192.168.105.10:6443.
+# Forward the k3s API to host loopback so `kubectl` from the host
+# reaches it via the lima SSH tunnel regardless of the lima0 DHCP
+# address (which isn't fixed run-to-run). The agent VM reaches the
+# server directly over the lima-shared network at its DHCP IP.
 portForwards:
   - guestPort: 6443
     hostIP: "127.0.0.1"
@@ -57,40 +64,70 @@ provision:
       #!/bin/bash
       set -euxo pipefail
 
-      # Wait for the lima-shared interface to exist (link-only is
-      # enough — we don't depend on DHCP because some lima/socket_vmnet
-      # combos don't complete DHCPv4 on the shared subnet, leaving
-      # lima0 link-up but without an IPv4 lease).
-      for _ in $(seq 1 60); do
-        if ip link show lima0 2>/dev/null | grep -q 'state UP'; then
-          break
-        fi
-        sleep 1
-      done
-
-      # Static IP in the lima-shared subnet (socket_vmnet hands out
-      # 192.168.105.0/24 by default). Server pins .10, agent pins
-      # .11 — predictable, conflict-free for a single rig instance.
-      LIMA_IP=192.168.105.10
-      ip addr add ${LIMA_IP}/24 dev lima0 2>/dev/null || true
+      # Block until lima0 has an IPv4 address — i.e. the vmnet
+      # DHCP lease has actually landed. Event-driven via networkd;
+      # returns the instant IPv4 is configured, so it copes with
+      # the wildly variable cold-vmnet DHCP convergence (observed
+      # 0s to 193s across runs — no fixed poll timeout can).
+      #
+      # --ipv4 is load-bearing, NOT cosmetic: lima0 gains an IPv6
+      # ULA almost immediately, which by itself makes the link
+      # ":routable"/"online". Waiting on routability alone returns
+      # before the IPv4 lease, the script then captures an empty
+      # address, and k3s dies with `invalid node-ip: invalid ip
+      # format ''`. We must wait on the *actual* dependency: IPv4
+      # present.
+      #
+      # --timeout is a pure failsafe against a genuinely stuck
+      # boot, NOT a calibrated value. If it trips, the cause is a
+      # stray brew-services socket_vmnet conflicting with lima's
+      # own (lima 2.x manages its own — do NOT `brew services
+      # start socket_vmnet`; see scripts/vm-rig/README.md).
+      if ! /lib/systemd/systemd-networkd-wait-online \
+            --interface=lima0 --ipv4 --timeout=600; then
+        echo "natra vm-rig: lima0 has no IPv4 after 600s failsafe." >&2
+        echo "  Check for a stray brew-services socket_vmnet" >&2
+        echo "  conflicting with lima's own. See scripts/vm-rig/README.md." >&2
+        exit 1
+      fi
+      LIMA_IP=$(ip -4 -o addr show lima0 | awk '{print $4}' | cut -d/ -f1)
+      # Defense in depth: never hand k3s an empty --node-ip even if
+      # wait-online's contract ever changes under us.
+      if [ -z "${LIMA_IP:-}" ]; then
+        echo "natra vm-rig: lima0 IPv4 empty despite wait-online success." >&2
+        exit 1
+      fi
       echo "$LIMA_IP" > /etc/natra-server-ip
 
-      # flannel-backend=host-gw: each node sets a kernel route
-      # "<other-node pod-cidr> via <other-node-ip> dev lima0", and
-      # pod-to-pod cross-node traffic uses that direct route.
-      # Caveat: requires the kernel's ARP for the other node's
-      # lima0 IP to resolve, which only works reliably when
-      # socket_vmnet/vmnet has learned the IP (via DHCP, normally).
-      # Static IPs (see provision-script comments) work for the
-      # k3s server↔agent control-plane join because that traffic
-      # routes via the lima-usernet NAT path, but pod-to-pod
-      # forwarding through host-gw may not work without a
-      # DHCP-learned vmnet entry. The floor assertion in
-      # cmd/vm-rig/test.go catches "iperf measured 0 bps" cases
-      # so we don't silently pass.
+      # Keep lima0's DHCP *address* (vmnet-known → cross-VM pod
+      # traffic works) but DROP its DHCP-provided default route.
+      # vmnet's lease installs `default via <gw> dev lima0` at
+      # metric 100, which outranks eth0's user-mode-NAT default
+      # (metric 200) and hijacks internet egress onto the vmnet
+      # path — which has no working outbound NAT, so the k3s
+      # install below (and image pulls) can't reach the internet.
+      # Internet must stay on eth0. flannel host-gw only needs
+      # lima0 for explicit pod-CIDR routes, never a default.
+      ip route del default dev lima0 2>/dev/null || true
+
+      # flannel-backend=host-gw: each node installs a kernel route
+      # "<other-node pod-cidr> via <other-node lima0 IP> dev lima0".
+      #
+      # --flannel-iface=lima0 is LOAD-BEARING and the actual fix for
+      # the original "cross-VM pod traffic dead" symptom. Without it
+      # flannel auto-selects its inter-node interface from the
+      # default route — which is correctly eth0 (the per-VM-isolated
+      # lima user-mode NAT; its IP 192.168.5.15 is identical on
+      # every VM and goes nowhere cross-VM). flannel then installs
+      # `<other pod-cidr> via 192.168.5.15 dev eth0`, a black hole.
+      # Pinning lima0 (the shared vmnet network, where the nodes
+      # actually reach each other — ping/ARP verified working)
+      # makes host-gw install the correct next-hop. This pairs with
+      # the default-route drop above: internet egress on eth0,
+      # pod-to-pod on lima0, both explicit, no auto-selection.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
-        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \
+        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --flannel-iface=lima0 --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \
         sh -
 
       # Token at a predictable path so up.sh can read it via shell

@@ -35,6 +35,14 @@ func cmdUp(c *Config) error {
 
 	fmt.Println("==> waiting for k3s server to finish provisioning")
 	tokenPath := "/etc/natra-node-token"
+	// lima only reports the VM "started" after its boot/provision
+	// scripts finish, and the server provision writes this token as
+	// its last step (after the event-driven networkd-wait-online +
+	// k3s install). So post-start the token effectively already
+	// exists; this poll is a failsafe against limactl-shell exec
+	// latency / edge races, NOT a calibrated wait. 180s is ample
+	// anti-hang insurance — if it trips, provision genuinely failed
+	// (inspect the VM; NATRA_VM_KEEP keeps it up).
 	if err := waitForFile(c.ServerName, tokenPath, 90, 2*time.Second); err != nil {
 		// Dump k3s logs to make timeouts diagnosable.
 		_ = run("limactl", "shell", c.ServerName, "--", "sudo", "journalctl", "-u", "k3s", "--no-pager", "-n", "30")
@@ -75,9 +83,8 @@ func cmdUp(c *Config) error {
 	// server: https://127.0.0.1:6443 — and that's exactly where
 	// the lima portForward (see lima-server.yaml) lands the VM's
 	// 6443 on the host, so we keep the address as-is. The agent
-	// VM joins via the lima-shared static IP (192.168.105.10:6443)
-	// because socket_vmnet doesn't route the host's loopback to
-	// the agent.
+	// VM joins via the server's lima-shared DHCP IP (captured
+	// above into serverIP, port 6443) over the vmnet network.
 	fmt.Printf("==> exporting kubeconfig to %s\n", c.KubeconfigPath)
 	kc, err := capture("limactl", "shell", c.ServerName, "--", "sudo", "cat", "/etc/rancher/k3s/k3s.yaml")
 	if err != nil {
@@ -87,9 +94,16 @@ func cmdUp(c *Config) error {
 		return err
 	}
 
-	// Stage 4: wait for both nodes to register as Ready.
+	// Stage 4: wait for both nodes Ready. Condition poll — there's
+	// no event channel through `limactl shell`, so we poll
+	// `kubectl get nodes` for the actual readiness condition. The
+	// agent's event-driven DHCP wait + k3s-agent install completed
+	// before its VM reported started; what remains here is k3s
+	// control-plane + flannel CNI convergence (typically 30-90s).
+	// 300s is a documented failsafe ceiling, not a calibrated
+	// value — the Ready condition is the mechanism.
 	fmt.Println("==> waiting for both nodes Ready")
-	if err := waitForNodesReady(c, 2, 60, 2*time.Second); err != nil {
+	if err := waitForNodesReady(c, 2, 150, 2*time.Second); err != nil {
 		_, _ = captureKubectl([]string{"KUBECONFIG=" + c.KubeconfigPath}, "get", "nodes")
 		return err
 	}

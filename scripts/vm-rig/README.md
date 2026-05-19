@@ -34,10 +34,17 @@ for what cloud-VM / metal would add on top.
 - `limactl` (lima 1.0+). Mac: `brew install lima`. Linux:
   distro package or build from source.
 - `socket_vmnet` on macOS for VM-to-VM networking:
-  `brew install socket_vmnet` then `sudo brew services start
-  socket_vmnet`. Lima will refuse to start the `shared` network
-  without it. Linux doesn't need this — lima uses libvirt/KVM
-  bridged networks directly.
+  `brew install socket_vmnet`. **Do NOT** `brew services start
+  socket_vmnet` — lima 2.x starts and manages its own
+  socket_vmnet instance (via the sudoers entry `limactl` writes).
+  A second, brew-services-managed instance is a duplicate
+  shared-mode vmnet network on the same gateway; the two collide
+  in macOS `vmnet.framework` and its DHCP responder stops
+  answering, so lima0 never gets a lease. (Older lima docs told
+  you to `brew services start` it — that guidance predates lima
+  managing socket_vmnet itself and is now actively harmful here.)
+  Linux doesn't need socket_vmnet — lima uses libvirt/KVM bridged
+  networks directly.
 - `kubectl`, `docker` on PATH.
 - Go 1.25+ (to run `cmd/vm-rig`; the binary is built on demand by
   `go run`, no separate install step).
@@ -149,43 +156,41 @@ networks; `cloud.debian.org` is more widely mirrored.
   API. If the lima shared network drops (rare), the test will see
   the API as unreachable; rerun `go run ./cmd/vm-rig up`.
 
-### Cross-VM pod traffic blocker (current)
+### The socket_vmnet DHCP conflict (resolved)
 
-On Debian 13 under lima's `shared` network, systemd-networkd's
-DHCPv4 client doesn't complete on `lima0` — networkd has the
-interface set to `DHCP=ipv4` but the client never logs an
-attempt. The current workaround (`scripts/vm-rig/lima-*.yaml`
-provision scripts) assigns static IPs `192.168.105.10` (server)
-and `192.168.105.11` (agent).
+History, because the fix is non-obvious and the original
+diagnosis was wrong. Symptom: cross-VM pod traffic dead;
+`cmd/vm-rig/test.go`'s connectivity gate failing.
 
-The k3s control-plane join works fine with statics — it routes
-via lima-usernet NAT, which doesn't depend on vmnet's ARP table.
-But pod-to-pod traffic via flannel `host-gw` fails: macOS
-`socket_vmnet` only learns ARP entries for IPs it assigned via
-DHCP, so cross-VM ARP for the static addresses gets dropped, and
-host-gw's "route pod CIDR via the other node's lima0 IP" never
-resolves a next-hop.
+The first investigation concluded "Debian/networkd doesn't
+DHCP lima0" and bolted on a static-IP workaround
+(`192.168.105.10/.11`). That diagnosis was incorrect, and the
+workaround made things worse: macOS `vmnet` only forwards L2
+(ARP) for addresses in its own DHCP table, so a hand-set static
+lima0 address is invisible to the other VM — flannel `host-gw`
+could never resolve the cross-node next-hop.
 
-Symptom: the `cmd/vm-rig/test.go` connectivity gate
-(`waitForIperfConnect`) fails loudly instead of producing a
-silent 0-bps PASS. The cluster is up, kubectl works, single-VM
-pod traffic works — only cross-VM pod traffic is dead.
+Actual root cause, found by packet capture (lima0 sent
+DHCPDISCOVER, got zero replies — so networkd *was* DHCPing
+correctly; the server wasn't answering): a leftover
+**brew-services `socket_vmnet`** (from the now-stale
+`brew services start socket_vmnet` step) ran alongside lima
+2.x's own auto-managed socket_vmnet. Two shared-mode vmnet
+instances pinned to the same gateway (`192.168.105.1`) collide
+in `vmnet.framework`; its DHCP responder stops answering.
 
-Paths to unblock (rough order of likelihood):
+Fix: don't run brew-services socket_vmnet (see Prerequisites).
+With only lima's own instance, lima0 gets a normal DHCP lease,
+that address is in vmnet's table, ARP resolves between VMs, and
+host-gw works. The provision scripts now wait for the DHCP
+lease and derive `--node-ip` from it — no static addresses.
 
-1. **Different distro.** Ubuntu 24.04's cloud-init + netplan
-   stack DHCPs cleanly under lima where Debian/networkd
-   doesn't. Simplest swap — change the `images:` block, drop the
-   static-IP provisioning.
-2. **flannel-VXLAN with explicit MTU.** Tunnels pod traffic over
-   UDP, so cross-VM ARP for pod CIDRs becomes irrelevant. A
-   previous attempt failed at "1/2 nodes Ready," almost certainly
-   an MTU mismatch (VXLAN adds 50 bytes of overhead; pod MTU
-   needs to be 1450 on a 1500-byte underlay).
-3. **Run vm-rig on Linux, not macOS.** lima's macOS networking
-   quirks evaporate — libvirt/KVM bridged gives real L2. A
-   small Linux VM accessed via SSH ends up simpler than fighting
-   socket_vmnet on the developer's Mac.
+If lima0 still doesn't get a lease: `pgrep -fl socket_vmnet`
+should show exactly one logical instance (lima's, socket path
+under `/private/var/run/lima/`). If you also see one with a
+socket under `/opt/homebrew/var/run/`, that's the stray
+brew-services one — `sudo brew services stop socket_vmnet` and
+restart the VMs.
 
 ## Planned direction
 

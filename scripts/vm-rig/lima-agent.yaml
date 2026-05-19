@@ -6,10 +6,13 @@
 #
 # Same kernel/image/network choices as server — see lima-server.yaml.
 
+# Image source: saimei.ftp.acc.umu.se, not cloud.debian.org — see
+# lima-server.yaml for the rationale (cloud.debian.org round-robin
+# hangs on a degraded backend + trips a lima digest-less bug).
 images:
-  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
     arch: "aarch64"
-  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
     arch: "x86_64"
 
 cpus: 2
@@ -38,22 +41,34 @@ provision:
         exit 1
       fi
 
-      for _ in $(seq 1 60); do
-        if ip link show lima0 2>/dev/null | grep -q 'state UP'; then
-          break
-        fi
-        sleep 1
-      done
+      # Block until lima0 has IPv4 (the DHCP lease). --ipv4 is
+      # load-bearing: lima0's instant IPv6 ULA makes it ":routable"
+      # before the IPv4 lease, and proceeding then feeds k3s an
+      # empty node-ip. See lima-server.yaml for the full rationale.
+      if ! /lib/systemd/systemd-networkd-wait-online \
+            --interface=lima0 --ipv4 --timeout=600; then
+        echo "natra vm-rig: lima0 has no IPv4 after 600s failsafe." >&2
+        echo "  See scripts/vm-rig/README.md (socket_vmnet conflict)." >&2
+        exit 1
+      fi
+      LIMA_IP=$(ip -4 -o addr show lima0 | awk '{print $4}' | cut -d/ -f1)
+      if [ -z "${LIMA_IP:-}" ]; then
+        echo "natra vm-rig: lima0 IPv4 empty despite wait-online success." >&2
+        exit 1
+      fi
 
-      # Static IP in the lima-shared subnet. See lima-server.yaml
-      # for the rationale (DHCP-on-shared-network is flaky across
-      # lima/socket_vmnet/distro combos).
-      LIMA_IP=192.168.105.11
-      ip addr add ${LIMA_IP}/24 dev lima0 2>/dev/null || true
+      # Drop lima0's DHCP default route — keep the address, keep
+      # internet egress on eth0's user-mode NAT. See lima-server.yaml.
+      ip route del default dev lima0 2>/dev/null || true
 
+      # --flannel-iface=lima0: pin flannel's inter-node interface
+      # to the shared vmnet network. Without it flannel picks eth0
+      # (the per-VM-isolated user-mode NAT) and cross-VM pod
+      # traffic black-holes. See lima-server.yaml for the full
+      # rationale — this is the actual fix for the original symptom.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         K3S_URL="${NATRA_K3S_URL}" \
         K3S_TOKEN="${NATRA_K3S_TOKEN}" \
-        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP}" \
+        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP} --flannel-iface=lima0" \
         sh -
