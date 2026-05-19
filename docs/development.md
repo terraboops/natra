@@ -65,9 +65,12 @@ kernel (colima's LinuxKit VM on Mac; the runner kernel on GH).
 For real kernel-to-kernel coverage there's a separate on-demand rig:
 
 ```bash
-make test-vm        # two-VM k3s cluster under lima, real cross-kernel
-                    # pod traffic. macOS prereq: brew install socket_vmnet.
-                    # See scripts/vm-rig/README.md.
+make test-vm           # two-VM k3s cluster under lima, real cross-kernel
+                       # pod traffic: natra throttle + CMS fast-pass.
+make perf-vs-vanilla-vm # baseline/natra/upstream comparison on two
+                       # real kernels, fresh cluster per phase (~40 min).
+                       # macOS prereq: brew install socket_vmnet (do NOT
+                       # `brew services start` it). See scripts/vm-rig/README.md.
 ```
 
 For what each layer actually validates — and the wire-level

@@ -35,16 +35,17 @@ for what cloud-VM / metal would add on top.
   distro package or build from source.
 - `socket_vmnet` on macOS for VM-to-VM networking:
   `brew install socket_vmnet`. **Do NOT** `brew services start
-  socket_vmnet` — lima 2.x starts and manages its own
-  socket_vmnet instance (via the sudoers entry `limactl` writes).
-  A second, brew-services-managed instance is a duplicate
-  shared-mode vmnet network on the same gateway; the two collide
-  in macOS `vmnet.framework` and its DHCP responder stops
-  answering, so lima0 never gets a lease. (Older lima docs told
-  you to `brew services start` it — that guidance predates lima
-  managing socket_vmnet itself and is now actively harmful here.)
-  Linux doesn't need socket_vmnet — lima uses libvirt/KVM bridged
-  networks directly.
+  socket_vmnet` — lima 2.x starts and manages its own instance
+  (via the sudoers entry `limactl` writes); a second
+  brew-services instance is a pointless duplicate shared-mode
+  vmnet network on the same gateway. (The rig uses static lima0
+  IPs and no longer depends on vmnet's DHCP responder, so a
+  stray duplicate is no longer the catastrophe it was in the
+  DHCP era — see "Network architecture" below — but a single
+  lima-managed instance is still the only supported config.)
+  Older lima docs told you to `brew services start` it; that
+  predates lima managing socket_vmnet itself. Linux doesn't need
+  socket_vmnet — lima uses libvirt/KVM bridged networks directly.
 - `kubectl`, `docker` on PATH.
 - Go 1.25+ (to run `cmd/vm-rig`; the binary is built on demand by
   `go run`, no separate install step).
@@ -175,41 +176,44 @@ networks; `cloud.debian.org` is more widely mirrored.
   API. If the lima shared network drops (rare), the test will see
   the API as unreachable; rerun `go run ./cmd/vm-rig up`.
 
-### The socket_vmnet DHCP conflict (resolved)
+### Network architecture (static lima0, no vmnet DHCP)
 
-History, because the fix is non-obvious and the original
-diagnosis was wrong. Symptom: cross-VM pod traffic dead;
-`cmd/vm-rig/test.go`'s connectivity gate failing.
+lima0 (the shared-network interface) is given a **static IP** —
+server `192.168.105.10`, agent `192.168.105.11` — by a
+networkd drop-in `/etc/systemd/network/05-natra-lima0.network`
+(`DHCP=no`), written in the provision script. The `05-` prefix
+sorts before lima's netplan-generated `10-netplan-lima0.network`,
+so networkd owns lima0 statically from the start and never runs
+a competing DHCP client on it. `--node-ip` is the static
+address; k3s gets `--flannel-iface=lima0`.
 
-The first investigation concluded "Debian/networkd doesn't
-DHCP lima0" and bolted on a static-IP workaround
-(`192.168.105.10/.11`). That diagnosis was incorrect, and the
-workaround made things worse: macOS `vmnet` only forwards L2
-(ARP) for addresses in its own DHCP table, so a hand-set static
-lima0 address is invisible to the other VM — flannel `host-gw`
-could never resolve the cross-node next-hop.
+Two pieces are load-bearing and non-obvious:
 
-Actual root cause, found by packet capture (lima0 sent
-DHCPDISCOVER, got zero replies — so networkd *was* DHCPing
-correctly; the server wasn't answering): a leftover
-**brew-services `socket_vmnet`** (from the now-stale
-`brew services start socket_vmnet` step) ran alongside lima
-2.x's own auto-managed socket_vmnet. Two shared-mode vmnet
-instances pinned to the same gateway (`192.168.105.1`) collide
-in `vmnet.framework`; its DHCP responder stops answering.
+- **`--flannel-iface=lima0`** is the actual fix for cross-VM
+  pod traffic. Without it flannel auto-selects its inter-node
+  interface from the default route — which is correctly eth0
+  (lima's per-VM-isolated user-mode NAT; its `192.168.5.15` is
+  identical on every VM and goes nowhere cross-VM). flannel then
+  installs `<other pod-cidr> via 192.168.5.15 dev eth0`, a black
+  hole. Pinning lima0 makes host-gw use the real inter-VM wire.
+- **Static, not DHCP.** lima's shared-network vmnet DHCP server
+  is wildly unreliable on this macOS stack (observed convergence
+  0 s → never across runs). Static is deterministic; it also
+  installs no default route, so internet egress stays on eth0
+  with zero extra work.
 
-Fix: don't run brew-services socket_vmnet (see Prerequisites).
-With only lima's own instance, lima0 gets a normal DHCP lease,
-that address is in vmnet's table, ARP resolves between VMs, and
-host-gw works. The provision scripts now wait for the DHCP
-lease and derive `--node-ip` from it — no static addresses.
-
-If lima0 still doesn't get a lease: `pgrep -fl socket_vmnet`
-should show exactly one logical instance (lima's, socket path
-under `/private/var/run/lima/`). If you also see one with a
-socket under `/opt/homebrew/var/run/`, that's the stray
-brew-services one — `sudo brew services stop socket_vmnet` and
-restart the VMs.
+Two earlier theories were both disproved by direct test and are
+recorded here so they aren't re-tried: (1) "macOS vmnet won't
+ARP statically-assigned addresses, so cross-VM pod traffic
+fails" — false; with static .10/.11, server↔agent ping is 0%
+loss and ARP resolves both ways. (2) "DHCP is required for
+cross-VM" — false; the real blocker was always the flannel
+interface selection above, invisible until the cluster reliably
+reached the flannel-routing stage. An intermediate fix that
+made vmnet DHCP work (removing a stray brew-services
+socket_vmnet that broke vmnet's DHCP responder) was superseded:
+removing the DHCP dependency entirely is simpler and
+deterministic.
 
 ## Two perf-vs-vanilla rigs
 

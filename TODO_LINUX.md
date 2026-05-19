@@ -267,15 +267,18 @@ runs everything.
 - **Real-veth in L3.** `BPF_PROG_RUN`'s ~3,772 B input cap rules out
   jumbo behavior at the BPF unit level. Real-veth coverage is
   currently in L4 only.
-- **Single-kernel L4/L5 topology (k3d).** k3d's "nodes" are
-  containers sharing one Linux kernel and one docker bridge. The
-  cross-kernel signal lives in the lima-based vm-rig
-  (`make test-vm` / `scripts/vm-rig/`) — two VMs, two kernels, one
-  k3s cluster joined over the lima shared network — which is
-  invoked manually and runs alongside the k3d-based L4 e2e. Real
-  NICs, hardware queueing, and real wire latency still aren't
-  reached; see `docs/test-environments.md` for the cloud-VM and
-  bare-metal escalation steps.
+- **Single-kernel L4/L5 topology (k3d) — cross-kernel now
+  covered by vm-rig.** k3d's "nodes" are containers sharing one
+  Linux kernel and one docker bridge. The cross-kernel signal is
+  provided by the lima-based vm-rig (two VMs, two real kernels,
+  real inter-VM vmnet wire): `make test-vm` for the natra
+  throttle + fast-pass assertions, `make perf-vs-vanilla-vm` for
+  the baseline/natra/upstream comparison (fresh cluster per
+  phase). Both pass; results in `docs/perf-vs-vanilla.md`
+  "Two-kernel (vm-rig) results". Still not reached: real hardware
+  NICs, switch queueing, real cross-AZ latency — see
+  `docs/test-environments.md` for the cloud-VM / bare-metal
+  escalation.
 - **Cilium / AWS NPA coexistence.** natra composes via bpf_mprog at
   the TCX hook by construction; no end-to-end rig with a loaded
   cilium / NPA cluster has been run yet. Validation needs a real

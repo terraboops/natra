@@ -168,20 +168,24 @@ plumbing without committing to multi-host infra. Catches: NIC
 offload skew, real veth/bridge handoff, cross-kernel BPF version
 mismatch, real network namespaces, MTU.
 
-**Status: built; cross-VM pod traffic currently blocked.**
-Orchestration lives in `cmd/vm-rig/` (Go, subcommands
-`up / install / test / down / all`); lima VM templates live in
-`scripts/vm-rig/*.yaml`. The rig brings up two VMs — server
-(control-plane) and agent (worker), each on its own Linux kernel —
-joined via the lima `shared` network. The k3s control plane joins
-cleanly; pod-to-pod traffic between annotated pods *should* cross
-a real virtual NIC pair, but on macOS with Debian VMs under lima's
-shared (socket_vmnet) network, cross-VM ARP for the statically-
-assigned IPs gets dropped by vmnet, and flannel `host-gw` can't
-resolve next-hops. The test's connectivity gate fails loudly
-instead of producing a silent 0-bps PASS. See
-`scripts/vm-rig/README.md` for the three plausible unblock paths
-(Ubuntu distro, VXLAN backend, Linux host).
+**Status: built and working, end-to-end.** Orchestration lives
+in `cmd/vm-rig/` (Go, subcommands
+`up / install / test / down / all / perfvsvanilla`); lima VM
+templates live in `scripts/vm-rig/*.yaml`. The rig brings up two
+VMs — server (control-plane) and agent (worker), each on its own
+Linux kernel — joined over the lima `shared` (socket_vmnet)
+network. `make test-vm` runs the natra throttle + CMS fast-pass
+assertions across the kernel boundary; `make perf-vs-vanilla-vm`
+runs the baseline/natra/upstream-bandwidth comparison (fresh
+cluster per phase). Both pass.
+
+The cross-VM path took a substantial debugging cascade to get
+right; the resolution is **static lima0 IPs via a networkd
+drop-in (no vmnet DHCP) plus `--flannel-iface=lima0`** — see
+`scripts/vm-rig/README.md` "Network architecture". The earlier
+"cross-VM ARP for static IPs is dropped by vmnet" diagnosis was
+disproved; ARP/ping always worked, flannel was selecting the
+wrong interface.
 
 Invoke with `make test-vm`. macOS prerequisite:
 `brew install socket_vmnet` for VM-to-VM L2 reachability; Linux
