@@ -41,31 +41,35 @@ provision:
         exit 1
       fi
 
-      # Block until lima0 has IPv4 (the DHCP lease). --ipv4 is
-      # load-bearing: lima0's instant IPv6 ULA makes it ":routable"
-      # before the IPv4 lease, and proceeding then feeds k3s an
-      # empty node-ip. See lima-server.yaml for the full rationale.
-      if ! /lib/systemd/systemd-networkd-wait-online \
-            --interface=lima0 --ipv4 --timeout=600; then
-        echo "natra vm-rig: lima0 has no IPv4 after 600s failsafe." >&2
-        echo "  See scripts/vm-rig/README.md (socket_vmnet conflict)." >&2
+      # Static lima0 IP — agent pins .11 (server pins .10). No
+      # vmnet DHCP (unreliable on this stack); networkd owns lima0
+      # statically via a 05- drop-in. See lima-server.yaml for the
+      # full rationale (verified: static cross-VM ping/ARP works;
+      # the real cross-VM fix is --flannel-iface=lima0).
+      LIMA_IP=192.168.105.11
+      for _ in $(seq 1 30); do
+        ip link show lima0 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      mkdir -p /etc/systemd/network
+      printf '[Match]\nName=lima0\n[Network]\nAddress=%s/24\nDHCP=no\n' \
+        "$LIMA_IP" > /etc/systemd/network/05-natra-lima0.network
+      networkctl reload
+      networkctl reconfigure lima0
+      for _ in $(seq 1 30); do
+        ip -4 -o addr show lima0 2>/dev/null | grep -q "${LIMA_IP}/24" && break
+        sleep 1
+      done
+      if ! ip -4 -o addr show lima0 | grep -q "${LIMA_IP}/24"; then
+        echo "natra vm-rig: failed to set static ${LIMA_IP} on lima0" >&2
         exit 1
       fi
-      LIMA_IP=$(ip -4 -o addr show lima0 | awk '{print $4}' | cut -d/ -f1)
-      if [ -z "${LIMA_IP:-}" ]; then
-        echo "natra vm-rig: lima0 IPv4 empty despite wait-online success." >&2
-        exit 1
-      fi
-
-      # Drop lima0's DHCP default route — keep the address, keep
-      # internet egress on eth0's user-mode NAT. See lima-server.yaml.
-      ip route del default dev lima0 2>/dev/null || true
 
       # --flannel-iface=lima0: pin flannel's inter-node interface
       # to the shared vmnet network. Without it flannel picks eth0
       # (the per-VM-isolated user-mode NAT) and cross-VM pod
-      # traffic black-holes. See lima-server.yaml for the full
-      # rationale — this is the actual fix for the original symptom.
+      # traffic black-holes. See lima-server.yaml — this is the
+      # actual fix for the original symptom.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         K3S_URL="${NATRA_K3S_URL}" \

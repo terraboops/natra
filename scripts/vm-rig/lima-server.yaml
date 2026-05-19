@@ -64,51 +64,48 @@ provision:
       #!/bin/bash
       set -euxo pipefail
 
-      # Block until lima0 has an IPv4 address — i.e. the vmnet
-      # DHCP lease has actually landed. Event-driven via networkd;
-      # returns the instant IPv4 is configured, so it copes with
-      # the wildly variable cold-vmnet DHCP convergence (observed
-      # 0s to 193s across runs — no fixed poll timeout can).
+      # Static lima0 IP on the lima shared (vmnet) network.
       #
-      # --ipv4 is load-bearing, NOT cosmetic: lima0 gains an IPv6
-      # ULA almost immediately, which by itself makes the link
-      # ":routable"/"online". Waiting on routability alone returns
-      # before the IPv4 lease, the script then captures an empty
-      # address, and k3s dies with `invalid node-ip: invalid ip
-      # format ''`. We must wait on the *actual* dependency: IPv4
-      # present.
+      # We deliberately do NOT use vmnet DHCP. On this macOS/lima
+      # stack vmnet's DHCP server is wildly unreliable for the
+      # shared network — observed convergence ranged from 0s to
+      # never (>600s) across runs, which is unworkable for an
+      # unattended rig. Static is deterministic and instant.
       #
-      # --timeout is a pure failsafe against a genuinely stuck
-      # boot, NOT a calibrated value. If it trips, the cause is a
-      # stray brew-services socket_vmnet conflicting with lima's
-      # own (lima 2.x manages its own — do NOT `brew services
-      # start socket_vmnet`; see scripts/vm-rig/README.md).
-      if ! /lib/systemd/systemd-networkd-wait-online \
-            --interface=lima0 --ipv4 --timeout=600; then
-        echo "natra vm-rig: lima0 has no IPv4 after 600s failsafe." >&2
-        echo "  Check for a stray brew-services socket_vmnet" >&2
-        echo "  conflicting with lima's own. See scripts/vm-rig/README.md." >&2
-        exit 1
-      fi
-      LIMA_IP=$(ip -4 -o addr show lima0 | awk '{print $4}' | cut -d/ -f1)
-      # Defense in depth: never hand k3s an empty --node-ip even if
-      # wait-online's contract ever changes under us.
-      if [ -z "${LIMA_IP:-}" ]; then
-        echo "natra vm-rig: lima0 IPv4 empty despite wait-online success." >&2
+      # The historical objection ("vmnet won't ARP statically-
+      # assigned IPs, so cross-VM pod traffic fails") is FALSE —
+      # verified directly: with static .10/.11, server↔agent ping
+      # is 0% loss and ARP resolves both ways. vmnet bridges the
+      # two VMs' lima0 at L2 regardless of how the address was
+      # assigned. The real cross-VM-pod-traffic fix is
+      # --flannel-iface=lima0 below, not the address-assignment
+      # method. Static also installs no default route, so internet
+      # egress stays on eth0's user-mode NAT with zero extra work.
+      #
+      # Own lima0 in networkd directly (DHCP=no) rather than
+      # `ip addr add` over the top: a 05- prefixed drop-in sorts
+      # before lima's netplan-generated 10-netplan-lima0.network,
+      # so networkd treats lima0 as static from the start and
+      # never runs a competing DHCP client on it.
+      LIMA_IP=192.168.105.10
+      for _ in $(seq 1 30); do
+        ip link show lima0 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      mkdir -p /etc/systemd/network
+      printf '[Match]\nName=lima0\n[Network]\nAddress=%s/24\nDHCP=no\n' \
+        "$LIMA_IP" > /etc/systemd/network/05-natra-lima0.network
+      networkctl reload
+      networkctl reconfigure lima0
+      for _ in $(seq 1 30); do
+        ip -4 -o addr show lima0 2>/dev/null | grep -q "${LIMA_IP}/24" && break
+        sleep 1
+      done
+      if ! ip -4 -o addr show lima0 | grep -q "${LIMA_IP}/24"; then
+        echo "natra vm-rig: failed to set static ${LIMA_IP} on lima0" >&2
         exit 1
       fi
       echo "$LIMA_IP" > /etc/natra-server-ip
-
-      # Keep lima0's DHCP *address* (vmnet-known → cross-VM pod
-      # traffic works) but DROP its DHCP-provided default route.
-      # vmnet's lease installs `default via <gw> dev lima0` at
-      # metric 100, which outranks eth0's user-mode-NAT default
-      # (metric 200) and hijacks internet egress onto the vmnet
-      # path — which has no working outbound NAT, so the k3s
-      # install below (and image pulls) can't reach the internet.
-      # Internet must stay on eth0. flannel host-gw only needs
-      # lima0 for explicit pod-CIDR routes, never a default.
-      ip route del default dev lima0 2>/dev/null || true
 
       # flannel-backend=host-gw: each node installs a kernel route
       # "<other-node pod-cidr> via <other-node lima0 IP> dev lima0".
@@ -116,15 +113,13 @@ provision:
       # --flannel-iface=lima0 is LOAD-BEARING and the actual fix for
       # the original "cross-VM pod traffic dead" symptom. Without it
       # flannel auto-selects its inter-node interface from the
-      # default route — which is correctly eth0 (the per-VM-isolated
-      # lima user-mode NAT; its IP 192.168.5.15 is identical on
-      # every VM and goes nowhere cross-VM). flannel then installs
+      # default route — which is eth0 (the per-VM-isolated lima
+      # user-mode NAT; its IP 192.168.5.15 is identical on every VM
+      # and goes nowhere cross-VM). flannel then installs
       # `<other pod-cidr> via 192.168.5.15 dev eth0`, a black hole.
       # Pinning lima0 (the shared vmnet network, where the nodes
-      # actually reach each other — ping/ARP verified working)
-      # makes host-gw install the correct next-hop. This pairs with
-      # the default-route drop above: internet egress on eth0,
-      # pod-to-pod on lima0, both explicit, no auto-selection.
+      # actually reach each other — ping/ARP verified) makes
+      # host-gw install the correct next-hop.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --flannel-iface=lima0 --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \
