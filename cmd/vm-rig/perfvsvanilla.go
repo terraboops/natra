@@ -160,6 +160,25 @@ func pvvMeasurePhase(c *Config, env []string, namespace, serverNode, workerNode,
 		if err != nil {
 			return r, err
 		}
+		// baseline = a genuinely unshaped wire, not "bandwidth with
+		// kubelet's huge default burst". k3s bundles the upstream
+		// bandwidth plugin in its conflist, but it only installs a
+		// qdisc for *annotated* pods — so stripping the bandwidth
+		// annotations from the baseline perf-server makes the
+		// bundled plugin inert for it and the elephant runs at the
+		// raw cross-kernel wire ceiling. vanilla/natra keep the
+		// annotations (each shapes the same workload its own way).
+		if phase == "baseline" && m == "test/perf/realworld/perf-server.yaml" {
+			var keep []string
+			for _, line := range strings.Split(manifest, "\n") {
+				if strings.Contains(line, "kubernetes.io/ingress-bandwidth") ||
+					strings.Contains(line, "kubernetes.io/egress-bandwidth") {
+					continue
+				}
+				keep = append(keep, line)
+			}
+			manifest = strings.Join(keep, "\n")
+		}
 		if err := kubectl(env, strings.NewReader(manifest), "apply", "-f", "-"); err != nil {
 			return r, err
 		}
