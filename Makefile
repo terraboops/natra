@@ -186,7 +186,7 @@ test: test-unit ## Default test target — Layer 1 only (fast).
 
 .PHONY: test-unit
 test-unit: ## Layer 1a — Ginkgo unit tests.
-	go test ./pkg/... -coverprofile cover.out
+	go test ./pkg/... ./internal/... -coverprofile cover.out
 
 .PHONY: test-fuzz
 test-fuzz: ## Layer 1b — 30s fuzz against the bandwidth annotation parser.
