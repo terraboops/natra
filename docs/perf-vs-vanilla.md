@@ -172,36 +172,44 @@ Plan to close: `docs/test-environments.md`.
 ## Two-kernel (vm-rig) results
 
 `make perf-vs-vanilla-vm` — two lima VMs, each its own Linux
-kernel (Debian 13, 6.12), joined into one k3s cluster over a real
-inter-VM vmnet wire. perf-server (annotated 10M/10M) on the agent
-VM, perf-client on the server VM, so every packet crosses the
-kernel boundary. iperf3 elephant (receiver-side bps) + hey
-fresh-connection HTTP mice. One sample:
+kernel (Debian 13, 6.12), real inter-VM vmnet wire. perf-server
+(annotated 10M/10M) on the agent VM, perf-client on the server
+VM, so every packet crosses the kernel boundary. iperf3 elephant
+(receiver-side bps) + hey fresh-connection HTTP mice. **Each
+phase runs on its own pristine cluster** (full down/up/measure/
+down) so no warm-cache / kernel-state / ordering bias crosses
+phases — the per-phase latency numbers are trustworthy.
 
 | Phase    | iperf ing  | iperf eg   | hey rps | p50 ms | p99 ms |
 |----------|------------|------------|---------|--------|--------|
-| baseline | 21.17 Mbps | 20.76 Mbps |    1057 |   47.4 |   48.3 |
-| vanilla  | 10.07 Mbps | 10.07 Mbps |    1057 |   47.4 |   48.3 |
-| natra    | 10.25 Mbps | 10.07 Mbps |   16386 |    2.9 |    6.7 |
+| baseline | 21.14 Mbps | 20.83 Mbps |    1065 |   47.3 |   48.2 |
+| vanilla  | 10.06 Mbps | 10.00 Mbps |    1064 |   47.3 |   48.2 |
+| natra    | 10.17 Mbps | 10.14 Mbps |   15369 |    3.2 |    7.3 |
 
-Reads the same as the k3d story, now on real kernels:
+This reproduced an earlier confound-prone run (16386 rps /
+6.7 ms p99 for natra) almost exactly under full per-phase
+isolation — so the result is real, not a warm-cache artifact:
 
 - **Elephant cap.** natra (~10/10) holds the annotation as
-  tightly as the upstream token bucket (~10/10); baseline is the
-  ~21 Mbps vmnet wire ceiling.
-- **Mice survival.** At the *same* elephant cap, natra serves
-  16386 hey rps @ 6.7 ms p99 vs upstream's 1057 @ 48 ms — ~15×
-  RPS, ~7× lower tail. CMS fast-passes the small fresh-flow
-  requests around the bucket; the upstream single bucket queues
-  them behind the elephant.
-- **Caveat.** vanilla's hey row is identical to baseline's to
-  the decimal (1057 / 47.4 / 48.3). The elephant clearly shaped
-  (21→10), so the TBF burst patch engaged — but the exact match
-  suggests hey under baseline/vanilla is pinned by the same
-  contention bottleneck (mice starved either way), not that
-  vanilla measurement failed. Single sample; worth a second run
-  and a closer look at that one cell. The natra-vs-upstream
-  contrast is unambiguous regardless.
+  tightly as the upstream token bucket (~10/10). baseline's
+  ~21 Mbps is *not* an idle wire — k3s v1.30+ bundles the
+  bandwidth plugin, so even "baseline" runs a TBF on the
+  annotated pod, just with kubelet's ~193 MB default burst
+  (≈ unshaped over a short run).
+- **Mice survival.** At the same elephant cap, natra serves
+  **15369 hey rps @ 7.3 ms p99 vs upstream's 1064 @ 48 ms** —
+  ~14× RPS, ~7× lower tail. CMS fast-passes the small fresh-flow
+  requests around the bucket; the upstream single, flow-blind
+  bucket queues them behind the elephant.
+- **baseline ≈ vanilla is a finding, not noise.** The two rows
+  match to ~1 rps / 0.1 ms across *independent* clusters. The
+  upstream plugin's burst size is irrelevant to mice: one bucket
+  serves all flows, so the small requests starve behind the
+  elephant whether its burst is 193 MB or 1 MB. That flow-
+  blindness is precisely what natra's CMS classifier removes —
+  and why "natra p99 < baseline p99" is legitimate: baseline
+  mice are queued behind a 21 Mbps elephant in a shared bucket;
+  natra mice skip the bucket entirely.
 
 ## Throttle disposition
 
