@@ -49,7 +49,9 @@ func (e *Executor) runMemory(ctx context.Context, phase Phase) (WorkloadReport, 
 		if err := e.deployMemoryPods(ctx, ns, n, phase); err != nil {
 			return wr, fmt.Errorf("scale to %d: %w", n, err)
 		}
-		if err := kubectl(ctx, kc, nil, "wait", "--for=condition=Ready",
+		// kubectl wait needs an explicit resource type when given
+		// only a selector; "pods -l app=…" is the documented form.
+		if err := kubectl(ctx, kc, nil, "wait", "--for=condition=Ready", "pods",
 			"-n", ns, "-l", "app=perf-server-mem", "--timeout=180s"); err != nil {
 			return wr, fmt.Errorf("wait scale: %w", err)
 		}
@@ -292,10 +294,17 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 // deployMemoryPods deploys n-1 clones of perf-server, pinned to
 // the worker node, labelled app=perf-server-mem so they can be
 // waited on / cleaned up as a set.
+//
+// The base manifest is a multi-doc YAML (Pod + Service); we keep
+// only the Pod doc when cloning so we don't re-apply the Service
+// for each clone (the original Service is already in place from
+// stagePhase) and we don't accidentally repoint the Service
+// selector at the clones. The pod's existing `app: perf-server`
+// label gets rewritten to `app: perf-server-mem` so the wait/
+// teardown selector matches just the clones.
 func (e *Executor) deployMemoryPods(ctx context.Context, ns string, n int, phase Phase) error {
 	server, worker := e.Substrate.Nodes()
 	kc := e.Substrate.KubeconfigPath()
-	// Render the base perf-server manifest once.
 	manifest, err := renderPerfManifest(e.RepoRoot, "test/perf/realworld/perf-server.yaml",
 		ns, server, worker, e.PerfclientImage)
 	if err != nil {
@@ -304,21 +313,20 @@ func (e *Executor) deployMemoryPods(ctx context.Context, ns string, n int, phase
 	if phase == PhaseBaseline {
 		manifest = stripBandwidthAnnotations(manifest)
 	}
-	// Emit n-1 renamed copies. Naive string transform: replace the
-	// pod name "perf-server" with "perf-server-mem-<i>" and add the
-	// app label. Two manifests joined with --- so kubectl applies
-	// them as one document.
-	var docs []string
+	// Pod doc only — drop the Service section (everything from
+	// the first `---` onward).
+	if i := strings.Index(manifest, "\n---\n"); i >= 0 {
+		manifest = manifest[:i]
+	}
+	docs := make([]string, 0, n-1)
 	for i := 2; i <= n; i++ {
 		name := fmt.Sprintf("perf-server-mem-%d", i)
-		copy := strings.Replace(manifest, "name: perf-server", "name: "+name, 1)
-		// Add the app label under metadata; the manifest already has
-		// a labels: section we can extend with sed-style insertion.
-		copy = strings.Replace(copy,
-			"  name: "+name,
-			"  name: "+name+"\n  labels:\n    app: perf-server-mem",
-			1)
-		docs = append(docs, copy)
+		clone := strings.Replace(manifest, "name: perf-server", "name: "+name, 1)
+		// Repoint the pod's existing label in place — no second
+		// `labels:` key inserted, so the YAML stays valid and the
+		// pod actually carries the clone label.
+		clone = strings.Replace(clone, "app: perf-server", "app: perf-server-mem", 1)
+		docs = append(docs, clone)
 	}
 	bigDoc := strings.Join(docs, "\n---\n")
 	return kubectl(ctx, kc, strings.NewReader(bigDoc), "apply", "-f", "-")
