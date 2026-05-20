@@ -256,6 +256,12 @@ func parseTimeVPeakKB(out string) int64 {
 // returns 0 (no installer). vanilla returns 0 unless the rig has
 // deployed the upstream vanilla-installer DS (deploy/cni-installer
 // for the natra phase is the typical case here).
+//
+// Implementation notes:
+//   - crictl needs an explicit --runtime-endpoint on k3s nodes;
+//     the default socket isn't where k3s puts containerd.
+//   - The label filter format is `key=value` literally; we pass
+//     the raw "app=natra-installer" form straight through.
 func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase Phase) (int64, error) {
 	if phase == PhaseBaseline {
 		return 0, nil
@@ -267,22 +273,22 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 	case PhaseVanilla:
 		label = "app=vanilla-installer"
 	}
-	// Find the DS pod's pid namespace on the node and sum its cgroup
-	// memory.current. The script is a best-effort one-liner; if the
-	// installer DS isn't present, the script prints 0 and exits 0.
+	const crictl = `crictl --runtime-endpoint=unix:///run/k3s/containerd/containerd.sock`
 	script := fmt.Sprintf(`
-        pid=$(crictl ps -q --label io.kubernetes.pod.label.%s 2>/dev/null | head -1 | xargs -r crictl inspect 2>/dev/null | awk '/"pid":/ {print $2}' | tr -d ',' | head -1)
+        cid=$(%[1]s ps -q --label "%[2]s" 2>/dev/null | head -1)
+        if [ -z "$cid" ]; then echo 0; exit 0; fi
+        pid=$(%[1]s inspect "$cid" 2>/dev/null | awk '/"pid":/ {print $2}' | tr -d ',' | head -1)
         if [ -n "$pid" ] && [ -f /proc/$pid/cgroup ]; then
-          cg=$(awk -F: '$2 ~ /memory/ || $1 == "0" {print $3}' /proc/$pid/cgroup | head -1)
-          if [ -f /sys/fs/cgroup$cg/memory.current ]; then
-            cat /sys/fs/cgroup$cg/memory.current
+          cg=$(awk -F: '$1 == "0" {print $3}' /proc/$pid/cgroup | head -1)
+          if [ -f "/sys/fs/cgroup$cg/memory.current" ]; then
+            cat "/sys/fs/cgroup$cg/memory.current"
           else
             echo 0
           fi
         else
           echo 0
         fi
-    `, strings.ReplaceAll(label, "=", "."))
+    `, crictl, label)
 	out, err := sub.NodeShell(ctx, node, script)
 	if err != nil {
 		return 0, err

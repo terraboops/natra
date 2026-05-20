@@ -132,6 +132,14 @@ provision:
       # Pinning lima0 (the shared vmnet network, where the nodes
       # actually reach each other — ping/ARP verified) makes
       # host-gw install the correct next-hop.
+      # bpftool + /usr/bin/time are needed by the perfrig memory
+      # workload (bpftool reports byte-exact BPF memlock for natra;
+      # /usr/bin/time -v reports the CNI plugin's ru_maxrss). Debian
+      # trixie's generic cloud image has neither by default. Install
+      # before k3s so node bringup is steady-state.
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool time
+
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --flannel-iface=lima0 --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \

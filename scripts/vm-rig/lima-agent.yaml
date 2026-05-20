@@ -82,6 +82,13 @@ provision:
       # (the per-VM-isolated user-mode NAT) and cross-VM pod
       # traffic black-holes. See lima-server.yaml — this is the
       # actual fix for the original symptom.
+      # bpftool + /usr/bin/time are needed by the perfrig memory
+      # workload — see lima-server.yaml's matching install for the
+      # rationale. Same package set on every node since the worker
+      # is where the measurements actually run.
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool time
+
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         K3S_URL="${NATRA_K3S_URL}" \
