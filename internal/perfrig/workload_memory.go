@@ -219,20 +219,30 @@ func splitJSONArrays(s string) []string {
 // the system state both plugins touch, which is not the
 // plugin's cost.
 func pluginInvokePeakRSS(ctx context.Context, sub Substrate, node string, phase Phase) (int64, error) {
-	var bin string
-	switch phase {
-	case PhaseBaseline:
+	if phase == PhaseBaseline {
 		return 0, nil
+	}
+	var name string
+	switch phase {
 	case PhaseVanilla:
-		bin = "/opt/cni/bin/bandwidth"
+		name = "bandwidth"
 	case PhaseNatra:
-		bin = "/opt/cni/bin/natra"
+		name = "natra"
 	default:
 		return 0, nil
 	}
-	script := fmt.Sprintf(
-		`if [ -x %s ]; then /usr/bin/time -v env CNI_COMMAND=VERSION CNI_CONTAINERID=x CNI_NETNS=/proc/self/ns/net CNI_IFNAME=eth0 CNI_PATH=/opt/cni/bin %s < /dev/null 2>&1 >/dev/null || true; fi`,
-		bin, bin)
+	// CNI binary location varies: /opt/cni/bin/ on kind/upstream,
+	// /var/lib/rancher/k3s/data/cni/ on k3s 1.30+, sometimes a
+	// versioned subdir. Find the binary rather than guess; bail
+	// with 0 if it genuinely isn't anywhere.
+	script := fmt.Sprintf(`
+        bin=""
+        for p in /opt/cni/bin/%[1]s /var/lib/rancher/k3s/data/cni/%[1]s /var/lib/rancher/k3s/data/current/bin/%[1]s; do
+          [ -x "$p" ] && { bin="$p"; break; }
+        done
+        if [ -z "$bin" ]; then exit 0; fi
+        /usr/bin/time -v env CNI_COMMAND=VERSION CNI_CONTAINERID=x CNI_NETNS=/proc/self/ns/net CNI_IFNAME=eth0 CNI_PATH=$(dirname "$bin") "$bin" < /dev/null 2>&1 1>/dev/null || true
+    `, name)
 	out, err := sub.NodeShell(ctx, node, script)
 	if err != nil {
 		return 0, err
@@ -269,7 +279,10 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 	label := ""
 	switch phase {
 	case PhaseNatra:
-		label = "app=natra-installer"
+		// deploy/cni-installer.yaml labels the DS pods `app=natra`,
+		// not app=natra-installer (the DS *resource* name is
+		// natra-installer but the pod template label is app=natra).
+		label = "app=natra"
 	case PhaseVanilla:
 		label = "app=vanilla-installer"
 	}
