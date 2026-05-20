@@ -85,10 +85,22 @@ func (e *Executor) runPhase(ctx context.Context, phase Phase) (PhaseReport, erro
 		return pr, fmt.Errorf("cluster up: %w", err)
 	}
 
+	// natra phase: chain natra + (the natra installer code also
+	// imports perfclient). baseline/vanilla phases: only the
+	// perfclient image is needed — natra is not installed but the
+	// workload pods still pull perfclient, so import it explicitly.
+	// Missing this is what wedged the first lima run: the perf-
+	// client pod stayed ImagePullBackOff forever because the image
+	// only existed on disk, not in either VM's containerd.
 	if phase == PhaseNatra {
 		e.logf("==> [%s] installing natra (image + chained conflist)\n", phase)
 		if err := e.Substrate.InstallNatra(ctx); err != nil {
 			return pr, fmt.Errorf("natra install: %w", err)
+		}
+	} else {
+		e.logf("==> [%s] importing perfclient image\n", phase)
+		if err := e.Substrate.ImportImage(ctx, e.PerfclientImage, "Dockerfile.perfclient"); err != nil {
+			return pr, fmt.Errorf("import perfclient: %w", err)
 		}
 	}
 
