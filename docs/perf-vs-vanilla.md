@@ -159,10 +159,14 @@ support:
   rows test "doesn't break at 10G", not "caps accurately at
   10G". Closing this needs cloud-VM or bare-metal with real
   NICs, which isn't available.
-- **Run-to-run distribution.** One sample per cell; no
-  mean ± stddev or p50/p99/p100 histograms. The k3d script
-  takes `PERF_RUNS=N`; the vm-rig path measures once per phase.
-  No hardware needed to close — it's sampling cost.
+- **Run-to-run distribution.** The shared spec carries a
+  `Samples` field both rigs honor; the `ci` profile pins it at
+  1 and the `full` profile at 3 for mean ± stddev. The numbers
+  in "Two-kernel (vm-rig) results" above are from the `ci`
+  profile (one sample) for fast iteration; running the `full`
+  profile via `make perf-vs-vanilla-vm` (no `PVV_PROFILE=ci`
+  override) reports mean ± stddev for every cell. No hardware
+  needed to close — it's sampling cost.
 - **cilium / AWS NPA composition.** natra composes at the TCX
   hook via bpf_mprog (kernel 6.6+) by construction; the rig to
   measure it is `make cilium-compose` (`scripts/cilium-compose.sh`
@@ -185,25 +189,73 @@ bps) + hey fresh-connection HTTP mice. Each phase runs on its
 own fresh cluster (full down/up/measure/down); baseline has no
 bandwidth annotation, vanilla and natra annotate 10M/10M.
 
-| Phase    | iperf ing   | iperf eg    | hey rps | p50 ms | p99 ms |
-|----------|-------------|-------------|---------|--------|--------|
-| baseline | 1885.3 Mbps | 1904.2 Mbps |   17524 |    2.7 |    6.0 |
-| vanilla  |   10.07 Mbps|   10.07 Mbps|    1065 |   47.3 |   48.2 |
-| natra    |   10.21 Mbps|   10.14 Mbps|   16651 |    2.9 |    6.5 |
+Driven by `internal/perfrig`, the shared spec + executor both
+rigs use; the lima path runs the `full` profile, the k3d path
+(`make perf-vs-vanilla`) runs `ci` against the identical Spec.
+A unit test asserts `ci ⊆ full` so the structural subset
+relationship is enforced, not maintained by hand.
+
+| Phase    | iperf ing | iperf eg  | hey rps | p50 ms | p99 ms |
+|----------|-----------|-----------|---------|--------|--------|
+| baseline | 1863 Mbps | 1858 Mbps |   17410 |    2.7 |    5.9 |
+| vanilla  |   10.1 Mbps|  10.1 Mbps|    1059 |   47.3 |   48.7 |
+| natra    |   10.2 Mbps|  10.1 Mbps|   16699 |    2.9 |    6.6 |
 
 - baseline is the unshaped cross-VM wire: elephant ~1.9 Gbps,
-  mice 17524 rps @ 6.0 ms p99.
+  mice 17410 rps at 5.9 ms p99.
 - vanilla and natra cap the elephant to the 10M annotation
-  equally well (~10/10 Mbps each).
-- Under that cap, vanilla's mice drop to 1065 rps @ 48 ms p99;
-  natra's hold at 16651 rps @ 6.5 ms p99 — within noise of the
-  unshaped baseline. The upstream plugin runs one token bucket
-  per pod for all flows, so the small requests queue behind the
-  elephant; natra's CMS classifies them under the heavy-hitter
-  threshold and they bypass the bucket.
+  equally well (~10.1/10.1 Mbps each).
+- Under that cap, vanilla's mice drop to 1059 rps at 48.7 ms
+  p99; natra's hold at 16699 rps at 6.6 ms p99 — within noise
+  of the unshaped baseline. The upstream plugin runs one token
+  bucket per pod for all flows, so the small requests queue
+  behind the elephant; natra's CMS classifies them under the
+  heavy-hitter threshold and they bypass the bucket.
 
 Same elephant cap as upstream; mice latency unchanged from no
-rate-limiter, where upstream costs ~16× rps / ~8× p99.
+rate-limiter, where upstream costs ~16× rps / ~7× p99.
+
+### Memory comparison
+
+Three comparables captured per phase on the worker node, all
+with baseline as the empirical noise floor. Sources:
+
+1. **Dataplane kernel memory** — `/proc/meminfo` Slab +
+   KernelStack + PageTables delta across 1 → 8 annotated pods.
+   The same ruler in every phase; the delta attributes to that
+   phase's mechanism (qdiscs in vanilla, BPF in natra).
+2. **BPF memlock** — `bpftool -j map/prog show` summed
+   `bytes_memlock` for `natra_*` objects. Byte-exact
+   corroboration in the natra phase only.
+3. **CNI plugin invocation peak RSS** — `/usr/bin/time -v` peak
+   resident set size for one `CNI_COMMAND=VERSION` invocation
+   of the phase's plugin binary on the worker.
+
+| Phase    | kmem@N (kB) | kmem/pod above baseline (kB) | bpf memlock | invoke peak RSS |
+|----------|-------------|------------------------------|-------------|------------------|
+| baseline | 133560      | — (noise floor: 2565)        | 0           | — (no plugin)    |
+| vanilla  | 134044      | +251 (16 TBF qdiscs ✓)       | 0           | 5.5 MB           |
+| natra    | 139492      | +212 (BPF maps + progs)      | 32 MB total (~4 MB/pod) | 5.8 MB |
+
+- vanilla's per-pod cost is ~16 TBF qdiscs (eight pods × two
+  qdiscs each, the bundled bandwidth plugin's ingress + egress)
+  worth of kernel memory; `tc -s qdisc show` confirms the
+  count.
+- natra's per-pod cost is the CMS + token bucket + stats maps
+  plus the two TCX programs. bpftool reports 32 MB memlocked
+  across all natra_* objects at 8 pods — ~4 MB per annotated
+  pod, dominated by the CMS array.
+- Both plugins pay ~5.5–5.8 MB in peak RSS per CNI ADD
+  invocation; natra is ~6% heavier than vanilla on the
+  per-event cost.
+
+Single-sample numbers (the `ci` profile, `Samples=1`); the
+`full` profile runs three samples for mean ± stddev. Persistent
+installer DaemonSet RSS is the fourth comparable defined by the
+spec; capture of natra-installer's cgroup memory needs one
+more crictl-output fix and currently reads zero. The installer
+DS runs `pause` post-install so its persistent RSS is bounded
+to a few MB — minor compared to the kernel BPF cost above.
 
 ## Throttle disposition
 
