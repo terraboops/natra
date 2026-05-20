@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/terraboops/natra/internal/perfrig"
 )
@@ -32,7 +35,51 @@ func (l *limaSubstrate) Nodes() (string, string) {
 	return "lima-" + l.c.ServerName, "lima-" + l.c.AgentName
 }
 
-func (l *limaSubstrate) Up(_ context.Context) error   { return cmdUp(l.c) }
+func (l *limaSubstrate) Up(_ context.Context) error {
+	healLimaImageCache()
+	return cmdUp(l.c)
+}
+
+// healLimaImageCache repairs a known lima cache failure mode: when
+// the upstream mirror's Last-Modified Head times out (TLS handshake
+// EOF, etc.), lima zeros the cache's `type` marker even though the
+// `data` qcow2 is intact. Every subsequent `limactl create` then
+// dies with `open .../<instance>/basedisk: no such file or
+// directory` because lima refuses to symlink basedisk from a cache
+// with an unrecognized type. Writing "qcow2" back into any empty
+// `type` file under ~/Library/Caches/lima/download/by-url-sha256/
+// makes the cache usable again until the mirror is reachable. This
+// is a workaround, not a fix for the underlying lima behavior, but
+// it's bounded (only touches our own cache, only when the marker is
+// empty) and turns a hard-fail-need-manual-intervention loop into
+// a transparent recovery.
+func healLimaImageCache() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	root := filepath.Join(home, "Library", "Caches", "lima", "download", "by-url-sha256")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return // no cache dir → nothing to heal
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		typePath := filepath.Join(root, e.Name(), "type")
+		info, err := os.Stat(typePath)
+		if err != nil || info.Size() != 0 {
+			continue
+		}
+		dataPath := filepath.Join(root, e.Name(), "data")
+		if _, err := os.Stat(dataPath); err != nil {
+			continue // no data file → not a complete cache entry
+		}
+		_ = os.WriteFile(typePath, []byte("qcow2"), 0o644)
+		fmt.Printf("==> lima cache heal: wrote qcow2 to %s\n", typePath)
+	}
+}
 func (l *limaSubstrate) Down(_ context.Context) error { return cmdDown(l.c) }
 
 func (l *limaSubstrate) InstallNatra(_ context.Context) error { return cmdInstall(l.c) }
