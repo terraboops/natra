@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,7 +74,7 @@ func cmdInstall(c *Config) error {
 		nil,
 		"rollout", "status",
 		"daemonset/natra-installer", "-n", "kube-system",
-		"--timeout=120s"); err != nil {
+		"--timeout=240s"); err != nil {
 		return err
 	}
 
@@ -129,46 +128,25 @@ func importImage(c *Config, image, dockerfile string) error {
 // cached.
 func renderInstallerManifest(c *Config) (string, error) {
 	src := filepath.Join(c.RepoRoot, "deploy", "cni-installer.yaml")
-	f, err := os.Open(src)
+	b, err := os.ReadFile(src)
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = f.Close() }()
-
-	var out strings.Builder
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	const natraTag = "ghcr.io/terraboops/natra:latest"
-	const k8sEtcCNI = "path: /etc/cni/net.d"
-	const k3sEtcCNI = "path: /var/lib/rancher/k3s/agent/etc/cni/net.d"
-
-	// State: when we see the natra init-container image line, the
-	// next imagePullPolicy line should be rewritten to Never. The
-	// pause sidecar's image line doesn't trigger this flag, so its
-	// IfNotPresent stays.
-	flipNextPullPolicy := false
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case strings.Contains(line, natraTag):
-			out.WriteString(strings.Replace(line, natraTag, c.NatraImage, 1))
-			out.WriteByte('\n')
-			flipNextPullPolicy = true
-		case flipNextPullPolicy && strings.Contains(line, "imagePullPolicy:"):
-			out.WriteString(strings.Replace(line, "IfNotPresent", "Never", 1))
-			out.WriteByte('\n')
-			flipNextPullPolicy = false
-		case strings.Contains(line, k8sEtcCNI):
-			out.WriteString(strings.Replace(line, k8sEtcCNI, k3sEtcCNI, 1))
-			out.WriteByte('\n')
-		default:
-			out.WriteString(line)
-			out.WriteByte('\n')
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return out.String(), nil
+	// Only the natra image tag needs substitution. The legacy
+	// /etc/cni/net.d → k3s-path rewrite + the IfNotPresent → Never
+	// rewrite are both no longer needed:
+	//
+	//   - The DS manifest now mounts BOTH /etc/cni/net.d and the
+	//     k3s path as separate volumes; the init container picks
+	//     whichever directory actually contains a *.conflist.
+	//     Rewriting one to the other defeats the dual-path
+	//     detection (and was the cause of the cilium phase rollout
+	//     timeout, since cilium writes its conflist at
+	//     /etc/cni/net.d/05-cilium.conflist).
+	//   - IfNotPresent works for both the natra image (limactl
+	//     copy + k3s ctr import → local hit) and the pause sidecar
+	//     (registry pull on cache miss). Forcing Never broke pause
+	//     in the same way it broke k3d before that fix.
+	return strings.ReplaceAll(string(b),
+		"ghcr.io/terraboops/natra:latest", c.NatraImage), nil
 }
