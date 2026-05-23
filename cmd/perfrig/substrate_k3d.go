@@ -156,18 +156,20 @@ func (k *k3dSubstrate) InstallNatra(ctx context.Context) error {
 	if err := k.ImportImage(ctx, k.natraImage, "Dockerfile.cni"); err != nil {
 		return fmt.Errorf("import natra image: %w", err)
 	}
-	// Render the installer manifest with the local image tag and
-	// pull policy. The on-disk manifest has the production ghcr
-	// tag + IfNotPresent; we substitute to the local tag + Never
-	// so the cluster uses our just-imported image.
+	// Render the installer manifest with the local image tag. The
+	// on-disk manifest has the production ghcr tag; we only rewrite
+	// the image, NOT the pull policy. IfNotPresent works for both
+	// the natra image (k3d image import puts it in the cluster's
+	// containerd → local hit) and the pause sidecar (well-known
+	// registry image kubelet pulls if missing). The earlier "Never"
+	// rewrite over-broadly hit the pause container too, and pause
+	// isn't pre-loaded in k3d → DS stuck pulling forever.
 	manifest, err := os.ReadFile(filepath.Join(k.repoRoot, "deploy", "cni-installer.yaml"))
 	if err != nil {
 		return fmt.Errorf("read installer manifest: %w", err)
 	}
-	rewritten := strings.NewReplacer(
-		"ghcr.io/terraboops/natra:latest", k.natraImage,
-		"imagePullPolicy: IfNotPresent", "imagePullPolicy: Never",
-	).Replace(string(manifest))
+	rewritten := strings.ReplaceAll(string(manifest),
+		"ghcr.io/terraboops/natra:latest", k.natraImage)
 
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+k.KubeconfigPath())
