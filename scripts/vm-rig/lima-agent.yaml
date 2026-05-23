@@ -89,9 +89,12 @@ provision:
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool time
 
+      # k3s agent with no flannel/kube-proxy — cilium owns the
+      # dataplane (installed by the server's provision script).
+      # No --flannel-iface needed since flannel is not running.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
         K3S_URL="${NATRA_K3S_URL}" \
         K3S_TOKEN="${NATRA_K3S_TOKEN}" \
-        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP} --flannel-iface=lima0" \
+        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP}" \
         sh -
