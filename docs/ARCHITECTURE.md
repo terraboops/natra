@@ -293,8 +293,9 @@ returned link to bpffs at
 kernel holds each program reference via its link until `cmdDel`
 removes the pin. Composes via `bpf_mprog` with anything else
 attaching at the same hook — that's the contract bpf_mprog
-provides; we haven't run a composed stack (cilium / NPA + natra)
-end-to-end yet.
+provides; the vm-rig (`make perf-vs-vanilla-vm`) runs cilium
+as its CNI with natra chained after it, so a real composed
+cilium + natra stack is exercised on every run.
 
 ### Hook: clsact (kernel 5.x+)
 
@@ -350,9 +351,11 @@ Properties that are claimed by construction but not yet validated
 on a real rig (this list is what the test environments in
 `docs/test-environments.md` would close):
 
-- **cilium / aws-network-policy-agent coexistence.** The
-  bpf_mprog contract on TCX says natra composes; we haven't run a
-  loaded cilium cluster with natra chained alongside.
+- **aws-network-policy-agent coexistence.** The vm-rig now runs
+  cilium as its CNI on every `make perf-vs-vanilla-vm` so the
+  cilium+natra TCX coexistence is exercised end-to-end. AWS NPA
+  (which also attaches at TCX via bpf_mprog) is the remaining
+  unmeasured case — needs an EKS cluster with NPA, not local.
 - **Real-NIC offload behavior.** TSO, GRO, LRO, hardware TX
   timestamping all reshape what the BPF program sees vs. what a
   software bridge produces. The L3-L5 rig is software-only.

@@ -167,15 +167,13 @@ support:
   profile via `make perf-vs-vanilla-vm` (no `PVV_PROFILE=ci`
   override) reports mean ± stddev for every cell. No hardware
   needed to close — it's sampling cost.
-- **cilium / AWS NPA composition.** natra composes at the TCX
-  hook via bpf_mprog (kernel 6.6+) by construction; the rig to
-  measure it is `make cilium-compose` (`scripts/cilium-compose.sh`
-  — k3d, cilium as the CNI with kube-proxy/flannel disabled,
-  natra chained after it, asserting both programs sit at the pod
-  TCX hook and natra still rate-limits). Scaffold landed;
-  end-to-end verification pending (the natra-installer conflist
-  patch was written against flannel and may need work for
-  cilium's conflist shape).
+- **AWS NPA composition.** The vm-rig now runs cilium as its
+  CNI (TCX dataplane, kube-proxy replacement), so natra-with-
+  cilium coexistence at the pod TCX hook is exercised on every
+  `make perf-vs-vanilla-vm` run. AWS NPA (which also attaches
+  at TCX via bpf_mprog) is the remaining unmeasured composition
+  case — it doesn't run locally; closing it needs an EKS cluster
+  with NPA enabled, which isn't available.
 
 Escalation rigs: `docs/test-environments.md`.
 

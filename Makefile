@@ -242,10 +242,6 @@ test-vm: ## Layer 4 (kernel-isolated): two-VM k3s cluster via lima, real cross-k
 perf-vs-vanilla-vm: ## natra vs upstream bandwidth on two real kernels (lima). Owns the VM lifecycle: fresh cluster per phase. ~40 min. Local-dev counterpart of the k3d perf-vs-vanilla.
 	@go run ./cmd/vm-rig perfvsvanilla
 
-.PHONY: cilium-compose
-cilium-compose: ## Prove natra composes with cilium at the TCX hook (k3d, cilium as CNI, natra chained). SCAFFOLD — not yet verified.
-	@bash scripts/cilium-compose.sh
-
 .PHONY: test-all
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.
 
