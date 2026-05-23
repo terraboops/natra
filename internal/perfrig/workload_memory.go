@@ -287,10 +287,18 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 		label = "app=vanilla-installer"
 	}
 	const crictl = `crictl --runtime-endpoint=unix:///run/k3s/containerd/containerd.sock`
+	// crictl inspect's `info` field is a *stringified* JSON, not a
+	// structured object — `"pid":NNN` is wrapped inside an escaped
+	// string. A grep that matches the literal substring works for
+	// both the raw and the escaped form (the backslashes around
+	// "pid": don't affect the match).
 	script := fmt.Sprintf(`
         cid=$(%[1]s ps -q --label "%[2]s" 2>/dev/null | head -1)
         if [ -z "$cid" ]; then echo 0; exit 0; fi
-        pid=$(%[1]s inspect "$cid" 2>/dev/null | awk '/"pid":/ {print $2}' | tr -d ',' | head -1)
+        pid=$(%[1]s inspect "$cid" 2>/dev/null \
+            | grep -oE '"pid":[[:space:]]*[0-9]+' \
+            | grep -oE '[0-9]+' \
+            | head -1)
         if [ -n "$pid" ] && [ -f /proc/$pid/cgroup ]; then
           cg=$(awk -F: '$1 == "0" {print $3}' /proc/$pid/cgroup | head -1)
           if [ -f "/sys/fs/cgroup$cg/memory.current" ]; then

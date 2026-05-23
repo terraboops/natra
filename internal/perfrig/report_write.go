@@ -35,40 +35,92 @@ func WriteReport(rep Report, path string, out io.Writer) error {
 	return nil
 }
 
-// writeIperfTable summarizes the iperfSweep+mixed throughput data.
-// Today the iperfSweep workload also fills MixedSamples (rps/p50/p99
-// from the hey HTTP path), so this table covers the
-// throughput-and-mice story end to end per phase.
+// writeIperfTable summarizes the iperfSweep workload: one row per
+// phase × rate × direction × kind. With single-rate today the table
+// is compact; the same shape scales when the multi-rate sweep lands.
 func writeIperfTable(b *strings.Builder, rep Report) {
-	fmt.Fprintf(b, "\nPhase summary (iperf elephant + hey HTTP mice on the annotated pod)\n")
-	fmt.Fprintf(b, "%-10s  %-14s  %-14s  %-14s  %-11s  %-11s\n",
-		"Phase", "iperf ing Mbps", "iperf eg Mbps", "hey rps", "p50 ms", "p99 ms")
-	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 84))
+	if !anyWorkloadHasData(rep, WorkloadIperfSweep) {
+		return
+	}
+	fmt.Fprintf(b, "\niperfSweep: per-direction elephant throughput\n")
+	fmt.Fprintf(b, "%-10s  %-14s  %-14s\n", "Phase", "iperf ing Mbps", "iperf eg Mbps")
+	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 44))
 	for _, p := range rep.Phases {
-		ing, eg, rps, p50, p99 := collectMixedSeries(p)
-		fmt.Fprintf(b, "%-10s  %-14s  %-14s  %-14s  %-11s  %-11s\n",
-			p.Phase,
-			cell(ing, 1e6, 1), cell(eg, 1e6, 1),
-			cell(rps, 1, 0), cell(p50, 1, 1), cell(p99, 1, 1))
+		var ing, eg []float64
+		for _, w := range p.Workloads {
+			if w.Kind != WorkloadIperfSweep {
+				continue
+			}
+			for _, c := range w.IperfCells {
+				switch c.Direction {
+				case "ingress":
+					ing = append(ing, c.Bps)
+				case "egress":
+					eg = append(eg, c.Bps)
+				}
+			}
+		}
+		fmt.Fprintf(b, "%-10s  %-14s  %-14s\n",
+			p.Phase, cell(ing, 1e6, 1), cell(eg, 1e6, 1))
 	}
 }
 
+// writeMixedTable reports the mixed workload: iperf3 --bidir
+// elephant plus annotated mice (CMS fast-pass story) and bystander
+// mice (collateral cost on an unannotated neighbor). The bystander
+// columns are the actual natra-vs-vanilla "doesn't charge what it
+// doesn't have to" check.
 func writeMixedTable(b *strings.Builder, rep Report) {
-	// Mixed-with-bystander lands in the next slice; until then this
-	// section is suppressed rather than printing an empty header.
-	hasBystander := false
+	if !anyWorkloadHasData(rep, WorkloadMixed) {
+		return
+	}
+	fmt.Fprintf(b, "\nmixed: iperf3 --bidir elephant + concurrent hey mice on annotated + bystander pods\n")
+	fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s\n",
+		"Phase", "ing Mbps", "eg Mbps",
+		"pod rps", "p50 ms", "p99 ms",
+		"by rps", "p50 ms", "p99 ms")
+	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 110))
+	for _, p := range rep.Phases {
+		var ing, eg, prps, pp50, pp99, brps, bp50, bp99 []float64
+		for _, w := range p.Workloads {
+			if w.Kind != WorkloadMixed {
+				continue
+			}
+			for _, m := range w.MixedSamples {
+				ing = append(ing, m.IperfIngressBps)
+				eg = append(eg, m.IperfEgressBps)
+				prps = append(prps, m.PodRPS)
+				pp50 = append(pp50, m.PodP50)
+				pp99 = append(pp99, m.PodP99)
+				brps = append(brps, m.BystanderRPS)
+				bp50 = append(bp50, m.BystanderP50)
+				bp99 = append(bp99, m.BystanderP99)
+			}
+		}
+		fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s\n",
+			p.Phase,
+			cell(ing, 1e6, 1), cell(eg, 1e6, 1),
+			cell(prps, 1, 0), cell(pp50, 1, 1), cell(pp99, 1, 1),
+			cell(brps, 1, 0), cell(bp50, 1, 1), cell(bp99, 1, 1))
+	}
+}
+
+// anyWorkloadHasData reports whether at least one phase carries
+// data for the named workload. Used to skip empty sections in the
+// report — a workload that never produced samples (e.g. mixed when
+// the bystander deploy failed) shouldn't render an empty header.
+func anyWorkloadHasData(rep Report, kind WorkloadKind) bool {
 	for _, p := range rep.Phases {
 		for _, w := range p.Workloads {
-			if w.Kind == WorkloadMixed && len(w.MixedSamples) > 0 {
-				hasBystander = true
-				break
+			if w.Kind != kind {
+				continue
+			}
+			if len(w.IperfCells) > 0 || len(w.MixedSamples) > 0 || len(w.MemorySamples) > 0 {
+				return true
 			}
 		}
 	}
-	if !hasBystander {
-		return
-	}
-	fmt.Fprintf(b, "\n(mixed workload with bystander — pending wiring)\n")
+	return false
 }
 
 // writeMemoryTable renders the three-comparable memory section.
@@ -123,19 +175,6 @@ func writeMemoryTable(b *strings.Builder, rep Report) {
 			cell(invokeRSS, 1024, 1),
 			cell(dsRSS, 1024, 1))
 	}
-}
-
-func collectMixedSeries(p PhaseReport) (ing, eg, rps, p50, p99 []float64) {
-	for _, w := range p.Workloads {
-		for _, m := range w.MixedSamples {
-			ing = append(ing, m.IperfIngressBps)
-			eg = append(eg, m.IperfEgressBps)
-			rps = append(rps, m.PodRPS)
-			p50 = append(p50, m.PodP50)
-			p99 = append(p99, m.PodP99)
-		}
-	}
-	return
 }
 
 // cell renders mean (and ±stddev when >1 sample) at the given
