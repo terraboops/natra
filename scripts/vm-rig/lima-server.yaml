@@ -135,12 +135,22 @@ provision:
       # bpftool + /usr/bin/time are needed by the perfrig memory
       # workload (bpftool reports byte-exact BPF memlock for natra;
       # /usr/bin/time -v reports the CNI plugin's ru_maxrss).
-      # helm + curl are needed below to install cilium as the CNI.
+      # jq + tar + curl prepare for helm + cilium install below.
       # Debian trixie's generic cloud image has none of these by
       # default. Install before k3s so node bringup is steady-state.
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        bpftool time helm jq
+        bpftool time jq tar curl
+
+      # helm isn't in standard Debian repos; pull a pinned static
+      # release directly. v3.16.4 supports the kubernetes 1.31 we
+      # install below.
+      HELM_VERSION="v3.16.4"
+      ARCH=$(dpkg --print-architecture)
+      curl -sfL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" \
+        | tar -xz -C /tmp
+      install -m 0755 "/tmp/linux-${ARCH}/helm" /usr/local/bin/helm
+      rm -rf "/tmp/linux-${ARCH}"
 
       # k3s WITHOUT flannel, kube-proxy, or k3s's built-in network
       # policy controller — cilium replaces all three (with TCX-mode
