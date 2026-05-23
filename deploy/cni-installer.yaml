@@ -146,10 +146,30 @@ spec:
               # rapid rewrites can race with sandbox creation,
               # surfacing as "failed to find network info for sandbox"
               # CRI errors.
-              while ! ls /host/etc/cni/net.d/*.conflist >/dev/null 2>&1; do
-                sleep 1
+              #
+              # The conflist dir varies by distribution:
+              #   /etc/cni/net.d                       — kind, kubeadm,
+              #                                          most distros'
+              #                                          containerd
+              #   /var/lib/rancher/k3s/agent/etc/cni/net.d
+              #                                        — k3s default;
+              #                                          k3d uses this
+              # Detect which one the current node uses and patch that
+              # one. We mount both as separate volumes; the wait + the
+              # install-cni-chain target the directory that actually
+              # has a conflist.
+              cni_conf_dir=""
+              while [ -z "$cni_conf_dir" ]; do
+                for d in /host/etc/cni/net.d /host/var-k3s-cni-conf; do
+                  if ls "$d"/*.conflist >/dev/null 2>&1; then
+                    cni_conf_dir="$d"
+                    break
+                  fi
+                done
+                [ -z "$cni_conf_dir" ] && sleep 1
               done
-              /usr/local/bin/natra install-cni-chain /host/etc/cni/net.d/
+              echo "natra: patching conflist dir $cni_conf_dir"
+              /usr/local/bin/natra install-cni-chain "$cni_conf_dir"
               echo "natra: chain install complete"
           volumeMounts:
             - name: cni-bin-dir
@@ -160,6 +180,8 @@ spec:
               mountPath: /host/bin
             - name: cni-net-dir
               mountPath: /host/etc/cni/net.d
+            - name: cni-net-dir-k3s
+              mountPath: /host/var-k3s-cni-conf
             - name: host-sys
               mountPath: /host/sys
               # Bidirectional so the bpffs mount escapes into the
@@ -208,6 +230,14 @@ spec:
         - name: cni-net-dir
           hostPath:
             path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: cni-net-dir-k3s
+          # k3s writes its conflist here, not /etc/cni/net.d.
+          # DirectoryOrCreate so non-k3s nodes don't fail; the
+          # init container picks whichever directory actually
+          # contains a *.conflist.
+          hostPath:
+            path: /var/lib/rancher/k3s/agent/etc/cni/net.d
             type: DirectoryOrCreate
         - name: host-sys
           hostPath:
