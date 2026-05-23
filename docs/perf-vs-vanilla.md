@@ -291,17 +291,27 @@ when cilium / NPA already owns the qdisc layout.
 ## Reproduce
 
 ```
-make perf-vs-vanilla
+make perf-vs-vanilla       # k3d, ci profile (~18-22 min, fits CI)
+make perf-vs-vanilla-vm    # lima, full profile (~60 min, two real kernels)
 ```
 
-Knobs (env vars):
+Both targets share `internal/perfrig` — same Spec, same Executor,
+different Substrate (k3d on colima vs lima). Knobs:
 
 ```
-RATE_SWEEP="100M 1G 10G 40G"   # rates per phase
-PERF_RUNS=3                    # samples per cell → mean ± stddev
-NATRA_PERF_ATTACH_MODE=tcx-podside    # pin attach mode
-NATRA_PERF_EDT_PACING=on              # pin EDT mode
+PERF_PROFILE=ci            # default for make perf-vs-vanilla; single rate, Samples=1
+PERF_PROFILE=full          # full rate sweep, Samples=3 — much longer
+PERF_CLUSTER=natra-perfrig # k3d cluster name (default natra-perfrig)
+PVV_PROFILE=ci             # same idea for the vm-rig entry; default full there
 ```
 
-Output: `/tmp/natra-perf-vs-vanilla-result.txt` (also tee'd to
-stdout during the run).
+Outputs:
+
+```
+/tmp/natra-k3d-perf-vs-vanilla-result.txt    # k3d
+/tmp/natra-vm-rig-perf-vs-vanilla-result.txt # vm-rig
+```
+
+The CI workflow (`.github/workflows/perf.yml`) runs the k3d
+ci-profile job on every push and uploads the result table as a
+build artifact.

@@ -27,3 +27,42 @@ jobs:
           KERNEL: local
         run: |
           sudo -E env "PATH=$PATH" KERNEL=$KERNEL go test -tags=perf -v ./test/perf/...
+
+  # Cluster-level natra-vs-upstream comparison via the shared perfrig
+  # executor (internal/perfrig + cmd/perfrig + k3dSubstrate). Runs
+  # the `ci` profile — single rate (10M), Samples=1, all three
+  # workloads (iperfSweep + mixed + memory) — sized to fit a per-
+  # push CI window.
+  #
+  # The same executor drives the lima vm-rig locally
+  # (`make perf-vs-vanilla-vm`, `full` profile). An Apply()
+  # subset-validation test in internal/perfrig pins
+  # `ci ⊆ full`, so this CI job cannot drift away from what the
+  # vm-rig measures — they share the spec.
+  perf-vs-vanilla:
+    name: natra vs upstream bandwidth (k3d, ci profile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: ./.github/actions/build-bpf
+      - name: Install k3d
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh \
+            | TAG=v5.7.4 bash
+      - name: Run perf-vs-vanilla (ci profile)
+        # PERF_PROFILE=ci is the script's default; setting it
+        # explicitly documents intent and survives any future
+        # default change.
+        env:
+          PERF_PROFILE: ci
+        run: make perf-vs-vanilla
+      - name: Upload result table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-vs-vanilla-result
+          path: /tmp/natra-k3d-perf-vs-vanilla-result.txt
+          if-no-files-found: ignore
