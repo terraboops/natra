@@ -152,15 +152,25 @@ provision:
       install -m 0755 "/tmp/linux-${ARCH}/helm" /usr/local/bin/helm
       rm -rf "/tmp/linux-${ARCH}"
 
-      # k3s WITHOUT flannel, kube-proxy, or k3s's built-in network
-      # policy controller — cilium replaces all three (with TCX-mode
-      # BPF dataplane + kube-proxy replacement). Pods stay
-      # ContainerCreating until cilium is installed below; the
-      # blocking helm rollout below holds the script until cilium
-      # is healthy and nodes can become Ready.
+      # k3s WITHOUT flannel and WITHOUT k3s's built-in network
+      # policy controller (cilium provides both). kube-proxy IS
+      # kept (no --disable-kube-proxy) — cilium runs as the CNI +
+      # network-policy enforcer; kube-proxy handles Service IP →
+      # backend selection via iptables. This is the
+      # KPR-off / policy-only configuration: pod-to-pod traffic
+      # transits the normal TC chain on pod-eth0 → host-veth, so
+      # natra (TCX-attached on pod-eth0) actually sees traffic.
+      # KPR-on would have cilium's bpf_redirect_peer fast-path
+      # bypass natra entirely — that's a separate compatibility
+      # story than what this rig validates.
+      #
+      # The KPR-off configuration is also the more faithful proxy
+      # for AWS NPA: NPA is a policy enforcer (no service-LB
+      # replacement), so cilium-without-KPR matches its shape on
+      # the cluster.
       curl -sfL https://get.k3s.io | \
         INSTALL_K3S_VERSION="v1.31.4+k3s1" \
-        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=none --disable-network-policy --disable-kube-proxy --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP} --write-kubeconfig-mode=644" \
+        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=none --disable-network-policy --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP} --write-kubeconfig-mode=644" \
         sh -
 
       # Token at a predictable path so up.sh can read it via shell
@@ -181,7 +191,8 @@ provision:
       helm repo update >/dev/null
       helm install cilium cilium/cilium --namespace kube-system \
         --set bpf.tcx=true \
-        --set kubeProxyReplacement=true \
+        --set kubeProxyReplacement=false \
+        --set bpf.hostRouting=false \
         --set k8sServiceHost=${LIMA_IP} \
         --set k8sServicePort=6443 \
         --set operator.replicas=1 \
