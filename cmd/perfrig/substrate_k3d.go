@@ -168,8 +168,8 @@ func (k *k3dSubstrate) InstallNatra(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read installer manifest: %w", err)
 	}
-	rewritten := strings.ReplaceAll(string(manifest),
-		"ghcr.io/terraboops/natra:latest", k.natraImage)
+	rewritten := perfrig.ApplyNatraAttachModeEnv(strings.ReplaceAll(string(manifest),
+		"ghcr.io/terraboops/natra:latest", k.natraImage))
 
 	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	cmd.Env = append(os.Environ(), "KUBECONFIG="+k.KubeconfigPath())

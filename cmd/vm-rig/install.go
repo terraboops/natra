@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/terraboops/natra/internal/perfrig"
 )
 
 // cmdInstall builds the natra container image on the host, copies
@@ -147,6 +149,7 @@ func renderInstallerManifest(c *Config) (string, error) {
 	//     copy + k3s ctr import → local hit) and the pause sidecar
 	//     (registry pull on cache miss). Forcing Never broke pause
 	//     in the same way it broke k3d before that fix.
-	return strings.ReplaceAll(string(b),
-		"ghcr.io/terraboops/natra:latest", c.NatraImage), nil
+	rendered := strings.ReplaceAll(string(b),
+		"ghcr.io/terraboops/natra:latest", c.NatraImage)
+	return perfrig.ApplyNatraAttachModeEnv(rendered), nil
 }

@@ -1,10 +1,35 @@
 package perfrig
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
 )
+
+// ApplyNatraAttachModeEnv lets the caller override the installer
+// manifest's default `NATRA_ATTACH_MODE: ""` (which the binary
+// resolves to the auto fallback chain). Forcing an explicit mode
+// is the knob for compositions where auto's first pick is
+// bypassed by another dataplane — cilium with kube-proxy-
+// replacement routes pod-to-pod through host-side BPF, bypassing
+// pod-eth0 where tcx-podside attaches; tcx-hostside puts natra
+// where cilium delivers traffic to.
+//
+// The substitution is a literal string replace of the empty env
+// value to the requested one. Whitespace and key context are
+// included so other empty-quoted env values (NATRA_EDT_PACING, …)
+// aren't accidentally rewritten.
+func ApplyNatraAttachModeEnv(manifest string) string {
+	mode := os.Getenv("NATRA_ATTACH_MODE")
+	if mode == "" {
+		return manifest
+	}
+	const oldEnv = "- name: NATRA_ATTACH_MODE\n              value: \"\""
+	const newFmt = "- name: NATRA_ATTACH_MODE\n              value: %q"
+	return strings.Replace(manifest, oldEnv,
+		fmt.Sprintf(newFmt, mode), 1)
+}
 
 // renderManifest reads a YAML file and applies a string-replacer.
 // Same shape as cmd/vm-rig's helper; pulled into the package so the
