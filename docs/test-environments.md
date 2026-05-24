@@ -148,13 +148,27 @@ metal capable of producing >1 Gbps single-stream.
 
 ### Real CNI composition
 
-natra coexists with cilium, aws-network-policy-agent, and other
-TC-hook users via `bpf_mprog` on kernel 6.6+. Single-kernel
-single-bridge k3d doesn't have cilium installed, so the actual
-composition behavior isn't exercised. The attach-mode fallback
-table-tests cover the loader's behavior when one mode fails, but
-not the cilium + NPA + natra stack producing correct ordered
-classification on the same skb.
+natra coexists with cilium, aws-network-policy-agent
+(`aws-network-policy-agent`, aka AWS NPA), and other tc/TCX-hook
+users via `bpf_mprog` on kernel 6.6+. The vm-rig
+(`make perf-vs-vanilla-vm`) now runs cilium as its CNI on every
+run, exercising the composition path end-to-end on two real
+kernels.
+
+**Cilium proxies for the BPF-NPA class.** AWS NPA is the
+production case we can't run locally (needs EKS); cilium with
+its BPF dataplane stands in for it, because the host-side
+veth + `bpf_mprog` coexistence story is the same regardless of
+which CNI is the other side of the hook. What the vm-rig's
+cilium run shows (current finding: host-side bypass with
+kube-proxy-replacement, fixed by `NATRA_ATTACH_MODE=tcx-hostside`
+— see `docs/perf-vs-vanilla.md`) inherits to AWS NPA without
+further measurement.
+
+What the local rig still doesn't measure: NPA-specific policy
+ordering semantics, EKS-CNI's secondary-ENI interactions, and
+any cilium-or-NPA configuration we don't have a flag for in the
+vm-rig. Those land at "real cloud cluster" cost.
 
 ## What we'd add, ranked
 
@@ -214,6 +228,12 @@ Where this catches things L4 can't: cilium + natra interop on
 real kernels, cilium's chained-mode behavior with natra's
 mprog-style attach, multi-tenant elephant-isolates-bystander on
 nodes where the bystander has its own NIC interrupts.
+
+The vm-rig (`make perf-vs-vanilla-vm`) closes most of these on
+two real kernels locally — including the cilium interop case,
+which itself proxies for the broader BPF-NPA class (AWS NPA in
+particular). Cloud VMs add real underlay + real NIC, but the
+BPF-coexistence shape is the vm-rig's signal.
 
 ### 3. Bare metal
 

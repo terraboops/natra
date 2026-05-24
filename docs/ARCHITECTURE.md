@@ -351,11 +351,17 @@ Properties that are claimed by construction but not yet validated
 on a real rig (this list is what the test environments in
 `docs/test-environments.md` would close):
 
-- **aws-network-policy-agent coexistence.** The vm-rig now runs
-  cilium as its CNI on every `make perf-vs-vanilla-vm` so the
-  cilium+natra TCX coexistence is exercised end-to-end. AWS NPA
-  (which also attaches at TCX via bpf_mprog) is the remaining
-  unmeasured case — needs an EKS cluster with NPA, not local.
+- **BPF-NPA coexistence (cilium, AWS NPA).** The vm-rig now
+  runs cilium as its CNI on every `make perf-vs-vanilla-vm`.
+  Cilium stands in as a proxy for the broader class of
+  BPF-based network-policy CNIs that attach via `tc clsact`
+  (and increasingly TCX) on host-side veths — AWS NPA
+  (`aws-network-policy-agent`, the production case we can't
+  run locally without EKS) is the same shape. Anything cilium's
+  coexistence finding teaches transfers to NPA. See
+  `docs/perf-vs-vanilla.md` "BPF-NPA composition" for the
+  current measured behavior and the `NATRA_ATTACH_MODE` knob
+  that resolves the host-side-bypass case.
 - **Real-NIC offload behavior.** TSO, GRO, LRO, hardware TX
   timestamping all reshape what the BPF program sees vs. what a
   software bridge produces. The L3-L5 rig is software-only.

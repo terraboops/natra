@@ -196,8 +196,19 @@ The vm-rig **uses cilium as its CNI** (TCX dataplane, kube-proxy
 replacement, helm-installed on first server boot). natra chains
 after cilium in the conflist. This raises the fidelity of the
 two-real-kernel measurement: it's not just two real kernels, it's
-two real kernels running the same dataplane (cilium) production
-cluster usually run.
+two real kernels running the same dataplane (cilium) a production
+cluster usually runs.
+
+**Cilium is a proxy for the class** of BPF-based network-policy
+CNIs that attach via `tc clsact` (and increasingly TCX) on
+host-side veths. The most production-relevant member of that
+class for natra is **AWS NPA** (`aws-network-policy-agent`),
+which runs on EKS and isn't reachable from a local rig; cilium
+on the vm-rig stands in for it. The composition story natra
+needs to support — "another BPF dataplane is already on the
+veth; coexist cleanly via `bpf_mprog`, see traffic, enforce" —
+is the same regardless of which CNI is at the other end of the
+hook. What cilium tests, AWS NPA inherits.
 
 Most-recent flannel-host-gw baseline / vanilla / natra numbers
 (pre-cilium, single sample under `ci`):
@@ -218,38 +229,46 @@ Most-recent flannel-host-gw baseline / vanilla / natra numbers
   mice latency unchanged from no rate-limiter, where upstream
   costs ~16× rps / ~7× p99.**
 
-### Cilium composition — measured, with a finding
+### BPF-NPA composition — measured, with a finding
 
-The current vm-rig run (cilium as CNI, kube-proxy replacement)
-brings up the cluster cleanly, the natra-installer DS rolls out,
-and `natra install-cni-chain` writes `00-natra-05-cilium.conflist`
-with the natra plugin chained after cilium's. Annotated
-perf-server pods come up Ready (so kubelet's CNI ADD walks the
-chain successfully). But the natra phase iperf reports
-~1951/1951 Mbps — **the same as baseline**, no rate limiting.
+Cilium as CNI on the vm-rig comes up cleanly, the
+natra-installer DS rolls out, and `natra install-cni-chain`
+writes `00-natra-05-cilium.conflist` with the natra plugin
+chained after cilium's. Annotated perf-server pods reach
+Ready (kubelet's CNI ADD walks the chain). But the natra phase
+iperf reports ~1951/1951 Mbps — **same as baseline**, no rate
+limiting.
 
-What this means: cilium with `kubeProxyReplacement=true` routes
-pod-to-pod traffic through host-side BPF programs that bypass
-the pod-eth0 TCX hook natra attaches to. natra's CNI ADD
-succeeds (the chain runs, BPF programs presumably attach), but
-traffic never traverses them in this configuration.
+What this means: cilium with `kubeProxyReplacement=true`
+routes pod-to-pod traffic through host-side BPF programs that
+bypass the pod-eth0 TCX hook natra's default `auto` attach mode
+lands on. natra's CNI ADD succeeds and the BPF programs attach,
+but traffic never traverses them in this configuration.
 
-Workarounds and follow-ups (not yet implemented):
+Because cilium proxies for the BPF-NPA class (above), this is
+the **AWS NPA composition story** too, ahead of any actual EKS
+run: any CNI that owns the host-side veth with its own BPF and
+re-routes pod-to-pod through host-side hooks will skip a
+pod-eth0 TCX-attached natra the same way.
 
-- attach natra at the host-side veth instead (`NATRA_ATTACH_MODE=
-  tcx-hostside` or `clsact-hostside`) so it sees traffic after
-  cilium hands it off to the pod's veth host side; needs a small
-  install change and a re-validation.
-- run cilium with kube-proxy replacement disabled to keep
-  pod-eth0 in the data path; loses cilium's main draw but
-  isolates the variable.
-- characterize precisely which cilium configurations engage vs
-  bypass pod-eth0 TCX.
+The fix is the `NATRA_ATTACH_MODE` knob — putting natra on the
+host-side veth where these CNIs deliver traffic to. Both
+substrates (lima cmdInstall and k3d via cmd/perfrig) honor
+`NATRA_ATTACH_MODE` in the calling environment and rewrite the
+installer DS env:
 
-The composition gap is now measured, not asserted. flannel
-host-gw still works as it always did; switching CNI from flannel
-to cilium on the vm-rig surfaced the real-world bypass issue
-that ought to drive natra's attach-side decisions going forward.
+    NATRA_ATTACH_MODE=tcx-hostside    make perf-vs-vanilla-vm
+
+A re-validation under this mode is the next thing the vm-rig
+run will show. If it engages, the production guidance becomes
+"set `NATRA_ATTACH_MODE=tcx-hostside` when running alongside a
+BPF-based network-policy CNI"; auto-detection (probe cilium /
+NPA presence and pick the mode) is a clean follow-on.
+
+flannel host-gw still works as it always did; switching the
+vm-rig's CNI from flannel to cilium-as-NPA-proxy surfaced the
+real-world host-side-bypass class that ought to drive natra's
+attach-side defaults going forward.
 
 ### Memory comparison
 
