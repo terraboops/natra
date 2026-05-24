@@ -246,13 +246,39 @@ func pluginInvokePeakRSS(ctx context.Context, sub Substrate, node string, phase 
 	// /var/lib/rancher/k3s/data/cni/ on k3s 1.30+, sometimes a
 	// versioned subdir. Find the binary rather than guess; bail
 	// with 0 if it genuinely isn't anywhere.
+	//
+	// Peak RSS measurement: prefer /usr/bin/time -v when present
+	// (lima debian has it via apt-install). When it's not (k3d
+	// rancher/k3s base is busybox, no GNU time), fall back to
+	// polling /proc/$pid/status's VmRSS while the plugin runs and
+	// reporting the max we observed. The fallback misses the
+	// absolute peak if the plugin's lifetime is shorter than one
+	// poll cycle, but the CNI plugin runs long enough (BPF load +
+	// attach, ~10-50ms) for a tight while-loop to catch the
+	// steady-state high-water mark. Same output format as time -v
+	// so parseTimeVPeakKB stays unified.
 	script := fmt.Sprintf(`
         bin=""
         for p in /opt/cni/bin/%[1]s /var/lib/rancher/k3s/data/cni/%[1]s /var/lib/rancher/k3s/data/current/bin/%[1]s; do
           [ -x "$p" ] && { bin="$p"; break; }
         done
         if [ -z "$bin" ]; then exit 0; fi
-        /usr/bin/time -v env CNI_COMMAND=VERSION CNI_CONTAINERID=x CNI_NETNS=/proc/self/ns/net CNI_IFNAME=eth0 CNI_PATH=$(dirname "$bin") "$bin" < /dev/null 2>&1 1>/dev/null || true
+        cni_env="CNI_COMMAND=VERSION CNI_CONTAINERID=x CNI_NETNS=/proc/self/ns/net CNI_IFNAME=eth0 CNI_PATH=$(dirname "$bin")"
+        if [ -x /usr/bin/time ]; then
+          /usr/bin/time -v env $cni_env "$bin" < /dev/null 2>&1 1>/dev/null || true
+        else
+          # Pure-shell fallback: fork the plugin, poll its VmRSS,
+          # report the max as time -v's line format.
+          env $cni_env "$bin" < /dev/null > /dev/null 2>&1 &
+          pid=$!
+          peak=0
+          while [ -d /proc/$pid ]; do
+            v=$(awk '/^VmRSS:/ {print $2}' /proc/$pid/status 2>/dev/null)
+            [ -n "$v" ] && [ "$v" -gt "$peak" ] && peak=$v
+          done
+          wait $pid 2>/dev/null || true
+          echo "Maximum resident set size (kbytes): $peak"
+        fi
     `, name)
 	out, err := sub.NodeShell(ctx, node, script)
 	if err != nil {
