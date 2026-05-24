@@ -167,11 +167,21 @@ rigs use; the lima path runs the `full` profile, the k3d path
 A unit test asserts `ci ⊆ full` so the structural subset
 relationship is enforced, not maintained by hand.
 
+The vm-rig **uses cilium as its CNI** (TCX dataplane, kube-proxy
+replacement, helm-installed on first server boot). natra chains
+after cilium in the conflist. This raises the fidelity of the
+two-real-kernel measurement: it's not just two real kernels, it's
+two real kernels running the same dataplane (cilium) production
+cluster usually run.
+
+Most-recent flannel-host-gw baseline / vanilla / natra numbers
+(pre-cilium, single sample under `ci`):
+
 | Phase    | iperf ing | iperf eg  | hey rps | p50 ms | p99 ms |
 |----------|-----------|-----------|---------|--------|--------|
 | baseline | 1863 Mbps | 1858 Mbps |   17410 |    2.7 |    5.9 |
-| vanilla  |   10.1 Mbps|  10.1 Mbps|    1059 |   47.3 |   48.7 |
-| natra    |   10.2 Mbps|  10.1 Mbps|   16699 |    2.9 |    6.6 |
+| vanilla  |  10.1 Mbps|  10.1 Mbps|    1059 |   47.3 |   48.7 |
+| natra    |  10.2 Mbps|  10.1 Mbps|   16699 |    2.9 |    6.6 |
 
 - baseline is the unshaped cross-VM wire: elephant ~1.9 Gbps,
   mice 17410 rps at 5.9 ms p99.
@@ -179,13 +189,42 @@ relationship is enforced, not maintained by hand.
   equally well (~10.1/10.1 Mbps each).
 - Under that cap, vanilla's mice drop to 1059 rps at 48.7 ms
   p99; natra's hold at 16699 rps at 6.6 ms p99 — within noise
-  of the unshaped baseline. The upstream plugin runs one token
-  bucket per pod for all flows, so the small requests queue
-  behind the elephant; natra's CMS classifies them under the
-  heavy-hitter threshold and they bypass the bucket.
+  of the unshaped baseline. **Same elephant cap as upstream;
+  mice latency unchanged from no rate-limiter, where upstream
+  costs ~16× rps / ~7× p99.**
 
-Same elephant cap as upstream; mice latency unchanged from no
-rate-limiter, where upstream costs ~16× rps / ~7× p99.
+### Cilium composition — measured, with a finding
+
+The current vm-rig run (cilium as CNI, kube-proxy replacement)
+brings up the cluster cleanly, the natra-installer DS rolls out,
+and `natra install-cni-chain` writes `00-natra-05-cilium.conflist`
+with the natra plugin chained after cilium's. Annotated
+perf-server pods come up Ready (so kubelet's CNI ADD walks the
+chain successfully). But the natra phase iperf reports
+~1951/1951 Mbps — **the same as baseline**, no rate limiting.
+
+What this means: cilium with `kubeProxyReplacement=true` routes
+pod-to-pod traffic through host-side BPF programs that bypass
+the pod-eth0 TCX hook natra attaches to. natra's CNI ADD
+succeeds (the chain runs, BPF programs presumably attach), but
+traffic never traverses them in this configuration.
+
+Workarounds and follow-ups (not yet implemented):
+
+- attach natra at the host-side veth instead (`NATRA_ATTACH_MODE=
+  tcx-hostside` or `clsact-hostside`) so it sees traffic after
+  cilium hands it off to the pod's veth host side; needs a small
+  install change and a re-validation.
+- run cilium with kube-proxy replacement disabled to keep
+  pod-eth0 in the data path; loses cilium's main draw but
+  isolates the variable.
+- characterize precisely which cilium configurations engage vs
+  bypass pod-eth0 TCX.
+
+The composition gap is now measured, not asserted. flannel
+host-gw still works as it always did; switching CNI from flannel
+to cilium on the vm-rig surfaced the real-world bypass issue
+that ought to drive natra's attach-side decisions going forward.
 
 ### Memory comparison
 
