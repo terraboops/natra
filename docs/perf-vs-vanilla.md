@@ -229,46 +229,77 @@ Most-recent flannel-host-gw baseline / vanilla / natra numbers
   mice latency unchanged from no rate-limiter, where upstream
   costs ~16× rps / ~7× p99.**
 
-### BPF-NPA composition — measured, with a finding
+### BPF-NPA composition — measured, working
 
 Cilium as CNI on the vm-rig comes up cleanly, the
-natra-installer DS rolls out, and `natra install-cni-chain`
-writes `00-natra-05-cilium.conflist` with the natra plugin
-chained after cilium's. Annotated perf-server pods reach
-Ready (kubelet's CNI ADD walks the chain). But the natra phase
-iperf reports ~1951/1951 Mbps — **same as baseline**, no rate
-limiting.
+natra-installer DS rolls out and writes
+`00-natra-05-cilium.conflist` (natra chained after cilium),
+both natra BPF programs attach at `tcx-podside`, and the natra
+phase shapes traffic to the annotated 10 Mbps rate.
 
-What this means: cilium with `kubeProxyReplacement=true`
-routes pod-to-pod traffic through host-side BPF programs that
-bypass the pod-eth0 TCX hook natra's default `auto` attach mode
-lands on. natra's CNI ADD succeeds and the BPF programs attach,
-but traffic never traverses them in this configuration.
+Result on a clean cilium-as-CNI / kube-proxy-handling-Services
+run (lima vm-rig, `ci` profile, two real Linux 6.12 kernels):
 
-Because cilium proxies for the BPF-NPA class (above), this is
+| Phase    | iperf elephant         | annotated mice          | bystander            | mice total |
+|----------|------------------------|-------------------------|----------------------|------------|
+| baseline | 1500 / 1538 Mbps       | 773 rps  p99 124 ms     | 774 rps p99 119 ms   | 1547       |
+| natra    | **10.2 / 10.2 Mbps**   | **2423 rps p99 74 ms**  | 2461 rps p99 77 ms   | **4884**   |
+
+natra honors the 10M annotation within 2%, keeps annotated
+mice fast (CMS fast-pass under cilium is the same fast-pass
+that works under flannel), bystander unaffected, mice total
+**3.2× baseline** — the cap frees worker capacity that
+baseline's elephant was hogging, fairly split between annotated
+and bystander. `bpftool` on the worker reports 32 MB of natra
+BPF memlocked, byte-exact corroboration that the programs are
+loaded and running.
+
+Because cilium proxies for the broader BPF-NPA class, this is
 the **AWS NPA composition story** too, ahead of any actual EKS
-run: any CNI that owns the host-side veth with its own BPF and
-re-routes pod-to-pod through host-side hooks will skip a
-pod-eth0 TCX-attached natra the same way.
+run: a BPF policy enforcer that owns the host-side veth and a
+TCX-attached natra coexist via `bpf_mprog` at the pod-eth0
+hook, no traffic redirection between them.
 
-The fix is the `NATRA_ATTACH_MODE` knob — putting natra on the
-host-side veth where these CNIs deliver traffic to. Both
-substrates (lima cmdInstall and k3d via cmd/perfrig) honor
-`NATRA_ATTACH_MODE` in the calling environment and rewrite the
-installer DS env:
+#### Two cilium settings that matter
 
-    NATRA_ATTACH_MODE=tcx-hostside    make perf-vs-vanilla-vm
+Getting here required two cilium-specific helm settings on the
+vm-rig install:
 
-A re-validation under this mode is the next thing the vm-rig
-run will show. If it engages, the production guidance becomes
-"set `NATRA_ATTACH_MODE=tcx-hostside` when running alongside a
-BPF-based network-policy CNI"; auto-detection (probe cilium /
-NPA presence and pick the mode) is a clean follow-on.
+- **`cni.exclusive=false`** — cilium's CNI installer defaults
+  to exclusive mode, which actively **renames any other
+  conflist** in `/etc/cni/net.d/` with a `.cilium_bak` suffix.
+  natra's chained `00-natra-05-cilium.conflist` was being
+  moved aside as fast as the installer wrote it, so containerd
+  never saw natra in the chain at all. (The first sign was
+  `/var/log/natra-cni.log` staying empty — the binary was
+  never invoked by CNI ADD.) Setting `cni.exclusive=false`
+  tells cilium to coexist with sibling conflists.
+- **`kubeProxyReplacement=false`** + **`bpf.hostRouting=false`**
+  — keeps pod-to-pod traffic on the normal Linux stack so it
+  transits pod-eth0 (and the TCX hook chain that natra is in).
+  Cilium with the full kube-proxy-replacement + host-routing
+  fast-path (`bpf_redirect_peer` / `bpf_redirect_neigh`) is
+  documented to bypass the netfilter + routing layers and
+  could prevent natra from seeing traffic; we haven't
+  separately tested whether `cni.exclusive=false` alone would
+  let natra engage in that configuration. **For now the
+  validated configuration is policy-only cilium** — which is
+  also the closest match to AWS NPA's shape (a policy enforcer
+  + kube-proxy for Services), so the proxy is faithful.
 
-flannel host-gw still works as it always did; switching the
-vm-rig's CNI from flannel to cilium-as-NPA-proxy surfaced the
-real-world host-side-bypass class that ought to drive natra's
-attach-side defaults going forward.
+#### Production guidance
+
+If you run cilium alongside natra, install cilium with:
+
+    helm install cilium cilium/cilium ... \
+      --set cni.exclusive=false \
+      --set kubeProxyReplacement=false \
+      --set bpf.hostRouting=false
+
+KPR-on coexistence (whether the host-routing fast-path can be
+made compatible with natra-at-tcx-podside, or whether natra
+needs cilium's bandwidth-manager integration instead) is the
+remaining open question. Documented as a follow-on.
 
 ### Memory comparison
 

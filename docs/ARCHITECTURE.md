@@ -351,17 +351,20 @@ Properties that are claimed by construction but not yet validated
 on a real rig (this list is what the test environments in
 `docs/test-environments.md` would close):
 
-- **BPF-NPA coexistence (cilium, AWS NPA).** The vm-rig now
-  runs cilium as its CNI on every `make perf-vs-vanilla-vm`.
-  Cilium stands in as a proxy for the broader class of
-  BPF-based network-policy CNIs that attach via `tc clsact`
-  (and increasingly TCX) on host-side veths — AWS NPA
-  (`aws-network-policy-agent`, the production case we can't
-  run locally without EKS) is the same shape. Anything cilium's
-  coexistence finding teaches transfers to NPA. See
+- **BPF-NPA coexistence (cilium, AWS NPA).** The vm-rig runs
+  cilium as its CNI on every `make perf-vs-vanilla-vm` and
+  exercises the bpf_mprog coexistence path at the pod TCX
+  hook on real two-kernel hardware. natra at `tcx-podside`
+  coexists with cilium's BPF programs cleanly when cilium
+  is installed in policy-only configuration
+  (`cni.exclusive=false`, `kubeProxyReplacement=false`,
+  `bpf.hostRouting=false`); the natra phase caps the elephant
+  at the annotated 10 Mbps and keeps mice fast end-to-end.
+  Cilium proxies for AWS NPA (also a BPF policy enforcer
+  alongside kube-proxy), so this validates the NPA
+  composition story ahead of any actual EKS run. See
   `docs/perf-vs-vanilla.md` "BPF-NPA composition" for the
-  current measured behavior and the `NATRA_ATTACH_MODE` knob
-  that resolves the host-side-bypass case.
+  full numbers and the cilium-with-KPR follow-on.
 - **Real-NIC offload behavior.** TSO, GRO, LRO, hardware TX
   timestamping all reshape what the BPF program sees vs. what a
   software bridge produces. The L3-L5 rig is software-only.
