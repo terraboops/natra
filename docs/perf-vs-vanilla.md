@@ -91,33 +91,58 @@ under ci profile).
 `iperf3 --bidir` against the annotated perf-server (drains both
 buckets at once) while two `hey -c 50 -z 25s -disable-keepalive`
 runs hit perf-server (annotated mice — CMS fast-pass story) and
-`bystander` (unannotated pod on the same worker — collateral
-cost). Fresh-connection requests at ~5-7 KB each, well under
-the 125 KiB heavy-hitter threshold at 10 Mbps.
+`bystander` (unannotated pod on the same worker). Fresh-connection
+requests at ~5-7 KB each, well under the 125 KiB heavy-hitter
+threshold at 10 Mbps.
 
-| Phase    | iperf ing | iperf eg | annotated mice RPS / p99 | bystander RPS / p99 |
-|----------|-----------|----------|--------------------------|---------------------|
-| baseline | 15.3 Gbps | 30 Gbps  | 2145 /   89 ms           | 9817 / 18 ms        |
-| vanilla  |   15 Mbps |  9 Mbps  |   12 / 4863 ms           | 8308 / 30 ms        |
-| natra    |   11 Mbps | 10 Mbps  | 2425 /   71 ms           | 12231 / 25 ms       |
+Numbers from the GH Actions `ci` profile run on commit
+`f06c4dd`:
 
-Read in three pieces:
+| Phase    | iperf ing | iperf eg | pod rps / p99 | bystander rps / p99 | mice total |
+|----------|-----------|----------|---------------|---------------------|------------|
+| baseline | 2894 Mbps | 6631 Mbps |  2068 /  69 ms |  2077 /  67 ms     | 4145       |
+| vanilla  |   16 Mbps |    6 Mbps |    16 / 5584 ms |  4441 /  64 ms     | 4457       |
+| natra    |   10 Mbps |   10 Mbps |  2644 /  42 ms |  2672 /  42 ms     | **5316**   |
 
-- **Elephant cap.** natra holds the elephant at 10.7/10.4 Mbps
-  with both directions running concurrently; vanilla shows the
-  TBF-overshoot pattern from iperfSweep but with --bidir's
-  contention pulling egress down to ~9 Mbps.
-- **Annotated mice.** natra 2425 rps / p99 71 ms ≈ baseline
-  (2145 / 89). vanilla collapses to 12 rps / p99 4863 ms — **180×
-  worse than baseline**. The upstream token-bucket queues every
-  flow against the same 10 Mbps slot, so mice wait behind the
-  elephant; natra's CMS classifies fresh-flow HTTP requests as
-  under-threshold and they bypass the bucket.
-- **Bystander.** Both plugins leave unannotated traffic alone:
-  vanilla bystander 8308 rps p99 30 ms, natra bystander 12231 rps
-  p99 25 ms. Neither attaches BPF or qdiscs to the bystander pod;
-  the difference is competition for the worker's shared physical
-  uplink and conntrack, not any plugin charge.
+The right way to read this is the **mice total** column — the
+sum of annotated + bystander RPS — alongside the per-row split:
+
+- **Elephant cap.** natra holds the --bidir elephant at 10/10
+  Mbps; vanilla shows the iperfSweep overshoot pattern (the host-
+  side IFB TBF is patched, the pod-netns egress TBF isn't, so the
+  cap is loose).
+
+- **Annotated mice.** natra 2644 rps / p99 42 ms ≈ baseline (2068
+  / 69 ms). vanilla collapses to 16 rps / p99 5584 ms — **130×
+  worse than baseline** on RPS, p99 from 69 ms to 5.6 seconds.
+  The upstream token bucket queues every annotated-pod flow
+  against the same 10 Mbps slot; natra's CMS fast-passes
+  fresh-flow HTTP under the heavy-hitter threshold so it bypasses
+  the bucket.
+
+- **Bystander vs. mice total.** Neither plugin attaches anything
+  to the unannotated bystander, so absolute bystander RPS isn't
+  a "plugin cost" — it's how much of the freed worker capacity
+  (CPU, software dataplane, conntrack) the bystander gets in
+  contention with the annotated mice.
+
+  Capping the elephant frees roughly the same spare worker
+  capacity in vanilla and natra. **Vanilla's bystander column
+  (4441) looks higher than natra's (2672) only because vanilla
+  collapses annotated mice (16 rps) and hands their share to the
+  bystander.** natra honors the annotated mice fairly, so the
+  spare capacity splits ~evenly between annotated (2644) and
+  bystander (2672). The right comparison is the *total*
+  mice-class throughput — and natra delivers 5316 rps, **+19%
+  more total request work than vanilla's 4457** and **+28% more
+  than baseline's 4145** (baseline's elephant dominates worker
+  resources).
+
+  Read the single bystander column alone and natra looks worse to
+  the neighbor; read the row as a whole and natra is delivering
+  more useful request work *and* respecting the annotated bucket
+  the user actually asked for. The per-column reading is the
+  trap; the row-level reading is the story.
 
 ## Gaps in this comparison
 

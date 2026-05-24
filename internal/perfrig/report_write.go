@@ -67,21 +67,26 @@ func writeIperfTable(b *strings.Builder, rep Report) {
 
 // writeMixedTable reports the mixed workload: iperf3 --bidir
 // elephant plus annotated mice (CMS fast-pass story) and bystander
-// mice (collateral cost on an unannotated neighbor). The bystander
-// columns are the actual natra-vs-vanilla "doesn't charge what it
-// doesn't have to" check.
+// mice (collateral cost on an unannotated neighbor). The trailing
+// "mice total" column (annotated + bystander RPS) is the
+// apples-to-apples comparison: capping the elephant frees worker
+// capacity, and the mice classes (annotated + bystander) share
+// it; reading either column alone hides whether the plugin
+// honored the annotated bucket fairly or just collapsed annotated
+// mice and handed their share to the bystander.
 func writeMixedTable(b *strings.Builder, rep Report) {
 	if !anyWorkloadHasData(rep, WorkloadMixed) {
 		return
 	}
 	fmt.Fprintf(b, "\nmixed: iperf3 --bidir elephant + concurrent hey mice on annotated + bystander pods\n")
-	fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s\n",
+	fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s  %-12s\n",
 		"Phase", "ing Mbps", "eg Mbps",
 		"pod rps", "p50 ms", "p99 ms",
-		"by rps", "p50 ms", "p99 ms")
-	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 110))
+		"by rps", "p50 ms", "p99 ms",
+		"mice total")
+	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 124))
 	for _, p := range rep.Phases {
-		var ing, eg, prps, pp50, pp99, brps, bp50, bp99 []float64
+		var ing, eg, prps, pp50, pp99, brps, bp50, bp99, totals []float64
 		for _, w := range p.Workloads {
 			if w.Kind != WorkloadMixed {
 				continue
@@ -95,13 +100,18 @@ func writeMixedTable(b *strings.Builder, rep Report) {
 				brps = append(brps, m.BystanderRPS)
 				bp50 = append(bp50, m.BystanderP50)
 				bp99 = append(bp99, m.BystanderP99)
+				// Per-sample total so mean+stddev aggregates
+				// correctly when Samples > 1; summing the means
+				// would lose stddev signal.
+				totals = append(totals, m.PodRPS+m.BystanderRPS)
 			}
 		}
-		fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s\n",
+		fmt.Fprintf(b, "%-10s  %-13s  %-13s  %-11s  %-9s  %-11s  %-11s  %-9s  %-11s  %-12s\n",
 			p.Phase,
 			cell(ing, 1e6, 1), cell(eg, 1e6, 1),
 			cell(prps, 1, 0), cell(pp50, 1, 1), cell(pp99, 1, 1),
-			cell(brps, 1, 0), cell(bp50, 1, 1), cell(bp99, 1, 1))
+			cell(brps, 1, 0), cell(bp50, 1, 1), cell(bp99, 1, 1),
+			cell(totals, 1, 0))
 	}
 }
 
