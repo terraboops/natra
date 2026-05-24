@@ -27,10 +27,27 @@ func (e *Executor) stagePhase(ctx context.Context, phase Phase) error {
 		ns = "natra-perfrig"
 	}
 
-	// 1. Namespace.
+	// 1. Namespace. Wait for the default ServiceAccount before
+	// applying any pod into it — k8s creates the SA asynchronously
+	// after the namespace, and on cold runners (CI) the first pod
+	// apply races the SA controller and fails with
+	// "serviceaccount 'default' not found". A short poll is the
+	// simplest portable wait (kubectl wait --for=create needs a
+	// newer kubectl than every runner has).
 	nsYAML := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + ns + "\n"
 	if err := kubectl(ctx, kc, strings.NewReader(nsYAML), "apply", "-f", "-"); err != nil {
 		return fmt.Errorf("create namespace %s: %w", ns, err)
+	}
+	saReady := false
+	for i := 0; i < 30; i++ {
+		if _, err := captureKubectl(ctx, kc, "get", "sa", "default", "-n", ns); err == nil {
+			saReady = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !saReady {
+		return fmt.Errorf("default ServiceAccount in %s never appeared (60s)", ns)
 	}
 
 	// 2. perf-server + perf-client. baseline phase strips the
