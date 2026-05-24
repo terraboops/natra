@@ -36,32 +36,49 @@ func WriteReport(rep Report, path string, out io.Writer) error {
 }
 
 // writeIperfTable summarizes the iperfSweep workload: one row per
-// phase × rate × direction × kind. With single-rate today the table
-// is compact; the same shape scales when the multi-rate sweep lands.
+// (phase, rate), columns for ingress + egress. Grouping by rate is
+// required for the multi-rate sweep (full profile) — collapsing
+// across rates would average 10M with 1G with 10G, which is
+// nonsense. ci profile produces one rate per phase so the table
+// stays compact there.
 func writeIperfTable(b *strings.Builder, rep Report) {
 	if !anyWorkloadHasData(rep, WorkloadIperfSweep) {
 		return
 	}
-	fmt.Fprintf(b, "\niperfSweep: per-direction elephant throughput\n")
-	fmt.Fprintf(b, "%-10s  %-14s  %-14s\n", "Phase", "iperf ing Mbps", "iperf eg Mbps")
-	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 44))
+	fmt.Fprintf(b, "\niperfSweep: per-direction elephant throughput (per phase × rate)\n")
+	fmt.Fprintf(b, "%-10s  %-6s  %-14s  %-14s\n",
+		"Phase", "rate", "iperf ing Mbps", "iperf eg Mbps")
+	fmt.Fprintf(b, "%s\n", strings.Repeat("-", 52))
 	for _, p := range rep.Phases {
-		var ing, eg []float64
+		// Group ingress + egress samples by rate, preserving the
+		// order rates first appeared in the workload's IperfCells
+		// (which matches plan.Rates order).
+		var rateOrder []Rate
+		ingByRate := map[Rate][]float64{}
+		egByRate := map[Rate][]float64{}
 		for _, w := range p.Workloads {
 			if w.Kind != WorkloadIperfSweep {
 				continue
 			}
 			for _, c := range w.IperfCells {
+				if _, seen := ingByRate[c.Rate]; !seen {
+					if _, sawEg := egByRate[c.Rate]; !sawEg {
+						rateOrder = append(rateOrder, c.Rate)
+					}
+				}
 				switch c.Direction {
 				case "ingress":
-					ing = append(ing, c.Bps)
+					ingByRate[c.Rate] = append(ingByRate[c.Rate], c.Bps)
 				case "egress":
-					eg = append(eg, c.Bps)
+					egByRate[c.Rate] = append(egByRate[c.Rate], c.Bps)
 				}
 			}
 		}
-		fmt.Fprintf(b, "%-10s  %-14s  %-14s\n",
-			p.Phase, cell(ing, 1e6, 1), cell(eg, 1e6, 1))
+		for _, r := range rateOrder {
+			fmt.Fprintf(b, "%-10s  %-6s  %-14s  %-14s\n",
+				p.Phase, r,
+				cell(ingByRate[r], 1e6, 1), cell(egByRate[r], 1e6, 1))
+		}
 	}
 }
 
