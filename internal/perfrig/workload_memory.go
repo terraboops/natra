@@ -55,6 +55,17 @@ func (e *Executor) runMemory(ctx context.Context, phase Phase) (WorkloadReport, 
 			"-n", ns, "-l", "app=perf-server-mem", "--timeout=180s"); err != nil {
 			return wr, fmt.Errorf("wait scale: %w", err)
 		}
+		// vanilla phase: re-patch TBF burst on the just-deployed
+		// clones too. The initial patch in stagePhase only covered
+		// the original perf-server pod; without re-patching, the
+		// N-pod memory measurement counts the inflated kubelet-
+		// default-burst structures and the per-pod kmem slope
+		// includes that extra metadata, skewing the comparison.
+		if phase == PhaseVanilla {
+			if err := e.patchVanillaTBF(ctx); err != nil {
+				return wr, fmt.Errorf("re-patch TBF after scale: %w", err)
+			}
+		}
 
 		atN, err := snapshotMemory(ctx, e.Substrate, worker, phase)
 		if err != nil {
@@ -286,7 +297,6 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 	case PhaseVanilla:
 		label = "app=vanilla-installer"
 	}
-	const crictl = `crictl --runtime-endpoint=unix:///run/k3s/containerd/containerd.sock`
 	// crictl inspect's `info` field is a *stringified* JSON, not a
 	// structured object — `"pid":NNN` is wrapped inside an escaped
 	// string. A grep that matches the literal substring works for
@@ -309,7 +319,7 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
         else
           echo 0
         fi
-    `, crictl, label)
+    `, crictlCmd, label)
 	out, err := sub.NodeShell(ctx, node, script)
 	if err != nil {
 		return 0, err

@@ -155,23 +155,71 @@ func (e *Executor) logNatraAttachState(ctx context.Context) {
 }
 
 // patchVanillaTBF rewrites the bundled bandwidth plugin's per-pod
-// TBF burst to 1 MB on both nodes via Substrate.NodeShell. The
-// rate field is preserved (different annotations map to different
-// rates; only the burst needs squashing).
+// TBF burst to 1 MB. Two passes per node:
+//
+//  1. node root netns — catches the host-side IFB qdiscs the
+//     bandwidth plugin installs for ingress shaping.
+//  2. for every pod sandbox in the workload namespace, enter its
+//     netns (nsenter -t $sandbox_pid -n) and patch any TBF qdisc
+//     there — catches the pod-eth0 egress TBF, which kubelet sets
+//     up with ~150s of credit (~193 MB on a 10 Mbps annotation) so
+//     a short measurement runs entirely inside the burst window.
+//
+// Without the pod-netns pass, vanilla iperf3 -R (egress) overshoots
+// the annotated cap by 2-10× because the egress side's burst is
+// kubelet's huge default. The pod-netns pass closes that.
+//
+// The rate field is preserved on every change (different
+// annotations map to different rates; only the burst needs
+// squashing). Idempotent: running again is a no-op modulo a
+// re-publish of the same burst value.
 func (e *Executor) patchVanillaTBF(ctx context.Context) error {
 	server, worker := e.Substrate.Nodes()
-	const script = `for dev in $(tc qdisc show | awk '/qdisc tbf/ {print $5}' | sort -u); do
+
+	// Pass 1: node root netns. Catches host-side IFB TBFs.
+	const rootScript = `for dev in $(tc qdisc show | awk '/qdisc tbf/ {print $5}' | sort -u); do
   rate=$(tc qdisc show dev "$dev" | sed -n 's/.*rate \([0-9A-Za-z]*\).*/\1/p' | head -1)
   [ -n "$rate" ] || continue
   tc qdisc change dev "$dev" root tbf rate "$rate" burst 1mb latency 50ms 2>/dev/null || true
 done`
 	for _, node := range []string{server, worker} {
-		if _, err := e.Substrate.NodeShell(ctx, node, script); err != nil {
-			return fmt.Errorf("tbf patch on %s: %w", node, err)
+		if _, err := e.Substrate.NodeShell(ctx, node, rootScript); err != nil {
+			return fmt.Errorf("tbf patch (root netns) on %s: %w", node, err)
 		}
+	}
+
+	// Pass 2: every pod sandbox in the workload namespace, on the
+	// worker (where the annotated pods land). Uses crictl + nsenter
+	// to reach the pod netns, then runs the same patch script
+	// against `tc qdisc show` there.
+	ns := e.namespaceForPhase()
+	podScript := fmt.Sprintf(`
+        crictl=%[1]s
+        for sb in $($crictl pods --namespace %[2]s -q 2>/dev/null); do
+          pid=$($crictl inspectp "$sb" 2>/dev/null \
+            | grep -oE '"pid":[[:space:]]*[0-9]+' \
+            | grep -oE '[0-9]+' \
+            | head -1)
+          [ -n "$pid" ] || continue
+          nsenter -t "$pid" -n sh -c '
+            for dev in $(tc qdisc show | awk "/qdisc tbf/ {print \$5}" | sort -u); do
+              rate=$(tc qdisc show dev "$dev" | sed -n "s/.*rate \([0-9A-Za-z]*\).*/\1/p" | head -1)
+              [ -n "$rate" ] || continue
+              tc qdisc change dev "$dev" root tbf rate "$rate" burst 1mb latency 50ms 2>/dev/null || true
+            done
+          ' 2>/dev/null || true
+        done`, crictlCmd, ns)
+	if _, err := e.Substrate.NodeShell(ctx, worker, podScript); err != nil {
+		return fmt.Errorf("tbf patch (pod netns) on %s: %w", worker, err)
 	}
 	return nil
 }
+
+// crictlCmd is the crictl invocation with the k3s runtime-endpoint
+// pinned. The default unix socket isn't where k3s puts containerd,
+// so callers must pass --runtime-endpoint explicitly. Reused by
+// the memory workload's installer-DS-RSS reader too — same shape.
+const crictlCmd = `crictl --runtime-endpoint=unix:///run/k3s/containerd/containerd.sock`
 
 // namespaceForPhase returns the executor's configured namespace,
 // applying the default. Workloads call this rather than re-reading
