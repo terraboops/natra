@@ -296,6 +296,15 @@ If you run cilium alongside natra, install cilium with:
       --set kubeProxyReplacement=false \
       --set bpf.hostRouting=false
 
+To reproduce the cilium-with-natra measurement locally:
+
+    make perf-vs-vanilla-vm-cilium
+
+The flannel vm-rig (`make perf-vs-vanilla-vm`, the default) is
+unchanged — it still uses k3s with flannel host-gw and produces
+the canonical two-kernel headline numbers. The cilium target is
+opt-in for the BPF-NPA composition story.
+
 KPR-on coexistence (whether the host-routing fast-path can be
 made compatible with natra-at-tcx-podside, or whether natra
 needs cilium's bandwidth-manager integration instead) is the
@@ -377,18 +386,40 @@ when cilium / NPA already owns the qdisc layout.
 ## Reproduce
 
 ```
-make perf-vs-vanilla       # k3d, ci profile (~18-22 min, fits CI)
-make perf-vs-vanilla-vm    # lima, full profile (~60 min, two real kernels)
+make perf-vs-vanilla            # k3d (flannel host-gw), ci profile
+                                # (~18-22 min, fits CI)
+make perf-vs-vanilla-vm         # lima, flannel host-gw CNI (default).
+                                # Canonical two-kernel headline.
+make perf-vs-vanilla-vm-cilium  # lima, cilium as CNI (cni.exclusive=
+                                # false, KPR off). Proxies AWS NPA;
+                                # exercises bpf_mprog coexistence at
+                                # pod TCX.
 ```
 
-Both targets share `internal/perfrig` — same Spec, same Executor,
-different Substrate (k3d on colima vs lima). Knobs:
+Both substrates share `internal/perfrig` — same Spec, same
+Executor, different Substrate (k3d on colima vs lima). The
+vm-rig's CNI choice is independent and toggled via `VMRIG_CNI`:
+
+```
+VMRIG_CNI=flannel          # default; flannel host-gw (lima-server-
+                           # flannel.yaml + lima-agent-flannel.yaml)
+VMRIG_CNI=cilium           # cilium as CNI (lima-server-cilium.yaml
+                           # + lima-agent-cilium.yaml). Set by
+                           # perf-vs-vanilla-vm-cilium implicitly.
+```
+
+Other knobs:
 
 ```
 PERF_PROFILE=ci            # default for make perf-vs-vanilla; single rate, Samples=1
 PERF_PROFILE=full          # full rate sweep, Samples=3 — much longer
 PERF_CLUSTER=natra-perfrig # k3d cluster name (default natra-perfrig)
 PVV_PROFILE=ci             # same idea for the vm-rig entry; default full there
+NATRA_ATTACH_MODE=…        # override the installer DS attach mode
+                           # (auto by default; valid: tcx-podside,
+                           # tcx-hostside, clsact-podside, clsact-
+                           # hostside). Logged at run start so
+                           # post-mortems are unambiguous.
 ```
 
 Outputs:

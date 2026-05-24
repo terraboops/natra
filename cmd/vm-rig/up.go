@@ -21,11 +21,15 @@ func cmdUp(c *Config) error {
 		return err
 	}
 
-	// Stage 1: server VM.
-	fmt.Printf("==> bringing up %s\n", c.ServerName)
+	// Stage 1: server VM. Pick the lima template by CNI choice
+	// (flannel default, cilium opt-in via VMRIG_CNI=cilium).
+	serverYAML, err := limaYAMLPath(c, "server")
+	if err != nil {
+		return err
+	}
+	fmt.Printf("==> bringing up %s (cni=%s)\n", c.ServerName, c.VMRigCNI)
 	if !limaExists(c.ServerName) {
-		if err := run("limactl", "create", "--name", c.ServerName,
-			filepath.Join(c.RigDir, "lima-server.yaml")); err != nil {
+		if err := run("limactl", "create", "--name", c.ServerName, serverYAML); err != nil {
 			return err
 		}
 	}
@@ -188,12 +192,30 @@ func waitForNodesReady(c *Config, want, attempts int, delay time.Duration) error
 	return fmt.Errorf("only %d/%d nodes Ready after %d attempts", lastReady, want, attempts)
 }
 
-// renderAgentYAML reads lima-agent.yaml, substitutes the empty
-// NATRA_K3S_URL / NATRA_K3S_TOKEN env values with the real
-// server-side ones, writes the result to a temp file, and returns
-// the path. Caller removes when done.
+// limaYAMLPath returns the lima template file for the given role
+// ("server" or "agent") based on c.VMRigCNI. Errors loudly on
+// unknown values so a typo in VMRIG_CNI surfaces here rather than
+// as a confused "file not found".
+func limaYAMLPath(c *Config, role string) (string, error) {
+	switch c.VMRigCNI {
+	case "flannel", "":
+		return filepath.Join(c.RigDir, "lima-"+role+"-flannel.yaml"), nil
+	case "cilium":
+		return filepath.Join(c.RigDir, "lima-"+role+"-cilium.yaml"), nil
+	default:
+		return "", fmt.Errorf("VMRIG_CNI=%q is not recognized (want flannel or cilium)", c.VMRigCNI)
+	}
+}
+
+// renderAgentYAML reads the agent lima template (chosen by
+// c.VMRigCNI), substitutes the empty NATRA_K3S_URL / NATRA_K3S_TOKEN
+// env values with the real server-side ones, writes the result to
+// a temp file, and returns the path. Caller removes when done.
 func renderAgentYAML(c *Config, serverIP, token string) (string, error) {
-	src := filepath.Join(c.RigDir, "lima-agent.yaml")
+	src, err := limaYAMLPath(c, "agent")
+	if err != nil {
+		return "", err
+	}
 	in, err := os.ReadFile(src)
 	if err != nil {
 		return "", err

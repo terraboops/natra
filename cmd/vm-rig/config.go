@@ -41,6 +41,15 @@ type Config struct {
 	// built from deploy/docker/Dockerfile.perfclient. Imported into
 	// both VMs and used by the hey HTTP-mice test.
 	PerfclientImage string
+
+	// VMRigCNI picks which lima YAML templates `up` provisions.
+	// "flannel" (default): flannel host-gw, the simpler / lower-
+	// overhead configuration; the canonical two-kernel headline
+	// numbers in docs/perf-vs-vanilla.md come from it.
+	// "cilium": cilium as CNI (cni.exclusive=false, KPR off,
+	// hostRouting off) — proxies for AWS NPA, exercises the
+	// bpf_mprog coexistence path at pod-eth0 TCX.
+	VMRigCNI string
 }
 
 func loadConfig() *Config {
@@ -50,6 +59,7 @@ func loadConfig() *Config {
 		KubeconfigPath:  envOr("NATRA_VM_KUBECONFIG", "/tmp/natra-vm-rig.kubeconfig"),
 		NatraImage:      envOr("NATRA_VM_IMAGE", "ghcr.io/terraboops/natra:vm-rig"),
 		PerfclientImage: envOr("NATRA_VM_PERFCLIENT_IMAGE", "ghcr.io/terraboops/natra-perfclient:vm-rig"),
+		VMRigCNI:        envOr("VMRIG_CNI", "flannel"),
 	}
 	_, thisFile, _, _ := runtime.Caller(0)
 	c.RepoRoot = filepath.Join(filepath.Dir(thisFile), "..", "..")

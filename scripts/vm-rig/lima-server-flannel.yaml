@@ -1,0 +1,101 @@
+# Lima VM template for the k3s server node (control-plane).
+# Flannel host-gw variant — the default, simpler vm-rig CNI. Lower
+# overhead, fewer moving parts, no helm install in the provision
+# script. Use lima-server-cilium.yaml for the production-shaped
+# BPF-NPA-proxy configuration (cilium as CNI). The Go-side selector
+# (Config.VMRigCNI, env VMRIG_CNI) picks which file `up` uses.
+#
+# Each VM runs its own Linux kernel. Inter-VM traffic crosses the
+# `lima` shared network (socket_vmnet on macOS, libvirt/KVM bridged
+# on Linux) — a real virtual NIC pair, not a shared bridge in one
+# kernel.
+#
+# Debian 13 (trixie) ships kernel 6.12 — well above the 6.6
+# threshold for TCX (bpf_mprog), so natra's preferred attach
+# mode works out of the box. clsact remains the kernel-5.x
+# fallback inside the loader if anything in the chain breaks.
+#
+# Image source rationale + saimei mirror choice: see
+# lima-server-cilium.yaml. Same image list, no functional
+# difference at the lima level.
+
+images:
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+
+networks:
+  - lima: shared
+
+mounts: []
+
+portForwards:
+  - guestPort: 6443
+    hostIP: "127.0.0.1"
+    hostPort: 6443
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      # Static lima0 IP — see lima-server-cilium.yaml for the full
+      # rationale (vmnet DHCP unreliability, networkd 05- drop-in
+      # priority, etc.). Server pins .10; agent pins .11.
+      LIMA_IP=192.168.105.10
+      for _ in $(seq 1 30); do
+        ip link show lima0 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      mkdir -p /etc/systemd/network
+      printf '[Match]\nName=lima0\n[Network]\nAddress=%s/24\nDHCP=no\n' \
+        "$LIMA_IP" > /etc/systemd/network/05-natra-lima0.network
+      networkctl reload
+      networkctl reconfigure lima0
+      for _ in $(seq 1 30); do
+        ip -4 -o addr show lima0 2>/dev/null | grep -q "${LIMA_IP}/24" && break
+        sleep 1
+      done
+      if ! ip -4 -o addr show lima0 | grep -q "${LIMA_IP}/24"; then
+        echo "natra vm-rig: failed to set static ${LIMA_IP} on lima0" >&2
+        exit 1
+      fi
+      echo "$LIMA_IP" > /etc/natra-server-ip
+
+      # bpftool + /usr/bin/time are needed by the perfrig memory
+      # workload (bpftool reports byte-exact BPF memlock for natra;
+      # /usr/bin/time -v reports the CNI plugin's ru_maxrss).
+      # Debian trixie's generic cloud image has neither by default.
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool time
+
+      # k3s with flannel host-gw as the CNI — the simpler, lower-
+      # overhead vm-rig default. --flannel-iface=lima0 is the
+      # load-bearing fix for the original "cross-VM pod traffic
+      # dead" symptom: without it flannel auto-selects eth0 (the
+      # per-VM-isolated lima user-mode NAT) and pod-to-pod
+      # cross-VM black-holes. Pinning lima0 (the shared vmnet
+      # network) gives host-gw the correct next-hop.
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="v1.31.4+k3s1" \
+        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=host-gw --flannel-iface=lima0 --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP}" \
+        sh -
+
+      # Token at a predictable path so up.sh can read it via shell
+      # exec. /var/lib/rancher/k3s/server/node-token is the canonical
+      # location; expose a world-readable copy for the rig.
+      install -m 0644 /var/lib/rancher/k3s/server/node-token /etc/natra-node-token

@@ -239,8 +239,12 @@ test-vm: ## Layer 4 (kernel-isolated): two-VM k3s cluster via lima, real cross-k
 	@go run ./cmd/vm-rig all
 
 .PHONY: perf-vs-vanilla-vm
-perf-vs-vanilla-vm: ## natra vs upstream bandwidth on two real kernels (lima). Owns the VM lifecycle: fresh cluster per phase. ~40 min. Local-dev counterpart of the k3d perf-vs-vanilla.
+perf-vs-vanilla-vm: ## natra vs upstream bandwidth on two real kernels (lima), flannel host-gw CNI. ~40 min. Fresh cluster per phase. Canonical two-kernel headline numbers.
 	@go run ./cmd/vm-rig perfvsvanilla
+
+.PHONY: perf-vs-vanilla-vm-cilium
+perf-vs-vanilla-vm-cilium: ## Same as perf-vs-vanilla-vm but with cilium as the CNI (cni.exclusive=false, KPR off). Proxies AWS NPA; exercises bpf_mprog coexistence at pod TCX. ~50 min.
+	@VMRIG_CNI=cilium go run ./cmd/vm-rig perfvsvanilla
 
 .PHONY: test-all
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.

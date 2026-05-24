@@ -1,0 +1,79 @@
+# Lima VM template for the k3s agent node (worker), flannel
+# host-gw variant. Pairs with lima-server-flannel.yaml. See that
+# file's header for the rig-level rationale and the
+# Config.VMRigCNI / VMRIG_CNI selector.
+
+images:
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+
+networks:
+  - lima: shared
+
+mounts: []
+
+# These come from `limactl start --set='.env.NATRA_K3S_URL=...'`
+# in up.sh after the server is ready.
+env:
+  NATRA_K3S_URL: ""
+  NATRA_K3S_TOKEN: ""
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      if [ -z "${NATRA_K3S_URL:-}" ] || [ -z "${NATRA_K3S_TOKEN:-}" ]; then
+        echo "natra vm-rig: NATRA_K3S_URL / NATRA_K3S_TOKEN must be set on the agent VM" >&2
+        exit 1
+      fi
+
+      # Static lima0 IP — see lima-server-flannel.yaml. Agent pins .11.
+      LIMA_IP=192.168.105.11
+      for _ in $(seq 1 30); do
+        ip link show lima0 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      mkdir -p /etc/systemd/network
+      printf '[Match]\nName=lima0\n[Network]\nAddress=%s/24\nDHCP=no\n' \
+        "$LIMA_IP" > /etc/systemd/network/05-natra-lima0.network
+      networkctl reload
+      networkctl reconfigure lima0
+      for _ in $(seq 1 30); do
+        ip -4 -o addr show lima0 2>/dev/null | grep -q "${LIMA_IP}/24" && break
+        sleep 1
+      done
+      if ! ip -4 -o addr show lima0 | grep -q "${LIMA_IP}/24"; then
+        echo "natra vm-rig: failed to set static ${LIMA_IP} on lima0" >&2
+        exit 1
+      fi
+
+      # bpftool + /usr/bin/time for the perfrig memory workload.
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bpftool time
+
+      # k3s agent with flannel host-gw. --flannel-iface=lima0 is the
+      # actual fix for cross-VM pod traffic — see
+      # lima-server-flannel.yaml. Without it flannel picks eth0
+      # (lima user-mode NAT) and pod-to-pod cross-VM black-holes.
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="v1.31.4+k3s1" \
+        K3S_URL="${NATRA_K3S_URL}" \
+        K3S_TOKEN="${NATRA_K3S_TOKEN}" \
+        INSTALL_K3S_EXEC="agent --node-ip=${LIMA_IP} --flannel-iface=lima0" \
+        sh -
