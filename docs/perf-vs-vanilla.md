@@ -210,24 +210,49 @@ veth; coexist cleanly via `bpf_mprog`, see traffic, enforce" —
 is the same regardless of which CNI is at the other end of the
 hook. What cilium tests, AWS NPA inherits.
 
-Most-recent flannel-host-gw baseline / vanilla / natra numbers
-(pre-cilium, single sample under `ci`):
+Latest flannel-host-gw default vm-rig numbers (`ci` profile,
+single sample, commit `beubje9u0`):
 
-| Phase    | iperf ing | iperf eg  | hey rps | p50 ms | p99 ms |
-|----------|-----------|-----------|---------|--------|--------|
-| baseline | 1863 Mbps | 1858 Mbps |   17410 |    2.7 |    5.9 |
-| vanilla  |  10.1 Mbps|  10.1 Mbps|    1059 |   47.3 |   48.7 |
-| natra    |  10.2 Mbps|  10.1 Mbps|   16699 |    2.9 |    6.6 |
+**iperfSweep (single rate at 10M, the staged perf-server's
+annotation):**
 
-- baseline is the unshaped cross-VM wire: elephant ~1.9 Gbps,
-  mice 17410 rps at 5.9 ms p99.
-- vanilla and natra cap the elephant to the 10M annotation
-  equally well (~10.1/10.1 Mbps each).
-- Under that cap, vanilla's mice drop to 1059 rps at 48.7 ms
-  p99; natra's hold at 16699 rps at 6.6 ms p99 — within noise
-  of the unshaped baseline. **Same elephant cap as upstream;
-  mice latency unchanged from no rate-limiter, where upstream
-  costs ~16× rps / ~7× p99.**
+| Phase    | iperf ing | iperf eg  |
+|----------|-----------|-----------|
+| baseline | 1534 Mbps | 1498 Mbps |
+| vanilla  |  10.1 Mbps|  10.1 Mbps|
+| natra    |  10.2 Mbps|  10.1 Mbps|
+
+**mixed (`iperf3 --bidir` elephant + concurrent annotated +
+bystander hey mice — the bystander-aware story):**
+
+| Phase    | iperf ing | iperf eg  | annotated mice rps/p99 | bystander rps/p99 | mice total |
+|----------|-----------|-----------|------------------------|-------------------|------------|
+| baseline | 789 Mbps  | 631 Mbps  |   746 / 88.7 ms        |   747 / 88.0 ms   | 1493       |
+| vanilla  |  10.6 Mbps|   8.6 Mbps|    36 / 1819 ms        |  9596 / 12.7 ms   | 9632       |
+| natra    |  10.1 Mbps|  10.1 Mbps|  6321 / 22.3 ms        |  6424 / 21.9 ms   | **12746**  |
+
+natra at `auto`-resolved `tcx-podside` on both directions
+(BPF memlock 32 MB byte-exact). Read the row, not the column:
+
+- **Elephant cap.** vanilla and natra both hold the 10M cap.
+  (vanilla's mixed-workload egress dips to 8.6 Mbps from
+  iperf3 --bidir contention; natra holds 10.1/10.1 with both
+  buckets engaged simultaneously.)
+- **Annotated mice.** natra delivers **6321 rps / p99 22 ms**;
+  vanilla collapses to **36 rps / p99 1819 ms** — natra is
+  ~175× more rps and ~80× better p99 at the same cap. The
+  CMS fast-pass routes fresh HTTP requests under the
+  heavy-hitter threshold, around the bucket; vanilla queues
+  every flow against the same 10M slot.
+- **Mice total.** natra's row sum is **12746 rps — +32% over
+  vanilla's 9632 and 8.5× baseline's 1493**. The cap frees
+  worker capacity that baseline's elephant was hogging; natra
+  splits it fairly (annotated 6321 ≈ bystander 6424), vanilla
+  collapses annotated and hands their share to the bystander
+  (36 + 9596). The column-by-column read makes vanilla's
+  bystander look great; the row-level read shows natra
+  delivers more total work AND honors the bucket the user
+  asked for.
 
 ### BPF-NPA composition — measured, working
 
