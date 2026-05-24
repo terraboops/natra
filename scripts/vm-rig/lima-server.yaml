@@ -193,6 +193,7 @@ provision:
         --set bpf.tcx=true \
         --set kubeProxyReplacement=false \
         --set bpf.hostRouting=false \
+        --set cni.exclusive=false \
         --set k8sServiceHost=${LIMA_IP} \
         --set k8sServicePort=6443 \
         --set operator.replicas=1 \
