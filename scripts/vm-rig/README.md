@@ -97,12 +97,29 @@ go run ./cmd/vm-rig down   # when done
 
 ## Files in this directory
 
-- `lima-server.yaml` — VM template for the k3s server (control-plane).
-  Cloud-init provisions k3s on first boot and writes the join token
-  to `/etc/natra-node-token`.
-- `lima-agent.yaml` — VM template for the k3s agent (worker). Reads
-  `NATRA_K3S_URL` + `NATRA_K3S_TOKEN` from its env block; `cmd/vm-rig`
-  renders a copy with those values inlined before `limactl create`.
+Each role (server, agent) has two YAML templates — one per CNI
+choice. `cmd/vm-rig` picks the right pair based on `VMRIG_CNI`
+(default `flannel`).
+
+- `lima-server-flannel.yaml` / `lima-agent-flannel.yaml` —
+  default. k3s with flannel host-gw, kube-proxy enabled, no
+  helm. Lower overhead, simpler provision, ~5 min cluster
+  bringup. Canonical two-kernel headline numbers come from this
+  pair.
+- `lima-server-cilium.yaml` / `lima-agent-cilium.yaml` — opt-in
+  via `VMRIG_CNI=cilium` (or `make perf-vs-vanilla-vm-cilium`).
+  k3s with `--flannel-backend=none`, cilium installed via helm
+  in the provision script with `cni.exclusive=false`,
+  `kubeProxyReplacement=false`, `bpf.hostRouting=false`.
+  Proxies AWS NPA's shape (BPF policy enforcer + kube-proxy
+  for Services). Heavier provision (helm + cilium image pulls,
+  ~10 min cluster bringup).
+
+The server templates' cloud-init provisions k3s on first boot
+and writes the join token to `/etc/natra-node-token`. The agent
+templates read `NATRA_K3S_URL` + `NATRA_K3S_TOKEN` from their
+env block; `cmd/vm-rig` renders a copy with those values
+inlined before `limactl create`.
 
 ## CLI
 
@@ -122,6 +139,9 @@ Environment:
   NATRA_VM_KUBECONFIG   kubeconfig output path (default /tmp/natra-vm-rig.kubeconfig)
   NATRA_VM_IMAGE        natra image tag to build/use (default ghcr.io/terraboops/natra:vm-rig)
   NATRA_VM_KEEP=1       used by `all` to skip teardown on exit
+  VMRIG_CNI             flannel (default) or cilium — selects the lima YAML pair
+  PVV_PROFILE           perfrig profile for perfvsvanilla: full (default) or ci
+  NATRA_ATTACH_MODE     override the installer DS attach mode (logged at run start)
 ```
 
 `perfvsvanilla` is the local-developer counterpart of the k3d

@@ -62,30 +62,42 @@ make ci              # All of the above + lint + license scan
 L2/L3/L4/L5 all run on macOS via Docker. All four share one Linux
 kernel (colima's LinuxKit VM on Mac; the runner kernel on GH).
 
-For real kernel-to-kernel coverage there's a separate on-demand rig:
+For real kernel-to-kernel coverage there's a separate on-demand
+two-VM lima rig:
 
 ```bash
-make test-vm           # two-VM k3s cluster under lima, real cross-kernel
-                       # pod traffic: natra throttle + CMS fast-pass.
-make perf-vs-vanilla-vm # baseline/natra/upstream comparison on two
-                       # real kernels, fresh cluster per phase (~40 min).
-                       # macOS prereq: brew install socket_vmnet (do NOT
-                       # `brew services start` it). See scripts/vm-rig/README.md.
+make test-vm                  # two-VM k3s cluster under lima, real
+                              # cross-kernel pod traffic: natra
+                              # throttle + CMS fast-pass.
+make perf-vs-vanilla-vm       # baseline/natra/upstream comparison on
+                              # two real kernels, flannel host-gw CNI
+                              # (default), fresh cluster per phase
+                              # (~40 min). macOS prereq: brew install
+                              # socket_vmnet (do NOT `brew services
+                              # start` it). See scripts/vm-rig/README.md.
+make perf-vs-vanilla-vm-cilium # Same as above but with cilium as the
+                              # CNI (proxies for AWS NPA; exercises
+                              # the bpf_mprog coexistence path at pod
+                              # TCX). VMRIG_CNI=cilium under the hood.
 ```
 
 For what each layer actually validates — and the wire-level
 behaviors none of these reach (real NICs, switch queueing, etc.) —
 see `docs/test-environments.md`.
 
-A real-cluster head-to-head against the upstream
-`containernetworking/plugins/bandwidth` plugin is available
-on-demand:
+The cluster-level head-to-head against the upstream
+`containernetworking/plugins/bandwidth` plugin runs locally and in
+CI via the shared `internal/perfrig` executor:
 
 ```bash
-make perf-vs-vanilla   # ~18-22 min; three k3d clusters in sequence
+make perf-vs-vanilla    # k3d substrate, ci profile (~18-22 min,
+                        # also runs per-push in GH Actions).
 ```
 
-See `docs/perf-vs-vanilla.md` for what it measures.
+Both rigs share the same Spec/Executor; the only difference is the
+Substrate impl. A unit test asserts `ci ⊆ full` so the k3d profile
+is structurally a subset of what the lima rig runs. See
+`docs/perf-vs-vanilla.md` for what either measures.
 
 ## Code quality
 
@@ -117,6 +129,14 @@ NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e   # or tcx-podside, clsact-ho
 
 ```
 cmd/natra/             CNI plugin entry point + install + dump-stats
+cmd/perfrig/           k3d substrate frontend; invoked by make
+                       perf-vs-vanilla and the GH CI perf-vs-vanilla
+                       job. Lima vm-rig has its own entry under
+                       cmd/vm-rig perfvsvanilla.
+cmd/vm-rig/            Lima two-VM rig lifecycle: up/down/install/test/
+                       perfvsvanilla. Reads VMRIG_CNI={flannel,cilium}.
+internal/perfrig/      Shared Spec + Executor + Substrate interface that
+                       both rigs run through.
 pkg/bpf/               Go loader; embeds bpf/natra.bpf.o
 pkg/cni/config/        Bandwidth annotation parser
 bpf/                   BPF C source (natra.bpf.c, vanilla.bpf.c, placeholder.bpf.c)
@@ -124,10 +144,14 @@ deploy/                DaemonSet manifest, Dockerfile
 test/cni/              L2 CNI protocol tests
 test/bpf/              L3 BPF dataplane + chaos + edge-case tests
 test/e2e/              L4 k3d end-to-end + chaos
-test/perf/             L5 perf scenarios; test/perf/realworld for the
-                       on-demand vs-vanilla cluster comparison
+test/perf/             L5 perf scenarios; test/perf/realworld holds the
+                       perf-server / perf-client / bystander manifests
+                       both perfrig substrates consume.
 docs/                  Architecture, CNI spec, this guide, blog
-scripts/               run-in-docker wrapper, license-scan, perf-vs-vanilla
+scripts/               run-in-docker wrapper, license-scan, vm-rig/
+                       (lima-server-{flannel,cilium}.yaml +
+                       lima-agent-*.yaml), perf-vs-vanilla.sh
+                       (thin k3d-bootstrap shim → cmd/perfrig)
 TODO_LINUX.md          Linux-only test layer details
 ```
 

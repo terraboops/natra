@@ -80,9 +80,14 @@ For natra this matters because:
 ### L5 — perf (`make test-perf` + `make perf-vs-vanilla`)
 
 `BPF_PROG_RUN` with elephant + mice scenario traffic patterns (synthetic
-in-kernel benchmarks), plus `scripts/perf-vs-vanilla.sh` which drives a
-real iperf workload across three k3d clusters comparing baseline /
-natra / upstream `bandwidth`. Same k3d kernel-sharing caveat as L4.
+in-kernel benchmarks). Plus the cluster-level comparison driven by
+`cmd/perfrig` (`make perf-vs-vanilla` → k3d substrate via the shrunk
+`scripts/perf-vs-vanilla.sh` shim, `make perf-vs-vanilla-vm` → lima
+vm-rig via `cmd/vm-rig perfvsvanilla`). Same `internal/perfrig`
+Executor + Spec under both substrates; a unit test pins `ci ⊆ full`
+so the k3d profile is structurally a subset of the lima profile.
+Same k3d kernel-sharing caveat as L4 applies to the k3d substrate;
+the lima vm-rig has its own real kernel per VM.
 
 ## What's not in the rig
 
@@ -141,8 +146,9 @@ production behavior?").
 The host-gw flannel topology on Mac/colima is software-bridged; on
 GH runners it's whatever the runner kernel's bridge does without
 hardware offload. Single-stream iperf3 peaks around 1 Gbps on this
-class of setup. The new `RATE_SWEEP=10M 1G 10G` exercise plugs in
-the annotations but doesn't actually push 10G traffic. Validation
+class of setup. The shared spec defines `Rates: [10M, 1G, 10G]`,
+exercised by the `full` profile; the rig plugs in the annotations
+but doesn't actually push 10G traffic on this hardware. Validation
 of "natra correctly throttles a 10G annotated pod" requires real
 metal capable of producing >1 Gbps single-stream.
 
