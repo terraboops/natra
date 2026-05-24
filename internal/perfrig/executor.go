@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 )
 
 // Executor runs a Plan against a Substrate, one phase at a time,
@@ -56,6 +57,15 @@ func (e *Executor) Run(ctx context.Context) (Report, error) {
 		Substrate: e.Substrate.Name(),
 		Profile:   e.Plan.Profile,
 	}
+	// Log the requested NATRA_ATTACH_MODE up front so post-mortems
+	// don't have to guess what auto resolved to; per-phase
+	// stage.go grep against /var/log/natra-cni.log adds the actual
+	// per-direction side that natra picked.
+	mode := os.Getenv("NATRA_ATTACH_MODE")
+	if mode == "" {
+		mode = "auto (chain: tcx-pod → clsact-pod → tcx-host → clsact-host)"
+	}
+	e.logf("==> [perfrig] NATRA_ATTACH_MODE requested: %s\n", mode)
 	for _, ph := range e.Plan.Phases {
 		e.logf("\n========== PHASE %s — fresh cluster ==========\n", ph)
 		phaseRep, err := e.runPhase(ctx, ph)

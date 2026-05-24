@@ -124,7 +124,34 @@ func (e *Executor) stagePhase(ctx context.Context, phase Phase) error {
 		"exec", "-n", ns, "perf-client", "-c", "tools", "--",
 		"hey", "-z", "5s", "-c", "50", "-disable-keepalive", "http://perf-server:80/")
 
+	// 6. In the natra phase, show what attach mode actually
+	//    resolved per direction by grepping the natra log on the
+	//    worker. Closes the "did auto pick what we expected?"
+	//    ambiguity that bit the cilium investigation.
+	if phase == PhaseNatra {
+		e.logNatraAttachState(ctx)
+	}
 	return nil
+}
+
+// logNatraAttachState reads /var/log/natra-cni.log on the worker
+// node and prints the natra binary's own "attached:" entries — one
+// per attached direction. The lines include the resolved side
+// (hostside/podside), direction (ingress/egress), ifindex, rate,
+// burst, and HH threshold. Best-effort: silent if the log isn't
+// readable or has no entries.
+func (e *Executor) logNatraAttachState(ctx context.Context) {
+	_, worker := e.Substrate.Nodes()
+	out, err := e.Substrate.NodeShell(ctx, worker,
+		`grep -h "attached:" /var/log/natra-cni.log 2>/dev/null | tail -n 8 || true`)
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		e.logf("==> [natra] resolved attach state: (no entries in /var/log/natra-cni.log yet)\n")
+		return
+	}
+	e.logf("==> [natra] resolved attach state (most recent attach entries on %s):\n", worker)
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		e.logf("    %s\n", line)
+	}
 }
 
 // patchVanillaTBF rewrites the bundled bandwidth plugin's per-pod
