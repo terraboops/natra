@@ -1,9 +1,11 @@
 package perfrig
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -138,12 +140,19 @@ func snapshotMemory(ctx context.Context, sub Substrate, node string, phase Phase
 
 	// bpftool memlock — natra phase byte-exact corroboration; zero
 	// elsewhere. We always try it; on baseline/vanilla the natra_*
-	// filter just returns no objects and the sum is 0.
+	// filter just returns no objects and the sum is 0. Separator
+	// line between the two bpftool invocations so splitJSONArrays
+	// can tell the prog and map arrays apart.
 	if phase == PhaseNatra {
 		out, err := sub.NodeShell(ctx, node,
-			`(bpftool -j prog show 2>/dev/null; bpftool -j map show 2>/dev/null) || true`)
+			`bpftool -j prog show 2>/dev/null; echo; bpftool -j map show 2>/dev/null`)
 		if err == nil {
 			snap.bpfMemlockBytes = sumNatraBpfMemlock(out)
+		}
+		if snap.bpfMemlockBytes == 0 {
+			fmt.Fprintf(os.Stderr,
+				"==> natra phase bpf memlock = 0; bpftool err=%v outlen=%d head=%.200q\n",
+				err, len(out), string(out))
 		}
 	}
 
@@ -163,26 +172,29 @@ func snapshotMemory(ctx context.Context, sub Substrate, node string, phase Phase
 	return snap, nil
 }
 
-// sumNatraBpfMemlock parses concatenated `bpftool -j prog show`
-// and `bpftool -j map show` output (each a top-level JSON array)
-// and sums bytes_memlock for objects named natra_* or matching
-// the natra prog names.
+// sumNatraBpfMemlock parses one or more concatenated `bpftool -j
+// prog show` and `bpftool -j map show` arrays and sums
+// bytes_memlock for objects whose `name` starts with `natra_`
+// (BPF kernel names are truncated to 15 chars, so the full
+// natra_config_map becomes natra_config_ma; the prefix match
+// catches both forms).
+//
+// json.Decoder reads each top-level JSON value in turn, so
+// concatenated arrays separated by whitespace are handled
+// without a fragile string-split. The earlier splitJSONArrays
+// approach split on `]` which broke on nested arrays like
+// `map_ids: [...]`, silently returning 0.
 func sumNatraBpfMemlock(raw []byte) int64 {
-	// bpftool emits one JSON array per command, concatenated. The
-	// objects are uniform-ish; we look for "name" and
-	// "bytes_memlock" fields. A naive split-on-`][` followed by
-	// per-array Unmarshal handles the concatenation without
-	// requiring a custom decoder.
-	chunks := splitJSONArrays(string(raw))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	var total int64
-	for _, chunk := range chunks {
+	for {
 		var items []map[string]any
-		if err := json.Unmarshal([]byte(chunk), &items); err != nil {
-			continue
+		if err := dec.Decode(&items); err != nil {
+			break // io.EOF or malformed tail
 		}
 		for _, it := range items {
 			name, _ := it["name"].(string)
-			if !strings.HasPrefix(name, "natra_") && name != "natra_ingress" && name != "natra_egress" {
+			if !strings.HasPrefix(name, "natra_") {
 				continue
 			}
 			switch v := it["bytes_memlock"].(type) {
@@ -194,25 +206,6 @@ func sumNatraBpfMemlock(raw []byte) int64 {
 		}
 	}
 	return total
-}
-
-// splitJSONArrays splits a string containing one or more
-// concatenated JSON arrays (`][`) into individual `[...]` strings.
-func splitJSONArrays(s string) []string {
-	parts := strings.SplitAfter(s, "]")
-	var out []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if strings.HasPrefix(p, "[") && strings.HasSuffix(p, "]") {
-			out = append(out, p)
-		} else if strings.HasPrefix(p, "[") {
-			out = append(out, p+"]")
-		}
-	}
-	if len(out) == 0 && strings.HasPrefix(strings.TrimSpace(s), "[") {
-		return []string{strings.TrimSpace(s)}
-	}
-	return out
 }
 
 // pluginInvokePeakRSS captures the per-CNI-ADD peak RSS of the
@@ -323,18 +316,18 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 	case PhaseVanilla:
 		label = "app=vanilla-installer"
 	}
-	// crictl ps --label filters by *container* labels, but the
-	// 'app: natra' label lives on the *pod template*. crictl pods
-	// + crictl inspectp is the correct path — pods carries the
-	// pod template labels, inspectp returns the sandbox's pid for
-	// nsenter / cgroup lookup. (The earlier crictl ps approach
-	// silently returned empty on both lima and k3d.)
+	// Read VmRSS directly from /proc/<sandbox-pid>/status rather
+	// than cgroup memory.current. For an installer DS that's just
+	// running pause post-install, the sandbox pid's own VmRSS is
+	// exactly the few MB we care about — no cgroup-path
+	// interpretation needed. The earlier cgroup approach hit two
+	// real problems: (a) on cgroup v1+v2 hybrid mode the "0::"
+	// line points at a slice that aggregates many pods (k3d
+	// natra showed 575 MB when expected ~few MB), and (b) the
+	// path traversal was substrate-dependent.
 	//
-	// inspectp's `info` field is a stringified JSON, not a
-	// structured object — `"pid":NNN` appears inside an escaped
-	// string. A literal-substring grep matches both raw and
-	// escaped forms (the backslashes around "pid": don't affect
-	// what grep sees).
+	// VmRSS is reported in kB; convert to bytes for the
+	// MemorySample.InstallerDSBytes field.
 	script := fmt.Sprintf(`
         pod=$(%[1]s pods -q --label "%[2]s" 2>/dev/null | head -1)
         if [ -z "$pod" ]; then echo 0; exit 0; fi
@@ -342,10 +335,10 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
             | grep -oE '"pid":[[:space:]]*[0-9]+' \
             | grep -oE '[0-9]+' \
             | head -1)
-        if [ -n "$pid" ] && [ -f /proc/$pid/cgroup ]; then
-          cg=$(awk -F: '$1 == "0" {print $3}' /proc/$pid/cgroup | head -1)
-          if [ -f "/sys/fs/cgroup$cg/memory.current" ]; then
-            cat "/sys/fs/cgroup$cg/memory.current"
+        if [ -n "$pid" ] && [ -f /proc/$pid/status ]; then
+          rss_kb=$(awk '/^VmRSS:/ {print $2}' /proc/$pid/status 2>/dev/null)
+          if [ -n "$rss_kb" ]; then
+            echo $((rss_kb * 1024))
           else
             echo 0
           fi

@@ -51,15 +51,27 @@ func TestSumNatraBpfMemlock_Empty(t *testing.T) {
 	}
 }
 
-// TestSumNatraBpfMemlock_Malformed — bpftool occasionally prints
-// warnings or partial output when a map is being modified. The
-// parser must shrug off the un-parseable chunk rather than
-// failing the whole run.
+// TestSumNatraBpfMemlock_Malformed — bpftool occasionally
+// prints warnings before the JSON arrays. The decoder bails on
+// the first parse error rather than trying to resync; in
+// practice bpftool either produces well-formed JSON or errors
+// out entirely, so this is the right contract. The test pins it
+// so a future change to "graceful resync" is a conscious choice.
 func TestSumNatraBpfMemlock_Malformed(t *testing.T) {
-	raw := `not valid json at all][{"name":"natra_ingress","bytes_memlock":2048}]`
-	got := sumNatraBpfMemlock([]byte(raw))
-	if got != 2048 {
-		t.Errorf("malformed leading chunk: got %d, want 2048 (second chunk should still parse)", got)
+	raw := `not valid json at all`
+	if got := sumNatraBpfMemlock([]byte(raw)); got != 0 {
+		t.Errorf("malformed input: got %d, want 0 (decoder bails on parse error)", got)
+	}
+}
+
+// TestSumNatraBpfMemlock_NestedArrays — real bpftool output
+// includes nested arrays like `map_ids: [...]` inside program
+// records. The earlier split-on-`]` parser broke on these. Pin
+// the modern json.Decoder contract: nested arrays parse cleanly.
+func TestSumNatraBpfMemlock_NestedArrays(t *testing.T) {
+	raw := `[{"id":12,"name":"natra_ingress","map_ids":[1594,1593,1592,1591],"bytes_memlock":8192}]`
+	if got := sumNatraBpfMemlock([]byte(raw)); got != 8192 {
+		t.Errorf("nested arrays: got %d, want 8192", got)
 	}
 }
 
