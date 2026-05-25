@@ -323,15 +323,22 @@ func installerDSPeakRSS(ctx context.Context, sub Substrate, node string, phase P
 	case PhaseVanilla:
 		label = "app=vanilla-installer"
 	}
-	// crictl inspect's `info` field is a *stringified* JSON, not a
-	// structured object — `"pid":NNN` is wrapped inside an escaped
-	// string. A grep that matches the literal substring works for
-	// both the raw and the escaped form (the backslashes around
-	// "pid": don't affect the match).
+	// crictl ps --label filters by *container* labels, but the
+	// 'app: natra' label lives on the *pod template*. crictl pods
+	// + crictl inspectp is the correct path — pods carries the
+	// pod template labels, inspectp returns the sandbox's pid for
+	// nsenter / cgroup lookup. (The earlier crictl ps approach
+	// silently returned empty on both lima and k3d.)
+	//
+	// inspectp's `info` field is a stringified JSON, not a
+	// structured object — `"pid":NNN` appears inside an escaped
+	// string. A literal-substring grep matches both raw and
+	// escaped forms (the backslashes around "pid": don't affect
+	// what grep sees).
 	script := fmt.Sprintf(`
-        cid=$(%[1]s ps -q --label "%[2]s" 2>/dev/null | head -1)
-        if [ -z "$cid" ]; then echo 0; exit 0; fi
-        pid=$(%[1]s inspect "$cid" 2>/dev/null \
+        pod=$(%[1]s pods -q --label "%[2]s" 2>/dev/null | head -1)
+        if [ -z "$pod" ]; then echo 0; exit 0; fi
+        pid=$(%[1]s inspectp "$pod" 2>/dev/null \
             | grep -oE '"pid":[[:space:]]*[0-9]+' \
             | grep -oE '[0-9]+' \
             | head -1)

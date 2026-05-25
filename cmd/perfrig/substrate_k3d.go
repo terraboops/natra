@@ -227,18 +227,32 @@ const (
 
 func (k *k3dSubstrate) EnsureBpftool(ctx context.Context, node string) error {
 	if err := k.cacheBpftoolBinary(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "==> EnsureBpftool: cache failed: %v\n", err)
 		return fmt.Errorf("cache bpftool: %w", err)
 	}
 	if k.bpftoolHost == "" {
-		return nil // best-effort: cache failed, executor sees zero
+		fmt.Fprintln(os.Stderr, "==> EnsureBpftool: no cached binary; skipping install")
+		return nil
 	}
 	// /usr/local/bin doesn't exist on k3s nodes by default; create
 	// it before docker cp.
-	_, _ = captureCmd(ctx, "docker", "exec", node, "mkdir", "-p", "/usr/local/bin")
+	if out, err := captureCmd(ctx, "docker", "exec", node, "mkdir", "-p", "/usr/local/bin"); err != nil {
+		fmt.Fprintf(os.Stderr, "==> EnsureBpftool: mkdir failed on %s: %v\n%s\n", node, err, out)
+	}
 	if out, err := captureCmd(ctx, "docker", "cp", k.bpftoolHost, node+":/usr/local/bin/bpftool"); err != nil {
+		fmt.Fprintf(os.Stderr, "==> EnsureBpftool: docker cp failed on %s: %v\n%s\n", node, err, out)
 		return fmt.Errorf("docker cp bpftool to %s: %w\n%s", node, err, out)
 	}
-	_, _ = captureCmd(ctx, "docker", "exec", node, "chmod", "0755", "/usr/local/bin/bpftool")
+	if out, err := captureCmd(ctx, "docker", "exec", node, "chmod", "0755", "/usr/local/bin/bpftool"); err != nil {
+		fmt.Fprintf(os.Stderr, "==> EnsureBpftool: chmod failed on %s: %v\n%s\n", node, err, out)
+	}
+	// Verify the install actually worked end-to-end so a future
+	// silent failure surfaces.
+	if out, err := captureCmd(ctx, "docker", "exec", node, "/usr/local/bin/bpftool", "version"); err != nil {
+		fmt.Fprintf(os.Stderr, "==> EnsureBpftool: post-install verify failed on %s: %v\n%s\n", node, err, out)
+		return fmt.Errorf("bpftool verify on %s: %w", node, err)
+	}
+	fmt.Fprintf(os.Stderr, "==> EnsureBpftool: bpftool installed at %s:/usr/local/bin/bpftool\n", node)
 	return nil
 }
 
