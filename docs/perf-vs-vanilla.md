@@ -285,10 +285,9 @@ run: a BPF policy enforcer that owns the host-side veth and a
 TCX-attached natra coexist via `bpf_mprog` at the pod-eth0
 hook, no traffic redirection between them.
 
-#### Two cilium settings that matter
+#### The one cilium setting that matters
 
-Getting here required two cilium-specific helm settings on the
-vm-rig install:
+Only one cilium helm flag is load-bearing for natra coexistence:
 
 - **`cni.exclusive=false`** — cilium's CNI installer defaults
   to exclusive mode, which actively **renames any other
@@ -299,41 +298,53 @@ vm-rig install:
   `/var/log/natra-cni.log` staying empty — the binary was
   never invoked by CNI ADD.) Setting `cni.exclusive=false`
   tells cilium to coexist with sibling conflists.
-- **`kubeProxyReplacement=false`** + **`bpf.hostRouting=false`**
-  — keeps pod-to-pod traffic on the normal Linux stack so it
-  transits pod-eth0 (and the TCX hook chain that natra is in).
-  Cilium with the full kube-proxy-replacement + host-routing
-  fast-path (`bpf_redirect_peer` / `bpf_redirect_neigh`) is
-  documented to bypass the netfilter + routing layers and
-  could prevent natra from seeing traffic; we haven't
-  separately tested whether `cni.exclusive=false` alone would
-  let natra engage in that configuration. **For now the
-  validated configuration is policy-only cilium** — which is
-  also the closest match to AWS NPA's shape (a policy enforcer
-  + kube-proxy for Services), so the proxy is faithful.
+
+KPR (kube-proxy replacement) and BPF host-routing
+(`bpf_redirect_peer` / `bpf_redirect_neigh`) turned out to be
+**orthogonal** to natra coexistence. An earlier write-up of
+this section theorized that those redirect helpers would
+bypass natra's `tcx-podside` attach by short-circuiting between
+pod-eth0 and host-veth without traversing pod-eth0's TC chain;
+that theory was wrong. With `cni.exclusive=false`, natra's
+chained conflist is in place, kubelet walks the chain on every
+CNI ADD, the BPF programs attach, and TCX runs on traffic
+regardless of cilium's redirect choices.
+
+Both configurations are validated on the vm-rig and have their
+own opt-in target:
+
+- **KPR-off cilium** (`VMRIG_CNI=cilium`,
+  `make perf-vs-vanilla-vm-cilium`) — cilium as the CNI +
+  policy enforcer, kube-proxy handling Services via iptables.
+  Default cilium variant. More faithful AWS NPA proxy (NPA is
+  a pure policy enforcer; doesn't replace kube-proxy).
+- **KPR-on cilium** (`VMRIG_CNI=cilium-kpr`,
+  `make perf-vs-vanilla-vm-cilium-kpr`) — cilium replaces
+  kube-proxy with socketLB + host-routing fast-path. cilium's
+  full production configuration.
+
+natra holds the 10M cap in both:
+
+| Variant   | iperf elephant (natra phase) | annotated mice (natra phase) |
+|-----------|------------------------------|------------------------------|
+| KPR off   | 10.2 / 10.2 Mbps             | 2423 rps p99 74 ms           |
+| KPR on    |  9.9 / 10.2 Mbps             | 2449 rps p99 80 ms           |
 
 #### Production guidance
 
 If you run cilium alongside natra, install cilium with:
 
     helm install cilium cilium/cilium ... \
-      --set cni.exclusive=false \
-      --set kubeProxyReplacement=false \
-      --set bpf.hostRouting=false
+      --set cni.exclusive=false
 
-To reproduce the cilium-with-natra measurement locally:
+That's the only essential override. KPR / host-routing /
+socketLB can stay at whatever you'd normally run for your
+cluster — natra at `tcx-podside` engages either way.
 
-    make perf-vs-vanilla-vm-cilium
+To reproduce locally:
 
-The flannel vm-rig (`make perf-vs-vanilla-vm`, the default) is
-unchanged — it still uses k3s with flannel host-gw and produces
-the canonical two-kernel headline numbers. The cilium target is
-opt-in for the BPF-NPA composition story.
-
-KPR-on coexistence (whether the host-routing fast-path can be
-made compatible with natra-at-tcx-podside, or whether natra
-needs cilium's bandwidth-manager integration instead) is the
-remaining open question. Documented as a follow-on.
+    make perf-vs-vanilla-vm-cilium       # KPR-off cilium
+    make perf-vs-vanilla-vm-cilium-kpr   # KPR-on cilium
 
 ### Memory comparison
 
