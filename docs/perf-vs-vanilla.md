@@ -267,8 +267,17 @@ not the column:
   single-stream), so 1G/10G annotations read as "doesn't
   break" rather than "caps accurately"; natra at 1G measures
   1005 Mbps and at 10G measures 1687 Mbps, which sits above
-  the baseline wire — an unresolved measurement puzzle
-  documented as the natra-faster-than-baseline follow-on.
+  the baseline wire. Investigated via direct lima inspection
+  (#128): natra's `installFQ` does replace pod-eth0's
+  `fq_codel` (kernel default on Debian 13's 6.12) with `fq`
+  for EDT pacing — confirmed — but a direct iperf3 comparison
+  on the same wire shows fq and fq_codel within 1% of each
+  other (1620 vs 1636 Mbps). So the perfrig measurement
+  discrepancy is *not* a qdisc artifact. Most likely
+  fresh-cluster-per-phase host-state variance (baseline runs
+  cold first, natra runs after caches warm); ordering the
+  phases differently or running more samples would tease that
+  apart. Doesn't affect the 10M cap-correctness story.
 - **Annotated mice.** natra delivers **5922 rps / p99 22 ms
   with stddev 149 rps** (extremely consistent); vanilla
   collapses to **58 rps / p99 1829 ms** — natra is ~100× more
