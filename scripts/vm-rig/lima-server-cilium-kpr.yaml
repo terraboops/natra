@@ -1,0 +1,228 @@
+# KPR-on cilium variant. Differs from lima-server-cilium.yaml in
+# two places: k3s install adds --disable-kube-proxy (cilium owns
+# Service routing via cgroup-connect BPF), and the helm install
+# uses kubeProxyReplacement=true with bpf.hostRouting at its
+# cilium default (true when KPR=true). cni.exclusive=false stays
+# — that's the load-bearing flag for natra coexistence regardless
+# of KPR config (#126 validated this directly).
+#
+# Selected via VMRIG_CNI=cilium-kpr (or `make perf-vs-vanilla-vm-
+# cilium-kpr`). The KPR-off variant (lima-server-cilium.yaml) stays
+# the default cilium config because it more faithfully proxies AWS
+# NPA (policy enforcer + kube-proxy doing Services); KPR-on
+# exercises cilium's full production fast-path.
+#
+# Lima VM template for the k3s server node (control-plane). One of
+# two VMs that form the natra kernel-isolated test cluster.
+#
+# Each VM runs its own Linux kernel. Inter-VM traffic crosses the
+# `lima` shared network (socket_vmnet on macOS, libvirt/KVM bridged
+# on Linux) — a real virtual NIC pair, not a shared bridge in one
+# kernel.
+#
+# Debian 13 (trixie) ships kernel 6.12 — well above the 6.6
+# threshold for TCX (bpf_mprog), so natra's preferred attach
+# mode works out of the box. clsact remains the kernel-5.x
+# fallback inside the loader if anything in the chain breaks.
+#
+# Source the image from saimei.ftp.acc.umu.se (Academic Computer
+# Club, Umeå — primary Debian/Ubuntu push-mirror infra), NOT the
+# `cloud.debian.org` alias. cloud.debian.org round-robins across
+# backend mirrors and does not fail fast off a hung one: observed
+# TLS handshakes stalling 12-30s on the mirror.accum.se backend,
+# which then trips a lima digest-less-image bug (basedisk creation
+# fails after the last-modified Head times out). A specific
+# known-reliable mirror is more deterministic for a test rig.
+# Follow-up (separate): pin a versioned path + sha512 digest so
+# lima skips the network Head entirely (latest/ rotates daily,
+# so digest-pinning needs a dated URL — out of scope here).
+
+images:
+  # Listed in order; lima tries each in sequence and uses the first
+  # that downloads cleanly. saimei is the primary; laotzu and the
+  # canonical cloud.debian.org are fallbacks for the days saimei is
+  # dropping EOFs mid-transfer (which it does periodically).
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2"
+    arch: "aarch64"
+  - location: "https://saimei.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://laotzu.ftp.acc.umu.se/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+  - location: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    arch: "x86_64"
+
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+
+# The shared network gives this VM and the agent VM L2 reachability
+# via socket_vmnet (Mac) / lima's default-bridged (Linux). Required
+# for k3s server↔agent join and pod-to-pod traffic.
+networks:
+  - lima: shared
+
+# No host mounts — the natra image is copied in explicitly by the
+# up script via `limactl copy`, and tests drive the cluster from
+# the host's kubectl after the kubeconfig is exported.
+mounts: []
+
+# Forward the k3s API to host loopback so `kubectl` from the host
+# reaches it via the lima SSH tunnel regardless of the lima0 DHCP
+# address (which isn't fixed run-to-run). The agent VM reaches the
+# server directly over the lima-shared network at its DHCP IP.
+portForwards:
+  - guestPort: 6443
+    hostIP: "127.0.0.1"
+    hostPort: 6443
+
+# Install k3s server on first boot. --disable=traefik,servicelb
+# trims the default k3s addons we don't need; --node-ip pins the
+# advertised address to the shared-network interface so the agent
+# can reach it. Token is written to a known path the agent picks
+# up via `limactl shell`.
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      # Static lima0 IP on the lima shared (vmnet) network.
+      #
+      # We deliberately do NOT use vmnet DHCP. On this macOS/lima
+      # stack vmnet's DHCP server is wildly unreliable for the
+      # shared network — observed convergence ranged from 0s to
+      # never (>600s) across runs, which is unworkable for an
+      # unattended rig. Static is deterministic and instant.
+      #
+      # The historical objection ("vmnet won't ARP statically-
+      # assigned IPs, so cross-VM pod traffic fails") is FALSE —
+      # verified directly: with static .10/.11, server↔agent ping
+      # is 0% loss and ARP resolves both ways. vmnet bridges the
+      # two VMs' lima0 at L2 regardless of how the address was
+      # assigned. The real cross-VM-pod-traffic fix is
+      # --flannel-iface=lima0 below, not the address-assignment
+      # method. Static also installs no default route, so internet
+      # egress stays on eth0's user-mode NAT with zero extra work.
+      #
+      # Own lima0 in networkd directly (DHCP=no) rather than
+      # `ip addr add` over the top: a 05- prefixed drop-in sorts
+      # before lima's netplan-generated 10-netplan-lima0.network,
+      # so networkd treats lima0 as static from the start and
+      # never runs a competing DHCP client on it.
+      LIMA_IP=192.168.105.10
+      for _ in $(seq 1 30); do
+        ip link show lima0 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      mkdir -p /etc/systemd/network
+      printf '[Match]\nName=lima0\n[Network]\nAddress=%s/24\nDHCP=no\n' \
+        "$LIMA_IP" > /etc/systemd/network/05-natra-lima0.network
+      networkctl reload
+      networkctl reconfigure lima0
+      for _ in $(seq 1 30); do
+        ip -4 -o addr show lima0 2>/dev/null | grep -q "${LIMA_IP}/24" && break
+        sleep 1
+      done
+      if ! ip -4 -o addr show lima0 | grep -q "${LIMA_IP}/24"; then
+        echo "natra vm-rig: failed to set static ${LIMA_IP} on lima0" >&2
+        exit 1
+      fi
+      echo "$LIMA_IP" > /etc/natra-server-ip
+
+      # flannel-backend=host-gw: each node installs a kernel route
+      # "<other-node pod-cidr> via <other-node lima0 IP> dev lima0".
+      #
+      # --flannel-iface=lima0 is LOAD-BEARING and the actual fix for
+      # the original "cross-VM pod traffic dead" symptom. Without it
+      # flannel auto-selects its inter-node interface from the
+      # default route — which is eth0 (the per-VM-isolated lima
+      # user-mode NAT; its IP 192.168.5.15 is identical on every VM
+      # and goes nowhere cross-VM). flannel then installs
+      # `<other pod-cidr> via 192.168.5.15 dev eth0`, a black hole.
+      # Pinning lima0 (the shared vmnet network, where the nodes
+      # actually reach each other — ping/ARP verified) makes
+      # host-gw install the correct next-hop.
+      # bpftool + /usr/bin/time are needed by the perfrig memory
+      # workload (bpftool reports byte-exact BPF memlock for natra;
+      # /usr/bin/time -v reports the CNI plugin's ru_maxrss).
+      # jq + tar + curl prepare for helm + cilium install below.
+      # Debian trixie's generic cloud image has none of these by
+      # default. Install before k3s so node bringup is steady-state.
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        bpftool time jq tar curl
+
+      # helm isn't in standard Debian repos; pull a pinned static
+      # release directly. v3.16.4 supports the kubernetes 1.31 we
+      # install below.
+      HELM_VERSION="v3.16.4"
+      ARCH=$(dpkg --print-architecture)
+      curl -sfL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" \
+        | tar -xz -C /tmp
+      install -m 0755 "/tmp/linux-${ARCH}/helm" /usr/local/bin/helm
+      rm -rf "/tmp/linux-${ARCH}"
+
+      # k3s WITHOUT flannel and WITHOUT k3s's built-in network
+      # policy controller (cilium provides both). kube-proxy IS
+      # kept (no --disable-kube-proxy) — cilium runs as the CNI +
+      # network-policy enforcer; kube-proxy handles Service IP →
+      # backend selection via iptables. This is the
+      # KPR-off / policy-only configuration: pod-to-pod traffic
+      # transits the normal TC chain on pod-eth0 → host-veth, so
+      # natra (TCX-attached on pod-eth0) actually sees traffic.
+      # KPR-on would have cilium's bpf_redirect_peer fast-path
+      # bypass natra entirely — that's a separate compatibility
+      # story than what this rig validates.
+      #
+      # The KPR-off configuration is also the more faithful proxy
+      # for AWS NPA: NPA is a policy enforcer (no service-LB
+      # replacement), so cilium-without-KPR matches its shape on
+      # the cluster.
+      # KPR-on variant: --disable-kube-proxy so cilium handles
+      # Services via its socketLB cgroup-connect BPF, not iptables.
+      curl -sfL https://get.k3s.io | \
+        INSTALL_K3S_VERSION="v1.31.4+k3s1" \
+        INSTALL_K3S_EXEC="server --disable=traefik,servicelb --flannel-backend=none --disable-network-policy --disable-kube-proxy --node-ip=${LIMA_IP} --advertise-address=${LIMA_IP} --tls-san=${LIMA_IP} --write-kubeconfig-mode=644" \
+        sh -
+
+      # Token at a predictable path so up.sh can read it via shell
+      # exec. /var/lib/rancher/k3s/server/node-token is the canonical
+      # location; expose a world-readable copy for the rig.
+      install -m 0644 /var/lib/rancher/k3s/server/node-token /etc/natra-node-token
+
+      # Install cilium as the CNI. Two-real-kernel rig now runs the
+      # same dataplane (TCX via bpf_mprog) cilium is the de-facto
+      # standard for in production, so the natra-with-cilium
+      # composition gets measured on every perf-vs-vanilla-vm run
+      # rather than as a separate compose rig. bpf.tcx=true pins
+      # cilium to TCX so the multi-program coexistence at the pod
+      # TCX hook is the same shape natra uses.
+      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+      until kubectl get nodes >/dev/null 2>&1; do sleep 2; done
+      helm repo add cilium https://helm.cilium.io >/dev/null
+      helm repo update >/dev/null
+      # KPR-on variant: kubeProxyReplacement=true with cilium's
+      # default host-routing fast-path (bpf_redirect_peer / neigh).
+      # Earlier hypothesis that this fast-path would bypass natra's
+      # tcx-podside attach turned out to be wrong: with
+      # cni.exclusive=false, natra's chained conflist is in place
+      # and TCX runs on traffic regardless of cilium's redirect
+      # helpers (#126 validation, 2026-05-25).
+      helm install cilium cilium/cilium --namespace kube-system \
+        --set bpf.tcx=true \
+        --set kubeProxyReplacement=true \
+        --set cni.exclusive=false \
+        --set k8sServiceHost=${LIMA_IP} \
+        --set k8sServicePort=6443 \
+        --set operator.replicas=1 \
+        --set ipam.mode=cluster-pool \
+        --set ipam.operator.clusterPoolIPv4PodCIDRList=10.42.0.0/16
+
+      # Block provision until cilium DS rolls out + nodes are Ready
+      # (without this the agent VM joins before cilium is up and the
+      # rig's "wait Ready" step sees NotReady nodes for ~minutes).
+      kubectl -n kube-system rollout status ds/cilium --timeout=240s

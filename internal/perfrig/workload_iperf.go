@@ -65,6 +65,15 @@ func (e *Executor) runIperfSweep(ctx context.Context, phase Phase) (WorkloadRepo
 
 	for ri, rate := range e.Plan.Rates {
 		target := rateNames[ri]
+		// Per-rate connectivity gate: cilium's socketLB BPF map
+		// can lag behind pod Ready by a few seconds, especially
+		// for newly-deployed Services. A 1s iperf3 probe in a
+		// retry loop lets the first real measurement land on a
+		// programmed map. Out of scope on flannel/iptables (the
+		// race doesn't exist there) but cheap to run anyway.
+		if err := waitIperfReachable(ctx, kc, ns, target); err != nil {
+			return wr, fmt.Errorf("connectivity gate (rate=%s): %w", rate, err)
+		}
 		for s := 1; s <= e.Plan.Samples; s++ {
 			e.logf("==> [%s] iperfSweep sample %d/%d (rate=%s target=%s)\n",
 				phase, s, e.Plan.Samples, rate, target)
@@ -154,6 +163,25 @@ func (e *Executor) deployIperfSweepPod(ctx context.Context, ns, name string, rat
 	// admitted pod when the apply returns immediately.
 	time.Sleep(500 * time.Millisecond)
 	return nil
+}
+
+// waitIperfReachable polls a 1s iperf3 against target until it
+// returns nonzero bps or attempts run out. The race it covers is
+// cilium-KPR-specific: socketLB BPF map programming for newly-
+// added Services can lag behind pod Ready by a few seconds, so
+// the first real iperf3 -c against a fresh per-rate Service can
+// hit "connection refused" even though kubectl wait succeeded.
+// On flannel/iptables this race doesn't exist; the poll exits
+// on the first attempt and adds ~1s of overhead.
+func waitIperfReachable(ctx context.Context, kubeconfig, ns, target string) error {
+	for i := 0; i < 30; i++ {
+		bps, err := iperfMeasure(ctx, kubeconfig, ns, "iperf3", "-c", target, "-t", "1", "-J")
+		if err == nil && bps > 0 {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("iperf3 -c %s never reachable in 60s", target)
 }
 
 // iperfMeasure runs one iperf3 invocation through the perf-client

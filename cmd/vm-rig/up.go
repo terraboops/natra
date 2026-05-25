@@ -196,14 +196,23 @@ func waitForNodesReady(c *Config, want, attempts int, delay time.Duration) error
 // ("server" or "agent") based on c.VMRigCNI. Errors loudly on
 // unknown values so a typo in VMRIG_CNI surfaces here rather than
 // as a confused "file not found".
+//
+// The agent template doesn't depend on cilium's KPR setting (only
+// the server's k3s install args + helm install differ), so the
+// cilium and cilium-kpr variants share the same agent file.
 func limaYAMLPath(c *Config, role string) (string, error) {
 	switch c.VMRigCNI {
 	case "flannel", "":
 		return filepath.Join(c.RigDir, "lima-"+role+"-flannel.yaml"), nil
 	case "cilium":
 		return filepath.Join(c.RigDir, "lima-"+role+"-cilium.yaml"), nil
+	case "cilium-kpr":
+		if role == "agent" {
+			return filepath.Join(c.RigDir, "lima-agent-cilium.yaml"), nil
+		}
+		return filepath.Join(c.RigDir, "lima-"+role+"-cilium-kpr.yaml"), nil
 	default:
-		return "", fmt.Errorf("VMRIG_CNI=%q is not recognized (want flannel or cilium)", c.VMRigCNI)
+		return "", fmt.Errorf("VMRIG_CNI=%q is not recognized (want flannel, cilium, or cilium-kpr)", c.VMRigCNI)
 	}
 }
 

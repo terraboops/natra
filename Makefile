@@ -246,6 +246,10 @@ perf-vs-vanilla-vm: ## natra vs upstream bandwidth on two real kernels (lima), f
 perf-vs-vanilla-vm-cilium: ## Same as perf-vs-vanilla-vm but with cilium as the CNI (cni.exclusive=false, KPR off). Proxies AWS NPA; exercises bpf_mprog coexistence at pod TCX. ~50 min.
 	@VMRIG_CNI=cilium go run ./cmd/vm-rig perfvsvanilla
 
+.PHONY: perf-vs-vanilla-vm-cilium-kpr
+perf-vs-vanilla-vm-cilium-kpr: ## Same as perf-vs-vanilla-vm-cilium but with KPR on (cilium replaces kube-proxy, bpf_redirect_peer fast-path). Exercises natra coexistence with cilium's full production config. ~50 min.
+	@VMRIG_CNI=cilium-kpr go run ./cmd/vm-rig perfvsvanilla
+
 .PHONY: test-all
 test-all: test-unit test-fuzz test-cni test-bpf test-e2e test-perf ## All layers.
 
