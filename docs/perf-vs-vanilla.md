@@ -412,12 +412,15 @@ with baseline as the empirical noise floor. Sources:
   per-event cost.
 
 Single-sample numbers (the `ci` profile, `Samples=1`); the
-`full` profile runs three samples for mean ± stddev. Persistent
-installer DaemonSet RSS is the fourth comparable defined by the
-spec; capture of natra-installer's cgroup memory needs one
-more crictl-output fix and currently reads zero. The installer
-DS runs `pause` post-install so its persistent RSS is bounded
-to a few MB — minor compared to the kernel BPF cost above.
+`full` profile runs three samples for mean ± stddev.
+
+The fourth comparable defined by the spec — persistent
+installer DaemonSet RSS — now reads cleanly via the sandbox
+pid's `/proc/<pid>/status` VmRSS. For the natra-installer (which
+runs `pause` post-install) this lands around 0.5 MB on k3d.
+Minor compared to the kernel BPF cost above; included for
+completeness so the row stays comparable across plugins as
+either side adds heavier persistent userspace.
 
 ## Throttle disposition
 
