@@ -61,30 +61,50 @@ extends each across rates and samples.
 
 iperf3 against the annotated perf-server, ingress (forward) +
 egress (-R), receiver-side `end.sum_received.bits_per_second`.
-Single rate at the pod's manifest annotation today; multi-rate
-sweep is the spec's `Rates` slice, ports next.
+Per-rate pods (perf-server-r10m, perf-server-r1g, perf-server-r10g)
+deployed with the matching annotation; mean ± stddev across
+Samples per (phase × rate) cell.
 
-| Phase    | iperf ing   | iperf eg    |
-|----------|-------------|-------------|
-| baseline | 81340 Mbps  | 72589 Mbps  |
-| vanilla  |    23 Mbps  |    21 Mbps  |
-| natra    |    10 Mbps  |    10 Mbps  |
+Full profile on k3d (3 samples, 3 rates):
+
+| Phase    | rate | iperf ing Mbps  | iperf eg Mbps   |
+|----------|------|-----------------|-----------------|
+| baseline | 10M  | 57821 ± 342     | 51971 ± 446     |
+| baseline | 1G   | 57284 ± 109     | 51955 ± 197     |
+| baseline | 10G  | 58188 ± 405     | 52778 ± 294     |
+| vanilla  | 10M  | **15.3 ± 5.0**  | **50.0 ± 50.3** |
+| vanilla  | 1G   | 1140 ± 156      | 1230 ± 0        |
+| vanilla  | 10G  | 9760 ± 134      | 9838 ± 0        |
+| natra    | 10M  | **10.1 ± 0.1**  | **10.1 ± 0.0**  |
+| natra    | 1G   | **1024 ± 8**    | **1047 ± 0.3**  |
+| natra    | 10G  | **10078 ± 74**  | **10169 ± 21**  |
 
 Rig: colima aarch64, LinuxKit ~6.12, k3d v5.7.4, flannel host-gw,
-software dataplane (no NIC offload). Single sample (Samples=1
-under ci profile).
+software dataplane (no NIC offload). The colima inter-container
+wire caps single-stream around ~58 Gbps unshaped (the baseline
+rows above); at 1G and 10G annotations both plugins are
+wire-limited, not shaper-limited, so the "did it cap" question
+only has a clean answer at 10M.
 
-- baseline is the unshaped colima inter-container wire — ~75 Gbps
-  on the shared LinuxKit kernel.
-- natra hits the 10M annotation within 1% on both directions.
-- vanilla overshoots to ~23 Mbps. The upstream bandwidth plugin's
-  TBF burst is patched to 1 MB before measurement, but the patch
-  reaches only the host-side IFB qdisc (visible from
-  `tc qdisc show` in the node root netns); the pod-side egress
-  TBF (in the pod netns) keeps its default kubelet burst (~150s
-  of credit at 10 Mbps). That's a known limitation of patching
-  TBF after-the-fact through the substrate; closing it needs a
-  pod-netns-aware patch the executor doesn't currently do.
+- **baseline** is the unshaped wire — same number at every rate
+  because no shaper engages.
+- **natra** holds 10M within 0.1%, with sub-0.1 Mbps stddev
+  across samples. Tightest cap of any plugin × rate combination
+  in the table.
+- **vanilla at 10M** shows the burst-overshoot variance — 50 ± 50
+  on egress means some samples land at ~10 Mbps and others at
+  100+ Mbps. The upstream bandwidth plugin's TBF burst is
+  patched to 1 MB in the node root netns, which reaches the
+  host-side IFB qdisc but not the pod-eth0 egress TBF (which
+  lives in the pod netns and keeps its default kubelet burst,
+  ~150 s of credit). A pod-netns-aware patch was attempted and
+  rejected — the nsenter approach broke on k3d's busybox-based
+  rancher/k3s image and made overshoot worse. Documented as a
+  k3d limitation.
+- **At 1G and 10G** both plugins are wire-limited (~1.2 Gbps
+  single-stream colima cap, ~10 Gbps multi-stream effective).
+  Reads as "doesn't break under high annotation" rather than
+  "caps accurately at the annotation."
 
 ### mixed — elephant + annotated mice + bystander mice
 
