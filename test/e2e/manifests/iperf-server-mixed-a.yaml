@@ -15,7 +15,7 @@ spec:
     kubernetes.io/hostname: k3d-natra-e2e-agent-0
   containers:
     - name: iperf
-      image: networkstatic/iperf3:latest
+      image: taoyou/iperf3-alpine:latest@sha256:c70f1a38eff69571c79ae0bb60df6745d04c947acca1b6178a3bc3ee9b4d4572
       args: ["-s"]
       ports:
         - containerPort: 5201

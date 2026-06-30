@@ -19,5 +19,5 @@ spec:
       effect: NoSchedule
   containers:
     - name: iperf
-      image: networkstatic/iperf3:latest
+      image: taoyou/iperf3-alpine:latest@sha256:c70f1a38eff69571c79ae0bb60df6745d04c947acca1b6178a3bc3ee9b4d4572
       command: ["sleep", "infinity"]

@@ -168,7 +168,7 @@ bootstrap_cluster() {
     # (Google's pull-through cache for Docker Hub) sidesteps the
     # limit entirely; pulling from ghcr.io is unaffected to begin with.
     local images=(
-        "mirror.gcr.io/networkstatic/iperf3:latest"
+        "mirror.gcr.io/taoyou/iperf3-alpine:latest@sha256:c70f1a38eff69571c79ae0bb60df6745d04c947acca1b6178a3bc3ee9b4d4572"
         "mirror.gcr.io/library/nginx:1.27-alpine"
         "mirror.gcr.io/bloomberg/goldpinger:3.11.2"
         "ghcr.io/terraboops/natra-perfclient:vsperf"
@@ -399,7 +399,7 @@ metadata:
 spec:
   containers:
     - name: iperf
-      image: mirror.gcr.io/networkstatic/iperf3:latest
+      image: mirror.gcr.io/taoyou/iperf3-alpine:latest@sha256:c70f1a38eff69571c79ae0bb60df6745d04c947acca1b6178a3bc3ee9b4d4572
       imagePullPolicy: IfNotPresent
       args: ["-s"]
       ports:
