@@ -27,7 +27,7 @@ COPY Makefile Makefile
 RUN make build-bpf
 
 # ----- Stage 2: Go -----
-FROM golang:1.25 AS go-builder
+FROM golang:1.26 AS go-builder
 
 WORKDIR /workspace
 

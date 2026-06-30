@@ -5,7 +5,7 @@
 #
 # Multi-stage so the final image stays small and contains no Go
 # toolchain — just the two static binaries plus iperf3 from alpine.
-FROM golang:1.25-alpine AS build
+FROM golang:1.26-alpine AS build
 RUN go install github.com/rakyll/hey@latest
 
 FROM alpine:3.19

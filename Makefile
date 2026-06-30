@@ -319,9 +319,11 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
-# v2.5.0+ is built against go 1.25 (matching natra's go.mod). v2.3.0
-# was built against go 1.24 and rejects the config when run against
-# 1.25-targeted code — see ci.yml for the same constraint.
+# v2.5.0 handles natra's go.mod (go 1.26). v2.3.0 was built against
+# go 1.24 and rejects the config when run against newer-targeted code
+# — see ci.yml for the same constraint. Newer v2.12.x enables stricter
+# linters (goconst/prealloc) that would flag unrelated pre-existing
+# test code; hold here until those are addressed deliberately.
 GOLANGCI_LINT_VERSION ?= v2.5.0
 
 .PHONY: golangci-lint

@@ -47,7 +47,7 @@ for what cloud-VM / metal would add on top.
   predates lima managing socket_vmnet itself. Linux doesn't need
   socket_vmnet — lima uses libvirt/KVM bridged networks directly.
 - `kubectl`, `docker` on PATH.
-- Go 1.25+ (to run `cmd/vm-rig`; the binary is built on demand by
+- Go 1.26+ (to run `cmd/vm-rig`; the binary is built on demand by
   `go run`, no separate install step).
 - ~6 GiB free disk per VM; ~30 GiB headroom overall is comfortable.
 

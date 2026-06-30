@@ -7,11 +7,11 @@
 #   scripts/run-in-docker.sh <command> [args...]
 #
 # Environment:
-#   NATRA_DOCKER_IMAGE  override the image (default: golang:1.25)
+#   NATRA_DOCKER_IMAGE  override the image (default: golang:1.26)
 
 set -euo pipefail
 
-IMAGE="${NATRA_DOCKER_IMAGE:-golang:1.25}"
+IMAGE="${NATRA_DOCKER_IMAGE:-golang:1.26}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 if ! command -v docker >/dev/null 2>&1; then

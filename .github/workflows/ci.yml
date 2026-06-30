@@ -30,7 +30,7 @@ jobs:
       # `make pre-commit` is the target the .githooks/pre-commit hook
       # invokes locally. Running the same target here means anything
       # caught locally is caught here, and vice versa — no drift. The
-      # Makefile pins golangci-lint v2.5.0 (matches go.mod's 1.25
+      # Makefile pins golangci-lint v2.5.0 (handles go.mod's 1.26
       # requirement) and installs it into ./bin via go-install.
       - run: make pre-commit
 
