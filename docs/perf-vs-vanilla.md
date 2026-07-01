@@ -65,32 +65,32 @@ Per-rate pods (perf-server-r10m, perf-server-r1g, perf-server-r10g)
 deployed with the matching annotation; mean ± stddev across
 Samples per (phase × rate) cell.
 
-Full profile on k3d (3 samples, 3 rates):
+Full profile on k3d (3 samples, 3 rates), commit `47ccaac`:
 
 | Phase    | rate | iperf ing Mbps  | iperf eg Mbps   |
 |----------|------|-----------------|-----------------|
-| baseline | 10M  | 57821 ± 342     | 51971 ± 446     |
-| baseline | 1G   | 57284 ± 109     | 51955 ± 197     |
-| baseline | 10G  | 58188 ± 405     | 52778 ± 294     |
-| vanilla  | 10M  | **15.3 ± 5.0**  | **50.0 ± 50.3** |
+| baseline | 10M  | 51429 ± 1622    | 49548 ± 932     |
+| baseline | 1G   | 53182 ± 1467    | 45120 ± 5581    |
+| baseline | 10G  | 52778 ± 678     | 47878 ± 438     |
+| vanilla  | 10M  | **15.4 ± 5.0**  | **50.0 ± 50.3** |
 | vanilla  | 1G   | 1140 ± 156      | 1230 ± 0        |
 | vanilla  | 10G  | 9760 ± 134      | 9838 ± 0        |
-| natra    | 10M  | **10.1 ± 0.1**  | **10.1 ± 0.0**  |
-| natra    | 1G   | **1024 ± 8**    | **1047 ± 0.3**  |
-| natra    | 10G  | **10078 ± 74**  | **10169 ± 21**  |
+| natra    | 10M  | **10.2 ± 0.1**  | **10.2 ± 0.0**  |
+| natra    | 1G   | **1020 ± 12**   | **1048 ± 0.5**  |
+| natra    | 10G  | **10047 ± 100** | **10169 ± 5**   |
 
-Rig: colima aarch64, LinuxKit ~6.12, k3d v5.7.4, flannel host-gw,
+Rig: colima aarch64, LinuxKit 6.8, k3d v5.8.3, flannel host-gw,
 software dataplane (no NIC offload). The colima inter-container
-wire caps single-stream around ~58 Gbps unshaped (the baseline
+wire caps single-stream around ~52 Gbps unshaped (the baseline
 rows above); at 1G and 10G annotations both plugins are
 wire-limited, not shaper-limited, so the "did it cap" question
 only has a clean answer at 10M.
 
 - **baseline** is the unshaped wire — same number at every rate
   because no shaper engages.
-- **natra** holds 10M within 0.1%, with sub-0.1 Mbps stddev
-  across samples. Tightest cap of any plugin × rate combination
-  in the table.
+- **natra** holds 10M to 10.2 Mbps (~2% over) with ≤0.1 Mbps
+  stddev across samples. Tightest, most repeatable cap of any
+  plugin × rate combination in the table.
 - **vanilla at 10M** shows the burst-overshoot variance — 50 ± 50
   on egress means some samples land at ~10 Mbps and others at
   100+ Mbps. The upstream bandwidth plugin's TBF burst is
@@ -115,54 +115,48 @@ runs hit perf-server (annotated mice — CMS fast-pass story) and
 requests at ~5-7 KB each, well under the 125 KiB heavy-hitter
 threshold at 10 Mbps.
 
-Numbers from the GH Actions `ci` profile run on commit
-`f06c4dd`:
+Full profile on k3d (3 samples), commit `47ccaac`:
 
-| Phase    | iperf ing | iperf eg | pod rps / p99 | bystander rps / p99 | mice total |
-|----------|-----------|----------|---------------|---------------------|------------|
-| baseline | 2894 Mbps | 6631 Mbps |  2068 /  69 ms |  2077 /  67 ms     | 4145       |
-| vanilla  |   16 Mbps |    6 Mbps |    16 / 5584 ms |  4441 /  64 ms     | 4457       |
-| natra    |   10 Mbps |   10 Mbps |  2644 /  42 ms |  2672 /  42 ms     | **5316**   |
+| Phase    | iperf ing       | iperf eg        | pod rps / p99      | bystander rps / p99 | mice total   |
+|----------|-----------------|-----------------|--------------------|---------------------|--------------|
+| baseline | 9233 ± 979 Mbps | 21139 ± 1219 Mbps | 4114 ± 2955 / 143 ms | 5062 ± 3093 / 99 ms | 9177 ± 5983  |
+| vanilla  | 27 ± 28 Mbps    | 26 ± 26 Mbps    | 24 ± 12 / 5142 ms  | 4923 ± 2524 / 50 ms | 4947 ± 2531  |
+| natra    | 10.2 ± 0.1 Mbps | 10.2 ± 0.1 Mbps | 3390 ± 2188 / 101 ms | 4263 ± 3137 / 94 ms | 7653 ± 5299  |
 
-The right way to read this is the **mice total** column — the
-sum of annotated + bystander RPS — alongside the per-row split:
+The full-profile mixed cells carry heavy run-to-run variance —
+fresh cluster per phase means each sample sees different warm-page
+/ conntrack / scheduler state (the same host-state effect #128
+traces on the vm-rig), and the stddevs run ~50-65% of the mean on
+the throughput columns. So read the signals that survive the
+noise, not the point estimates:
 
-- **Elephant cap.** natra holds the --bidir elephant at 10/10
-  Mbps; vanilla shows the iperfSweep overshoot pattern (the host-
-  side IFB TBF is patched, the pod-netns egress TBF isn't, so the
-  cap is loose).
+- **Elephant cap.** natra holds the --bidir elephant at 10.2/10.2
+  Mbps with ±0.1 stddev — the tightest, most repeatable cell here.
+  vanilla's cap is both loose and erratic (27 ± 28 / 26 ± 26): the
+  host-side IFB TBF is patched, the pod-netns egress TBF isn't, so
+  the overshoot lands anywhere from ~10 to 100+ Mbps sample to
+  sample. The ±28 error bar *is* the burst-overshoot story.
 
-- **Annotated mice.** natra 2644 rps / p99 42 ms ≈ baseline (2068
-  / 69 ms). vanilla collapses to 16 rps / p99 5584 ms — **130×
-  worse than baseline** on RPS, p99 from 69 ms to 5.6 seconds.
-  The upstream token bucket queues every annotated-pod flow
-  against the same 10 Mbps slot; natra's CMS fast-passes
-  fresh-flow HTTP under the heavy-hitter threshold so it bypasses
-  the bucket.
+- **Annotated mice.** This is the signal that survives the
+  variance. natra keeps annotated-pod HTTP at ~3390 rps / p99
+  101 ms; vanilla collapses it to 24 rps / p99 5142 ms — ~140×
+  fewer requests, p99 from ~100 ms to 5.1 seconds. The upstream
+  token bucket queues every annotated-pod flow against the same
+  10 Mbps slot; natra's CMS fast-passes fresh-flow HTTP under the
+  heavy-hitter threshold so it bypasses the bucket. The CI
+  single-sample run shows the same shape at lower variance (natra
+  2644 / 42 ms vs vanilla 16 / 5584 ms), and the vm-rig numbers
+  below are cleaner still.
 
-- **Bystander vs. mice total.** Neither plugin attaches anything
-  to the unannotated bystander, so absolute bystander RPS isn't
-  a "plugin cost" — it's how much of the freed worker capacity
-  (CPU, software dataplane, conntrack) the bystander gets in
-  contention with the annotated mice.
-
-  Capping the elephant frees roughly the same spare worker
-  capacity in vanilla and natra. **Vanilla's bystander column
-  (4441) looks higher than natra's (2672) only because vanilla
-  collapses annotated mice (16 rps) and hands their share to the
-  bystander.** natra honors the annotated mice fairly, so the
-  spare capacity splits ~evenly between annotated (2644) and
-  bystander (2672). The right comparison is the *total*
-  mice-class throughput — and natra delivers 5316 rps, **+19%
-  more total request work than vanilla's 4457** and **+28% more
-  than baseline's 4145** (baseline's elephant dominates worker
-  resources).
-
-  Read the single bystander column alone and natra looks worse to
-  the neighbor; read the row as a whole and natra is delivering
-  more useful request work *and* respecting the annotated bucket
-  the user actually asked for. The per-column reading is the
-  trap; the row-level reading is the story.
+- **Mice total.** natra 7653 vs vanilla 4947 vs baseline 9177 —
+  but with error bars of ±5299, ±2531, ±5983 the natra-vs-baseline
+  ordering is well inside the noise at full profile; don't read a
+  ranking into it. What *is* durable: vanilla is lowest because it
+  collapses the annotated mice and never recovers that share, and
+  natra honors the annotated bucket fairly (annotated 3390 ≈
+  bystander 4263) while capping the elephant. For a confident read
+  on total request work, use the lower-variance CI single-sample
+  or the vm-rig full-profile numbers below — not full-profile k3d.
 
 ## Gaps in this comparison
 
