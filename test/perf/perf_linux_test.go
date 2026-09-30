@@ -301,6 +301,10 @@ func synthElephantPkt() []byte {
 // entirely and pass at line rate. With 1000 distinct flows × 5
 // packets each, no flow's count reaches threshold, so STAT_HH_HITS
 // must be 0.
+//
+// The 320 KB of mice has to fit the per-direction mouse budget
+// (max(rate × 125 ms, 4 × threshold)), so the rate is 100 Mbps; the
+// one-byte bucket still drops anything that reaches it.
 func TestScenarioThousandMice(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatalf("remove memlock: %v", err)
@@ -316,9 +320,9 @@ func TestScenarioThousandMice(t *testing.T) {
 	t.Cleanup(coll.Close)
 
 	cfg := natraConfig{
-		RateBps:     1, // crippled — any mouse hitting the bucket would drop
-		BurstBytes:  1,
-		HHThreshold: 6400, // 100 × 64-byte packets; 5 packets/flow well under
+		RateBps:     12_500_000, // 100 Mbps; mouse budget 1.56 MB per window
+		BurstBytes:  1,          // any mouse hitting the bucket would drop
+		HHThreshold: 6400,       // 100 × 64-byte packets; 5 packets/flow well under
 	}
 	dir := bpf.DirectionIngress
 	key := uint32(dir)

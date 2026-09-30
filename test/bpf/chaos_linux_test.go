@@ -121,7 +121,7 @@ func TestMalformedPackets(t *testing.T) {
 		pkt  []byte
 	}{
 		{"non-ip ARP-like", arpLike()},
-		{"ipv6 (TC pass-through expected)", ipv6Pkt()},
+		{"ipv6 header only (single packet, mouse)", ipv6Pkt()},
 		{"truncated_ip_header", truncatedIP()},
 		{"bogus IP version (5)", bogusIPVersion()},
 		{"eth-only no payload (14 bytes)", make([]byte, 14)},
@@ -133,8 +133,9 @@ func TestMalformedPackets(t *testing.T) {
 			if err != nil {
 				t.Fatalf("BPF_PROG_RUN: %v", err)
 			}
-			// All malformed inputs should TC_ACT_OK (pass-through);
-			// natra explicitly chooses fail-open on parse failure.
+			// Each malformed input is a single small packet, so it's
+			// classified (keyed on EtherType or a partial tuple) as a
+			// mouse and passes.
 			if ret != 0 {
 				t.Errorf("ret=%d, want 0 (TC_ACT_OK) for malformed input %q", ret, tc.name)
 			}
