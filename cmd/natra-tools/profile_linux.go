@@ -38,6 +38,8 @@ import (
 
 	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
+
+	"github.com/terraboops/natra/pkg/bpf"
 )
 
 // progSnapshot is a per-program datum at a single tick. Runtime/RunCount
@@ -92,7 +94,7 @@ func profileCmd(args []string) error {
 	interval := fs.Duration("interval", 5*time.Second, "snapshot interval")
 	output := fs.String("output", "", "JSONL output file (default stdout)")
 	heapDir := fs.String("heap-dir", "", "if set, write a heap pprof of this process per tick")
-	pinPath := fs.String("pin-dir", pinDir, "bpffs directory where natra pins maps")
+	pinPath := fs.String("pin-dir", bpf.PinDir, "bpffs directory where natra pins maps")
 	once := fs.Bool("once", false, "take a single snapshot and exit (foreground use; soak rig)")
 	if err := fs.Parse(args); err != nil {
 		return err

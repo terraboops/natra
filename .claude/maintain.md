@@ -17,9 +17,15 @@
   - `make test-perf` (L5)
 - `make ci` runs every layer and prints a per-layer summary.
 - Benchmark results must never get worse. CI's "Bench (compare to
-  main)" job runs `scripts/bench-ab.sh` (interleaved main/HEAD rounds,
-  Go benchmarks + BPF hot-path `BenchmarkBPF`) and
-  `scripts/bench-gate.sh`, which fails on any significant regression.
+  main)" job runs `scripts/bench-check.sh`: interleaved main/HEAD
+  rounds (`bench-ab.sh`, each side on its own go.mod toolchain; Go
+  benchmarks + BPF hot-path `BenchmarkBPF`), gated by `bench-gate.sh`.
+  Any significant regression triggers a second A/B; it fails if the
+  same benchmark regresses again.
+- Sequential local microbenchmarks are unreliable on a laptop (the same
+  binary measured 60% apart an hour later). Compare interleaved, and
+  measure CNI invoke RSS with many interleaved `/usr/bin/time -v` runs
+  rather than the k3d rig's 3-sample poll.
   For dataplane changes also compare `PERF_PROFILE=full make
   perf-vs-vanilla` on main vs the branch before merging.
 - Head-to-head numbers: `make perf-vs-vanilla` (k3d, ~20 min) and the

@@ -8,24 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
 	"strings"
-	"time"
+	"syscall"
 
-	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
 	current "github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
+	"github.com/terraboops/natra/internal/cniskel"
 
 	"github.com/terraboops/natra/pkg/bpf"
 	"github.com/terraboops/natra/pkg/cni/config"
 )
 
-// pinDir holds the bpffs paths for natra's per-pod tcx-link pins and
-// per-pod map pins. A dedicated subdir keeps natra's pins separate from
-// other tooling on the node and makes cleanup straightforward (cmdDel
-// removes the per-container files).
-const pinDir = "/sys/fs/bpf/natra"
+// pinDir is where the plugin pins per-pod links and maps.
+const pinDir = bpf.PinDir
 
 // pinPathFor is the bpffs path for the pinned tcx link of a given
 // container's veth in a given (side, direction). Side is embedded
@@ -217,34 +213,17 @@ func resolveAttachStrategy(s string, edt edtMode) ([]attachAttempt, error) {
 
 func main() {
 	// natra is normally invoked by kubelet via the CNI ABI (no CLI
-	// args; stdin + env vars). The exceptions are subcommands the
-	// DaemonSet uses: `install-cni-chain` patches existing conflists
-	// to chain natra in, and `dump-stats` reads the pinned maps for
-	// a given containerID.
-	if len(os.Args) > 1 && os.Args[1] == "install-cni-chain" {
-		if err := installCNIChain(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+	// args; stdin + env vars). Operator subcommands live in
+	// natra-tools, installed next to this binary.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "install-cni-chain", "dump-stats", "profile":
+			execTools(os.Args[1:])
 		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "dump-stats" {
-		if err := dumpStats(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-	if len(os.Args) > 1 && os.Args[1] == "profile" {
-		if err := profileCmd(os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
 	}
 
-	skel.PluginMainFuncs(
-		skel.CNIFuncs{
+	cniskel.PluginMainFuncs(
+		cniskel.CNIFuncs{
 			Add:   cmdAdd,
 			Del:   cmdDel,
 			Check: cmdCheck,
@@ -273,7 +252,7 @@ func main() {
 // on plugin error. We also append every log line to /var/log/natra-cni.log
 // so successful invocations leave a trace — useful for "is natra even
 // being called?" without cranking up runtime log levels.
-func cmdAdd(args *skel.CmdArgs) error {
+func cmdAdd(args *cniskel.CmdArgs) error {
 	defer maybeWriteHeapProfile(args.ContainerID)
 	logf("ADD containerID=%s netns=%s ifname=%s", args.ContainerID, args.Netns, args.IfName)
 	logCaps()
@@ -366,7 +345,7 @@ func logCaps() {
 // prefix. CNI DEL is idempotent — missing files are not errors. We
 // don't bother distinguishing modes because both branches end at the
 // same result: the container's pins are gone.
-func cmdDel(args *skel.CmdArgs) error {
+func cmdDel(args *cniskel.CmdArgs) error {
 	prefix := args.ContainerID + "-"
 	entries, err := os.ReadDir(pinDir)
 	if err != nil {
@@ -392,7 +371,7 @@ func cmdDel(args *skel.CmdArgs) error {
 // clsact filter is attached would require listing tc filters per
 // ifindex; kubelet uses CHECK as a liveness hint and a false positive
 // is no worse than the fail-open path elsewhere.
-func cmdCheck(*skel.CmdArgs) error {
+func cmdCheck(*cniskel.CmdArgs) error {
 	return nil
 }
 
@@ -565,7 +544,7 @@ func resolveHHThreshold(conf *NetConf, rateBps int64) int64 {
 // For HookClsact, the kernel holds the program reference via the
 // qdisc tree.
 func attachBPF(
-	args *skel.CmdArgs,
+	args *cniskel.CmdArgs,
 	ingressCfg, egressCfg *config.Config,
 	strategy []attachAttempt,
 	edt edtMode,
@@ -617,7 +596,7 @@ func attachBPF(
 // our skb->tstamp is ignored by noqueue and the rate limit silently
 // passes packets at line rate.
 func tryAttachOne(
-	args *skel.CmdArgs,
+	args *cniskel.CmdArgs,
 	ingressCfg, egressCfg *config.Config,
 	attempt attachAttempt,
 	edt edtMode,
@@ -746,31 +725,22 @@ func resolveIfIndex(netnsPath, ifName string, side bpf.Side) (int, func(), error
 	}
 }
 
-// maybeWriteHeapProfile dumps the Go heap profile of the natra CNI
-// process at end of cmdAdd when NATRA_HEAP_PROFILE_DIR is set in the
-// environment. Files land at <dir>/cmdadd-<unixnano>-<containerID>.pprof,
-// one per invocation — kubelet typically calls a CNI plugin once per
-// pod sandbox, so the file count grows with pod churn.
-//
-// Aggregated across many ADDs during the perf-vs-vanilla rig, the
-// profile shows what natra allocates per-invocation; useful for
-// catching allocator regressions in the ADD hot path.
-func maybeWriteHeapProfile(containerID string) {
-	dir := os.Getenv("NATRA_HEAP_PROFILE_DIR")
-	if dir == "" {
-		return
+// execTools replaces this process with natra-tools from the same
+// directory, so `natra dump-stats` and friends keep working while
+// their code stays out of the CNI binary.
+func execTools(args []string) {
+	self, err := os.Executable()
+	if err == nil {
+		self, err = filepath.EvalSymlinks(self)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	runtime.GC()
-	path := filepath.Join(dir, fmt.Sprintf("cmdadd-%d-%s.pprof", time.Now().UnixNano(), containerID))
-	f, err := os.Create(path)
 	if err != nil {
-		return
+		fmt.Fprintf(os.Stderr, "natra: locate executable: %v\n", err)
+		os.Exit(1)
 	}
-	defer func() { _ = f.Close() }()
-	_ = pprof.WriteHeapProfile(f)
+	tools := filepath.Join(filepath.Dir(self), "natra-tools")
+	err = syscall.Exec(tools, append([]string{tools}, args...), os.Environ())
+	fmt.Fprintf(os.Stderr, "natra: %s is provided by natra-tools, expected at %s: %v\n", args[0], tools, err)
+	os.Exit(1)
 }
 
 // announce writes the "attached" line to stderr (kubelet captures it)
@@ -784,7 +754,7 @@ func announce(ifIndex int, side bpf.Side, dir bpf.Direction, cfg *config.Config)
 		side, dir, ifIndex, cfg.Rate, cfg.Burst, cfg.HeavyHitterThreshold)
 }
 
-func passthrough(args *skel.CmdArgs, conf *NetConf) error {
+func passthrough(args *cniskel.CmdArgs, conf *NetConf) error {
 	// In a chained call kubelet writes the upstream plugin's Result
 	// into stdin as `prevResult`. encoding/json fills conf.RawPrevResult
 	// (a generic map), but conf.PrevResult only gets populated after

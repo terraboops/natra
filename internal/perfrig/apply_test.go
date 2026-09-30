@@ -63,13 +63,16 @@ func TestApply_CISubsetOfFull(t *testing.T) {
 	}
 }
 
+// badProfileName names the invalid profiles the rejection tests build.
+const badProfileName = "bad"
+
 // TestApply_RejectsRateOutsideSpec — a profile that names a rate
 // the spec doesn't have should fail at Apply time, not at run time.
 // This catches drift like "someone added Rate100G to ProfileCI but
 // forgot DefaultSpec".
 func TestApply_RejectsRateOutsideSpec(t *testing.T) {
 	bad := Profile{
-		Name:      "bad",
+		Name:      badProfileName,
 		Rates:     []Rate{Rate10M, "100G"}, // 100G not in DefaultSpec
 		Workloads: []WorkloadKind{WorkloadIperfSweep},
 		Samples:   1,
@@ -87,7 +90,7 @@ func TestApply_RejectsRateOutsideSpec(t *testing.T) {
 // for workload kinds.
 func TestApply_RejectsWorkloadOutsideSpec(t *testing.T) {
 	bad := Profile{
-		Name:      "bad",
+		Name:      badProfileName,
 		Rates:     []Rate{Rate10M},
 		Workloads: []WorkloadKind{"someFutureWorkload"},
 		Samples:   1,
@@ -105,7 +108,7 @@ func TestApply_RejectsWorkloadOutsideSpec(t *testing.T) {
 // sample count beyond the spec's maximum.
 func TestApply_RejectsSamplesOverSpec(t *testing.T) {
 	bad := Profile{
-		Name:      "bad",
+		Name:      badProfileName,
 		Rates:     []Rate{Rate10M},
 		Workloads: []WorkloadKind{WorkloadIperfSweep},
 		Samples:   DefaultSpec.Samples + 1,
@@ -124,7 +127,7 @@ func TestApply_RejectsSamplesOverSpec(t *testing.T) {
 // error rather than emitting an empty report.
 func TestApply_RejectsZeroSamples(t *testing.T) {
 	bad := Profile{
-		Name:      "bad",
+		Name:      badProfileName,
 		Rates:     []Rate{Rate10M},
 		Workloads: []WorkloadKind{WorkloadIperfSweep},
 		Samples:   0,

@@ -27,6 +27,7 @@ BPF_CLANG ?= clang
 endif
 
 CNI_BINARY := bin/natra
+TOOLS_BINARY := bin/natra-tools
 BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o bpf/vanilla.bpf.o
 # Intentionally-invalid programs used by the L3 chaos suite. They MUST
 # build (clang accepts them) but FAIL to load (verifier rejects). Listed
@@ -137,7 +138,8 @@ build-cni-inner:
 	@mkdir -p bin pkg/bpf
 	@cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
 	@GOOS=linux CGO_ENABLED=0 go build -buildvcs=false -o $(CNI_BINARY) ./cmd/natra
-	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2))"
+	@GOOS=linux CGO_ENABLED=0 go build -buildvcs=false -o $(TOOLS_BINARY) ./cmd/natra-tools
+	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2)) and $(TOOLS_BINARY)"
 
 .PHONY: build-bpf
 build-bpf: $(BPF_OBJS) $(BPF_TESTDATA_OBJS) ## Compile BPF C sources (incl. chaos testdata) to bytecode (.o).
@@ -177,7 +179,7 @@ bpf/%.bpf.o: bpf/%.bpf.c
 
 .PHONY: clean
 clean: ## Clean build artifacts.
-	rm -f $(CNI_BINARY) $(BPF_OBJS) $(BPF_TESTDATA_OBJS) cover.out
+	rm -f $(CNI_BINARY) $(TOOLS_BINARY) $(BPF_OBJS) $(BPF_TESTDATA_OBJS) cover.out
 
 ##@ Testing
 
@@ -186,7 +188,7 @@ test: test-unit ## Default test target — Layer 1 only (fast).
 
 .PHONY: test-unit
 test-unit: ## Layer 1a — Ginkgo unit tests.
-	go test ./pkg/... ./internal/... -coverprofile cover.out
+	go test ./pkg/... ./internal/... ./cmd/... -coverprofile cover.out
 
 .PHONY: test-fuzz
 test-fuzz: ## Layer 1b — 30s fuzz against the bandwidth annotation parser.
@@ -322,12 +324,12 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
-# v2.5.0 handles natra's go.mod (go 1.26). v2.3.0 was built against
-# go 1.24 and rejects the config when run against newer-targeted code
-# — see ci.yml for the same constraint. Newer v2.12.x enables stricter
-# linters (goconst/prealloc) that would flag unrelated pre-existing
-# test code; hold here until those are addressed deliberately.
-GOLANGCI_LINT_VERSION ?= v2.5.0
+# golangci-lint must be built with a Go at least as new as go.mod's
+# directive, and its bundled x/tools must read that Go's export data.
+# v2.5.0 fails on go 1.27 ("export data version 4 is greater than
+# maximum supported version 2"); v2.14.0 handles it. See ci.yml for
+# the same constraint.
+GOLANGCI_LINT_VERSION ?= v2.14.0
 
 # golangci-lint refuses to run when built with a Go older than
 # go.mod's directive, so the cached binary is keyed on the Go version

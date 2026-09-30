@@ -19,7 +19,7 @@ jobs:
           go-version-file: go.mod
       - uses: ./.github/actions/build-bpf
       - name: Run unit tests
-        run: go test -race ./pkg/... -coverprofile cover.out
+        run: go test -race ./pkg/... ./internal/... ./cmd/... -coverprofile cover.out
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: always()
@@ -69,15 +69,14 @@ jobs:
           cd "$RUNNER_TEMP/base"
           make build-bpf
           cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
-      # Interleaved rounds, 10 samples per side. Benchmark results must
-      # never get worse: the gate fails on any significant regression.
+      # Interleaved rounds, 10 samples per side, each side on its own
+      # go.mod toolchain. Benchmark results must never get worse: any
+      # significant regression that reproduces on a second A/B fails.
       - name: Bench main vs HEAD
-        run: scripts/bench-ab.sh "$RUNNER_TEMP/base" . bench-main.txt bench-head.txt
-      - name: Regression gate
-        run: scripts/bench-gate.sh bench-main.txt bench-head.txt
+        run: scripts/bench-check.sh "$RUNNER_TEMP/base" . bench-out
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bench-results
-          path: bench-*.txt
+          path: bench-out/

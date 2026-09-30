@@ -129,6 +129,9 @@ spec:
               for dst in /host/opt/cni/bin /host/var-k3s-cni /host/bin; do
                 if [ -d "$dst" ]; then
                   install -m 0755 /usr/local/bin/natra "$dst/natra"
+                  # Operator subcommands (dump-stats, profile);
+                  # `natra <subcommand>` execs it from the same dir.
+                  install -m 0755 /usr/local/bin/natra-tools "$dst/natra-tools"
                   if command -v setcap >/dev/null 2>&1; then
                     setcap cap_bpf,cap_net_admin,cap_perfmon,cap_sys_resource+ep "$dst/natra" || true
                   fi

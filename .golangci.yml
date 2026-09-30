@@ -36,6 +36,12 @@ linters:
           - dupl
           - lll
         path: internal/*
+      # Verbatim copy of libcni's skel (see internal/cniskel/skel.go);
+      # kept unrestyled so it diffs cleanly against upstream.
+      - linters:
+          - goconst
+          - gocyclo
+        path: internal/cniskel/
     paths:
       - third_party$
       - builtin$
