@@ -8,16 +8,19 @@
 # bpf-ns/op) is lower-is-better, so any "+" is a regression. Run each
 # side with -count=10 or more so benchstat can detect a difference.
 #
-# Usage: scripts/bench-gate.sh <base.txt> <head.txt>
+# Usage: scripts/bench-gate.sh <base.txt> <head.txt> [regressed-out]
+#   regressed-out, if given, receives one "<benchmark> <unit>" line per
+#   regression (scripts/bench-check.sh uses it to confirm on a rerun).
 
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-	echo "usage: $0 <base.txt> <head.txt>" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+	echo "usage: $0 <base.txt> <head.txt> [regressed-out]" >&2
 	exit 64
 fi
 base="$1"
 head="$2"
+regressed_out="${3:-}"
 
 benchstat "$base" "$head"
 
@@ -27,6 +30,10 @@ regressions="$(benchstat -format csv "$base" "$head" 2>/dev/null | awk -F, '
 	$1 == "" || $1 == "geomean" { next }
 	$6 ~ /^\+/ { printf "  %s %s %s (%s)\n", $1, unit, $6, $7 }
 ')"
+
+if [ -n "$regressed_out" ]; then
+	printf '%s\n' "$regressions" | awk 'NF { print $1, $2 }' >"$regressed_out"
+fi
 
 if [ -n "$regressions" ]; then
 	echo
