@@ -63,31 +63,18 @@ jobs:
       - uses: ./.github/actions/build-bpf
       - name: Install benchstat
         run: go install golang.org/x/perf/cmd/benchstat@latest
-      - name: Bench HEAD
+      - name: Check out and build main
         run: |
-          go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-head.txt
-      - name: Bench main baseline
-        run: |
-          # Main may not have benchmarks at first push to a PR branch — the
-          # `|| echo` fallback keeps the workflow green; the compare step
-          # below skips the diff when bench-main.txt is empty.
-          git fetch origin main
-          git stash --include-untracked || true
-          git checkout origin/main || git checkout main || true
-          # build-bpf again at the main commit, since pkg/bpf/natra.bpf.o
-          # may differ between branches.
-          (sudo apt-get install -y -qq clang llvm make libbpf-dev linux-libc-dev >/dev/null && \
-           make build-bpf && cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o) || true
-          go test -bench=. -benchmem -benchtime=1s -run=^$ ./pkg/... | tee bench-main.txt || echo "no benchmarks on main yet"
-          git checkout -
-          git stash pop || true
-      - name: Compare with benchstat
-        run: |
-          if [ -s bench-main.txt ]; then
-            benchstat bench-main.txt bench-head.txt | tee bench-compare.txt
-          else
-            echo "No baseline on main yet — skipping regression check"
-          fi
+          git worktree add "$RUNNER_TEMP/base" origin/main
+          cd "$RUNNER_TEMP/base"
+          make build-bpf
+          cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
+      # Interleaved rounds, 10 samples per side. Benchmark results must
+      # never get worse: the gate fails on any significant regression.
+      - name: Bench main vs HEAD
+        run: scripts/bench-ab.sh "$RUNNER_TEMP/base" . bench-main.txt bench-head.txt
+      - name: Regression gate
+        run: scripts/bench-gate.sh bench-main.txt bench-head.txt
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4

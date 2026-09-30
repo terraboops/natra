@@ -16,6 +16,12 @@
   - `make test-e2e` (L4, k3d, ~5 min)
   - `make test-perf` (L5)
 - `make ci` runs every layer and prints a per-layer summary.
+- Benchmark results must never get worse. CI's "Bench (compare to
+  main)" job runs `scripts/bench-ab.sh` (interleaved main/HEAD rounds,
+  Go benchmarks + BPF hot-path `BenchmarkBPF`) and
+  `scripts/bench-gate.sh`, which fails on any significant regression.
+  For dataplane changes also compare `PERF_PROFILE=full make
+  perf-vs-vanilla` on main vs the branch before merging.
 - Head-to-head numbers: `make perf-vs-vanilla` (k3d, ~20 min) and the
   `perf-vs-vanilla-vm*` targets (lima, 40-50 min). Only run when a
   change touches the dataplane or the perf rig.
