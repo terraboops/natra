@@ -13,7 +13,9 @@
 // Stage 2 (token bucket): only flows whose CMS estimate exceeds
 // `hh_threshold` go through the bucket. Mice flows take the fast
 // pass at the top of the program (TC_ACT_OK without locking or
-// stat increment beyond passed). The upstream bandwidth plugin
+// stat increment beyond passed), up to a per-direction mouse-byte
+// budget (natra_mice_map) so many small flows can't add up to an
+// unthrottled elephant. The upstream bandwidth plugin
 // rate-limits all traffic uniformly via HTB-on-IFB; we only
 // rate-limit the elephants.
 //
@@ -40,6 +42,7 @@
 #include <linux/pkt_cls.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -117,6 +120,40 @@ struct {
 	__type(value, struct token_bucket);
 	__uint(max_entries, DIR_MAX);
 } natra_bucket_map SEC(".maps");
+
+// Aggregate cap on mouse fast-pass traffic. A flow stays a mouse until
+// its CMS estimate crosses hh_threshold, so a pod that keeps opening
+// new 5-tuples and sends just under the threshold on each would never
+// reach the token bucket. Mouse bytes are summed per direction over a
+// MICE_WINDOW_NS window; past the budget, further packets in that
+// window go through the token bucket like heavy hitters.
+//
+// Budget = max(rate × 125 ms, MICE_BUDGET_HH × hh_threshold) per
+// window. With the default threshold (rate × 100 ms) that's ~3× the
+// configured rate of mouse traffic on top of the bucket — a bounded
+// multiple instead of "whatever fits under the threshold per 5-tuple
+// until the CMS saturates". Mice beyond it still pass whenever the
+// bucket has tokens; they only lose the bypass while the pod is at
+// its limit.
+//
+// The counter is a plain XADD (no fetch, so clsact on 5.x kernels
+// still loads). Window rollover isn't atomic: a CPU racing the reset
+// can lose a few increments, which errs toward passing mice for at
+// most one window.
+#define MICE_WINDOW_NS (1ULL << 27) // ≈134 ms; power of two → shift
+#define MICE_BUDGET_HH 4ULL
+
+struct mice_window {
+	__u64 idx;
+	__u64 bytes;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, __u32);
+	__type(value, struct mice_window);
+	__uint(max_entries, DIR_MAX);
+} natra_mice_map SEC(".maps");
 
 // CMS cell holds a byte counter plus a decay-interval index. Lazy
 // aging: each cell-access reads the cell's last_decay_idx, computes
@@ -300,49 +337,116 @@ static __always_inline __u64 cms_update_and_min(__u32 dir,
 	return mn;
 }
 
-// Extract a 5-tuple. Returns 0 on success, -1 on parse failure
-// (non-IP, truncated header, fragment we don't dissect). Verifier-
-// friendly: every pointer access is guarded by a bound check against
+#ifndef IP_MF
+#define IP_MF     0x2000
+#define IP_OFFSET 0x1FFF
+#endif
+
+// fold_in6 reduces an IPv6 address to 32 bits for the flow key. The
+// key stays the same size for v4 and v6, so the per-row hash cost on
+// the IPv4 path is unchanged. Collisions only merge flows in the CMS,
+// which classifies them heavy sooner — the conservative direction.
+static __always_inline __u32 fold_in6(const struct in6_addr *a)
+{
+	return a->in6_u.u6_addr32[0] ^ a->in6_u.u6_addr32[1] ^
+	       a->in6_u.u6_addr32[2] ^ a->in6_u.u6_addr32[3];
+}
+
+// Build the flow key. Every packet gets one — nothing fails open:
+//
+//   - IPv4 / IPv6 with a TCP or UDP header in the linear area: full
+//     5-tuple (v6 addresses folded, see fold_in6).
+//   - IPv4 fragments: ports stay 0. Non-first fragments carry payload
+//     where the ports would be, so parsing them would let a sender
+//     mint a new "flow" per fragment. All fragments between a pair of
+//     hosts share one flow.
+//   - IPv6 with extension headers, other L4 protocols, or an L4 header
+//     that's truncated: address pair + next header, ports 0.
+//   - Non-IP or a truncated / malformed IP header: keyed on the
+//     EtherType alone. ARP and the like stay mice; a raw-socket flood
+//     of any EtherType becomes a heavy hitter and hits the bucket.
+//
+// Verifier-friendly: every pointer access is bounds-checked against
 // `data_end`.
-static __always_inline int parse_flow(struct __sk_buff *skb, struct flow_key *out)
+static __always_inline void parse_flow(struct __sk_buff *skb, struct flow_key *out)
 {
 	void *data     = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
+	void *l4;
 
 	struct ethhdr *eth = data;
 	if ((void *)(eth + 1) > data_end)
-		return -1;
-	if (eth->h_proto != bpf_htons(ETH_P_IP))
-		return -1;
+		return;
 
-	struct iphdr *ip = (void *)(eth + 1);
-	if ((void *)(ip + 1) > data_end)
-		return -1;
-	if (ip->ihl < 5)
-		return -1;
+	if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+		struct iphdr *ip = (void *)(eth + 1);
+		if ((void *)(ip + 1) > data_end || ip->ihl < 5)
+			goto by_ethertype;
+		out->src_ip = ip->saddr;
+		out->dst_ip = ip->daddr;
+		out->proto  = ip->protocol;
+		if (ip->frag_off & bpf_htons(IP_MF | IP_OFFSET))
+			return;
+		l4 = (void *)ip + ((__u32)ip->ihl * 4);
+	} else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+		struct ipv6hdr *ip6 = (void *)(eth + 1);
+		if ((void *)(ip6 + 1) > data_end)
+			goto by_ethertype;
+		out->src_ip = fold_in6(&ip6->saddr);
+		out->dst_ip = fold_in6(&ip6->daddr);
+		out->proto  = ip6->nexthdr;
+		l4 = (void *)(ip6 + 1);
+	} else {
+		goto by_ethertype;
+	}
 
-	out->src_ip = ip->saddr;
-	out->dst_ip = ip->daddr;
-	out->proto  = ip->protocol;
-	out->src_port = 0;
-	out->dst_port = 0;
-	__builtin_memset(out->pad, 0, sizeof(out->pad));
-
-	void *l4 = (void *)ip + ((__u32)ip->ihl * 4);
-	if (ip->protocol == IPPROTO_TCP) {
+	if (out->proto == IPPROTO_TCP) {
 		struct tcphdr *th = l4;
 		if ((void *)(th + 1) > data_end)
-			return -1;
+			return;
 		out->src_port = th->source;
 		out->dst_port = th->dest;
-	} else if (ip->protocol == IPPROTO_UDP) {
+	} else if (out->proto == IPPROTO_UDP) {
 		struct udphdr *uh = l4;
 		if ((void *)(uh + 1) > data_end)
-			return -1;
+			return;
 		out->src_port = uh->source;
 		out->dst_port = uh->dest;
 	}
-	return 0;
+	return;
+
+by_ethertype:
+	__builtin_memset(out, 0, sizeof(*out));
+	out->src_port = eth->h_proto;
+}
+
+// mice_within_budget adds `len` to `dir`'s mouse-byte window and
+// reports whether the window is still within budget. See
+// natra_mice_map for the budget.
+static __always_inline int mice_within_budget(__u32 dir, __u64 len, __u64 now_ns,
+					      const struct natra_config *cfg)
+{
+	struct mice_window *mw = bpf_map_lookup_elem(&natra_mice_map, &dir);
+	if (!mw)
+		return 1;
+
+	__u64 win = now_ns / MICE_WINDOW_NS;
+	if (mw->idx != win) {
+		mw->idx = win;
+		mw->bytes = 0;
+	}
+	__sync_fetch_and_add(&mw->bytes, len);
+	__u64 total = mw->bytes;
+
+	__u64 floor = 0xffffffffffffffffULL;
+	if (cfg->hh_threshold < (floor / MICE_BUDGET_HH))
+		floor = cfg->hh_threshold * MICE_BUDGET_HH;
+	if (total <= floor)
+		return 1;
+	// rate_bps is bytes/sec (the field name predates the unit), so
+	// >> 3 is 125 ms of the configured rate — close to one window,
+	// no divide, no overflow.
+	return total <= (cfg->rate_bps >> 3);
 }
 
 // consume_tokens charges `bytes` against `dir`'s bucket. Returns 1 if
@@ -476,12 +580,7 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 	}
 
 	struct flow_key k = {0};
-	if (parse_flow(skb, &k) < 0) {
-		// Non-IP / truncated. Pass through unaccounted; we only
-		// rate-limit IP traffic.
-		bump_stat(dir, STAT_PASSED);
-		return TC_ACT_OK;
-	}
+	parse_flow(skb, &k);
 
 	// One ktime read per packet — reused for CMS aging (now_idx) and
 	// token bucket refill (now_ns). Avoids a second syscall.
@@ -490,9 +589,12 @@ static __always_inline int natra_classify(struct __sk_buff *skb, __u32 dir)
 
 	__u64 len = skb->len;
 	__u64 bytes_est = cms_update_and_min(dir, &k, now_idx, len);
-	if (bytes_est <= cfg->hh_threshold) {
+	if (bytes_est <= cfg->hh_threshold &&
+	    mice_within_budget(dir, len, now_ns, cfg)) {
 		// Mouse: fast pass with no lock. Low-volume traffic stays
 		// at line rate even when an elephant exists on the same pod.
+		// Past the pod's mouse budget, mice fall through to the
+		// bucket below.
 		bump_stat(dir, STAT_PASSED);
 		return TC_ACT_OK;
 	}

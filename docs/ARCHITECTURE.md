@@ -57,7 +57,10 @@ The pipeline is two stages on the Pod-side veth:
    (16 bytes per cell after alignment padding, 2 MiB per direction).
    The 5-tuple (src/dst IP, src/dst port, proto) hashes into one cell
    per row via FNV-1a
-   mixed with per-row seeds. The estimator is `min` across the four
+   mixed with per-row seeds. IPv6 addresses are XOR-folded to 32 bits
+   so both families share the key shape; IPv4 fragments use ports 0
+   so every fragment of a datagram lands in one flow; non-IP and
+   malformed frames are keyed on EtherType. The estimator is `min` across the four
    rows. A flow is "heavy" when its estimate exceeds the
    `heavy_hitter_threshold`. Each cell carries a `last_decay_idx`
    so cells fade lazily on access — old elephants stop counting
@@ -66,7 +69,10 @@ The pipeline is two stages on the Pod-side veth:
 
 2. **Token bucket — heavy hitters only.** A per-direction bucket
    protected by `bpf_spin_lock`. Mice (below threshold) bypass the
-   bucket entirely and return `TC_ACT_OK`. Heavy flows pay tokens
+   bucket and return `TC_ACT_OK`, up to a per-direction mouse budget:
+   `max(rate × 125 ms, 4 × heavy_hitter_threshold)` bytes per 134 ms
+   window. Past it, mice pay tokens like heavy flows for the rest of
+   the window, so rotating 5-tuples can't dodge the limit. Heavy flows pay tokens
    proportional to `skb->len`; when the bucket is starved, the
    disposition helper picks the next action (EDT-pace on egress
    when available, else ECN-mark, else drop — see below).
@@ -340,8 +346,8 @@ host netns is locked down or already crowded with another BPF stack.
 
 Code-level gaps:
 
-- IPv6: `parse_flow` returns -1 for non-IPv4, so IPv6 flows pass
-  through unrate-limited in either direction.
+- IPv6 extension headers aren't walked; flows behind one are keyed on
+  the address pair and next header.
 - UDP: parsed for the 5-tuple, same fast path as TCP.
 - CO-RE: BPF program currently uses fixed kernel headers; CO-RE would
   help on heterogeneous kernels.

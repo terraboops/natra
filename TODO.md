@@ -63,11 +63,9 @@ test-environment escalation ladder see `docs/test-environments.md`.
 
 From `docs/ARCHITECTURE.md§Open ends`:
 
-- [ ] **IPv6 classification.** `parse_flow` in `bpf/natra.bpf.c`
-  returns -1 for non-IPv4, so IPv6 flows pass through unrate-limited
-  in both directions. Add an IPv6 header path that produces the
-  same flow-key shape so the CMS treats IPv4 and IPv6 traffic
-  symmetrically.
+- [x] **IPv6 classification.** `parse_flow` handles IPv6 (addresses
+  folded into the existing key shape). Non-IP and malformed packets
+  are keyed on EtherType instead of passing unaccounted.
 
 - [ ] **CO-RE in the BPF program.** Currently uses fixed kernel
   headers via `linux/*.h` includes. CO-RE (via `vmlinux.h` +

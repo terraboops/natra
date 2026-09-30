@@ -90,8 +90,10 @@ make test-vm       # two-VM kernel-isolated k3s cluster via lima
   through a NIC. The real-cluster head-to-head in
   [docs/perf-vs-vanilla.md](docs/perf-vs-vanilla.md) uses real iperf
   traffic in a k3d cluster, which still isn't bare metal.
-- IPv6 is not classified. `parse_flow` returns -1 for non-IPv4, so
-  IPv6 flows pass through unrate-limited.
+- IPv6 addresses are folded to 32 bits in the flow key, and IPv6
+  extension headers aren't walked (flows behind one are keyed on the
+  address pair). Both make the CMS merge flows, which classifies them
+  heavy sooner, never later.
 - The CMS sketch is fixed at compile time at 32768 × 4 cells per
   direction (262144 cells total per pod, 4 MiB at 16 bytes per
   cell). Past saturation, every flow's estimate collides with at
