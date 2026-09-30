@@ -6,6 +6,13 @@ import (
 	"sync"
 )
 
+// Method names FakeSubstrate records in Calls.
+const (
+	callUp           = "Up"
+	callDown         = "Down"
+	callInstallNatra = "InstallNatra"
+)
+
 // FakeSubstrate is the unit-test stand-in. It records every method
 // call and returns canned outputs for NodeShell so executor logic
 // (phase loop, parsing of bpftool / meminfo / iperf output) is
@@ -45,17 +52,17 @@ func (f *FakeSubstrate) record(call string) {
 }
 
 func (f *FakeSubstrate) Up(_ context.Context) error {
-	f.record("Up")
+	f.record(callUp)
 	return f.UpErr
 }
 
 func (f *FakeSubstrate) Down(_ context.Context) error {
-	f.record("Down")
+	f.record(callDown)
 	return f.DownErr
 }
 
 func (f *FakeSubstrate) InstallNatra(_ context.Context) error {
-	f.record("InstallNatra")
+	f.record(callInstallNatra)
 	return f.InstallErr
 }
 

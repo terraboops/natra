@@ -53,11 +53,11 @@ func TestExecutor_FreshClusterPerPhase(t *testing.T) {
 	var ups, downs, installs int
 	for _, c := range fake.Calls {
 		switch c {
-		case "Up":
+		case callUp:
 			ups++
-		case "Down":
+		case callDown:
 			downs++
-		case "InstallNatra":
+		case callInstallNatra:
 			installs++
 		}
 	}
@@ -87,7 +87,7 @@ func TestExecutor_PhaseOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	got := []Phase{}
+	got := make([]Phase, 0, len(rep.Phases))
 	for _, p := range rep.Phases {
 		got = append(got, p.Phase)
 	}
@@ -144,7 +144,7 @@ func TestExecutor_DeferredDownOnError(t *testing.T) {
 	// One opening Down, then a failed Up, then the deferred Down.
 	// The executor returns from the first phase, so only that
 	// phase's calls are present.
-	want := []string{"Down", "Up", "Down"}
+	want := []string{callDown, callUp, callDown}
 	if len(fake.Calls) != len(want) {
 		t.Fatalf("call sequence: got %v, want %v", fake.Calls, want)
 	}

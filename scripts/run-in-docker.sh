@@ -7,11 +7,11 @@
 #   scripts/run-in-docker.sh <command> [args...]
 #
 # Environment:
-#   NATRA_DOCKER_IMAGE  override the image (default: golang:1.26)
+#   NATRA_DOCKER_IMAGE  override the image (default: golang:1.27)
 
 set -euo pipefail
 
-IMAGE="${NATRA_DOCKER_IMAGE:-golang:1.26}"
+IMAGE="${NATRA_DOCKER_IMAGE:-golang:1.27}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Missing or stopped Docker exits 69 (EX_UNAVAILABLE) rather than 0:

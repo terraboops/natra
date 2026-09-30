@@ -322,12 +322,12 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
-# v2.5.0 handles natra's go.mod (go 1.26). v2.3.0 was built against
-# go 1.24 and rejects the config when run against newer-targeted code
-# — see ci.yml for the same constraint. Newer v2.12.x enables stricter
-# linters (goconst/prealloc) that would flag unrelated pre-existing
-# test code; hold here until those are addressed deliberately.
-GOLANGCI_LINT_VERSION ?= v2.5.0
+# golangci-lint must be built with a Go at least as new as go.mod's
+# directive, and its bundled x/tools must read that Go's export data.
+# v2.5.0 fails on go 1.27 ("export data version 4 is greater than
+# maximum supported version 2"); v2.14.0 handles it. See ci.yml for
+# the same constraint.
+GOLANGCI_LINT_VERSION ?= v2.14.0
 
 # golangci-lint refuses to run when built with a Go older than
 # go.mod's directive, so the cached binary is keyed on the Go version
