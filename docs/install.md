@@ -101,8 +101,10 @@ For one-off deployments, lab clusters, or a single node you're
 debugging on:
 
 ```bash
-# Get the binary onto the node
-scp natra <node>:/opt/cni/bin/natra
+# Get the binaries onto the node. natra-tools carries the operator
+# subcommands (install-cni-chain, dump-stats, profile); `natra
+# <subcommand>` execs it from the same directory.
+scp natra natra-tools <node>:/opt/cni/bin/
 
 # Set caps and chain natra into the existing CNI config
 ssh <node> sudo bash -c '

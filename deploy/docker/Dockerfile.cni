@@ -36,6 +36,7 @@ RUN go mod download
 
 COPY cmd/ cmd/
 COPY pkg/ pkg/
+COPY internal/ internal/
 
 # Bring the freshly-built BPF object into pkg/bpf/ where loader.go's
 # go:embed expects it. Architecturally important: the .bpf.o is
@@ -44,7 +45,8 @@ COPY pkg/ pkg/
 # silently embed the wrong build.
 COPY --from=bpf-builder /workspace/bpf/natra.bpf.o pkg/bpf/natra.bpf.o
 
-RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/natra ./cmd/natra
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/natra ./cmd/natra && \
+    CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o bin/natra-tools ./cmd/natra-tools
 
 # ----- Stage 3: runtime -----
 FROM alpine:latest
@@ -54,6 +56,9 @@ FROM alpine:latest
 # CNI plugin can pin BPF links regardless of the caller's caps.
 RUN apk --no-cache add ca-certificates libcap
 
+# natra-tools carries the operator subcommands; `natra <subcommand>`
+# execs it from the same directory.
 COPY --from=go-builder /workspace/bin/natra /usr/local/bin/natra
+COPY --from=go-builder /workspace/bin/natra-tools /usr/local/bin/natra-tools
 
 ENTRYPOINT ["/usr/local/bin/natra"]

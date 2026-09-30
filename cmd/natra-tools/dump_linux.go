@@ -40,7 +40,7 @@ func dumpStats(args []string) error {
 	}
 
 	open := func(name string) (*ebpf.Map, error) {
-		path := filepath.Join(pinDir, containerID+"-"+name+"-map")
+		path := filepath.Join(bpf.PinDir, containerID+"-"+name+"-map")
 		return ebpf.LoadPinnedMap(path, nil)
 	}
 
@@ -151,7 +151,7 @@ func dumpStats(args []string) error {
 	}
 
 	// Self-check: pin path stats can drift from /sys/fs/bpf/natra layout.
-	if entries, err := os.ReadDir(pinDir); err == nil {
+	if entries, err := os.ReadDir(bpf.PinDir); err == nil {
 		var pinned []string
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), containerID) {

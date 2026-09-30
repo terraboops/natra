@@ -27,6 +27,7 @@ BPF_CLANG ?= clang
 endif
 
 CNI_BINARY := bin/natra
+TOOLS_BINARY := bin/natra-tools
 BPF_OBJS := bpf/natra.bpf.o bpf/placeholder.bpf.o bpf/vanilla.bpf.o
 # Intentionally-invalid programs used by the L3 chaos suite. They MUST
 # build (clang accepts them) but FAIL to load (verifier rejects). Listed
@@ -137,7 +138,8 @@ build-cni-inner:
 	@mkdir -p bin pkg/bpf
 	@cp bpf/natra.bpf.o pkg/bpf/natra.bpf.o
 	@GOOS=linux CGO_ENABLED=0 go build -buildvcs=false -o $(CNI_BINARY) ./cmd/natra
-	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2))"
+	@GOOS=linux CGO_ENABLED=0 go build -buildvcs=false -o $(TOOLS_BINARY) ./cmd/natra-tools
+	@echo "Built $(CNI_BINARY) ($$(file $(CNI_BINARY) | cut -d',' -f2)) and $(TOOLS_BINARY)"
 
 .PHONY: build-bpf
 build-bpf: $(BPF_OBJS) $(BPF_TESTDATA_OBJS) ## Compile BPF C sources (incl. chaos testdata) to bytecode (.o).
@@ -177,7 +179,7 @@ bpf/%.bpf.o: bpf/%.bpf.c
 
 .PHONY: clean
 clean: ## Clean build artifacts.
-	rm -f $(CNI_BINARY) $(BPF_OBJS) $(BPF_TESTDATA_OBJS) cover.out
+	rm -f $(CNI_BINARY) $(TOOLS_BINARY) $(BPF_OBJS) $(BPF_TESTDATA_OBJS) cover.out
 
 ##@ Testing
 
@@ -186,7 +188,7 @@ test: test-unit ## Default test target — Layer 1 only (fast).
 
 .PHONY: test-unit
 test-unit: ## Layer 1a — Ginkgo unit tests.
-	go test ./pkg/... ./internal/... -coverprofile cover.out
+	go test ./pkg/... ./internal/... ./cmd/... -coverprofile cover.out
 
 .PHONY: test-fuzz
 test-fuzz: ## Layer 1b — 30s fuzz against the bandwidth annotation parser.

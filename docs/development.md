@@ -128,7 +128,11 @@ NATRA_E2E_ATTACH_MODE=clsact-podside make test-e2e   # or tcx-podside, clsact-ho
 ## Layout
 
 ```
-cmd/natra/             CNI plugin entry point + install + dump-stats
+cmd/natra/             CNI plugin entry point; `natra <subcommand>`
+                       execs natra-tools. deps_test.go keeps regexp
+                       and runtime/pprof out of this binary.
+cmd/natra-tools/       install-cni-chain, dump-stats, profile
+internal/cniskel/      libcni's skel with a regexp-free name check
 cmd/perfrig/           k3d substrate frontend; invoked by make
                        perf-vs-vanilla and the GH CI perf-vs-vanilla
                        job. Lima vm-rig has its own entry under
