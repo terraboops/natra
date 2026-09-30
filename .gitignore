@@ -39,7 +39,9 @@ tmp/
 dist/
 *.tar.gz
 *.zip
-.claude/
+# Local Claude Code state stays out; maintain.md is shared repo facts.
+.claude/*
+!.claude/maintain.md
 
 # Profiling / soak / measurement data — never check in
 results/

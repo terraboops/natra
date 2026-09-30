@@ -199,7 +199,9 @@ test-bench: ## Layer 1c — Hot-path benchmarks (no regression check; CI does th
 # ----- Linux-only layers (gated on uname -s) -----
 
 .PHONY: test-cni
-test-cni: ## Layer 2 — CNI protocol tests (Linux native or Mac via Docker).
+# Depends on build-cni: the specs exec bin/natra, and a missing or
+# stale binary fails every spec (or tests old code).
+test-cni: build-cni ## Layer 2 — CNI protocol tests (Linux native or Mac via Docker).
 ifeq ($(UNAME_S),Linux)
 	sudo go test -tags=$(TAGS_INTEGRATION) ./test/cni/...
 else
@@ -217,7 +219,8 @@ endif
 .PHONY: test-e2e
 test-e2e: ## Layer 4 — k3d end-to-end (works on Mac with Docker; Linux native too).
 	@if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then \
-		echo "Layer 4 needs Docker. Start the daemon and retry."; \
+		echo "Layer 4 needs Docker. Start the daemon (colima start, Docker Desktop, dockerd) and retry." >&2; \
+		exit 69; \
 	else \
 		go test -tags=$(TAGS_E2E) ./test/e2e/...; \
 	fi
@@ -326,21 +329,27 @@ GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 # test code; hold here until those are addressed deliberately.
 GOLANGCI_LINT_VERSION ?= v2.5.0
 
+# golangci-lint refuses to run when built with a Go older than
+# go.mod's directive, so the cached binary is keyed on the Go version
+# too. The install check always runs (it's a test + symlink when the
+# binary is current); a plain file target would skip it once
+# bin/golangci-lint exists and leave a stale version in place.
+GO_VERSION := $(shell go env GOVERSION)
+
 .PHONY: golangci-lint
-golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+golangci-lint: $(LOCALBIN) ## Download golangci-lint locally if necessary.
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION),$(GOLANGCI_LINT_VERSION)-$(GO_VERSION))
 
 define go-install-tool
-@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+@[ -f "$(1)-$(4)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(4)" ] || { \
 set -e; \
 package=$(2)@$(3) ;\
 echo "Downloading $${package}" ;\
 rm -f $(1) ;\
 GOBIN=$(LOCALBIN) go install $${package} ;\
-mv $(1) $(1)-$(3) ;\
+mv $(1) $(1)-$(4) ;\
 } ;\
-ln -sf $$(realpath $(1)-$(3)) $(1)
+ln -sf $$(realpath $(1)-$(4)) $(1)
 endef
 
 ##@ Utilities
